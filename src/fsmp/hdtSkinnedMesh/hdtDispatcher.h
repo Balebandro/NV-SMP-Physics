@@ -1,0 +1,46 @@
+#pragma once
+
+#include "BulletCollision/CollisionDispatch/btCollisionDispatcherMt.h"
+#include "hdtBulletHelper.h"
+#include <vector>
+
+namespace hdt
+{
+	class SkinnedMeshBody;
+
+	class CollisionDispatcher : public btCollisionDispatcherMt
+	{
+	public:
+		CollisionDispatcher(btCollisionConfiguration* collisionConfiguration) :
+			btCollisionDispatcherMt(
+				collisionConfiguration)
+		{
+		}
+
+		btPersistentManifold* getNewManifold(const btCollisionObject* b0, const btCollisionObject* b1) override
+		{
+			std::lock_guard<decltype(m_lock)> l(m_lock);
+			auto ret = btCollisionDispatcherMt::getNewManifold(b0, b1);
+			return ret;
+		}
+
+		void releaseManifold(btPersistentManifold* manifold) override
+		{
+			std::lock_guard<decltype(m_lock)> l(m_lock);
+			btCollisionDispatcherMt::releaseManifold(manifold);
+		}
+
+		bool needsCollision(const btCollisionObject* body0, const btCollisionObject* body1) override;
+		void dispatchAllCollisionPairs(btOverlappingPairCache* pairCache, const btDispatcherInfo& dispatchInfo,
+			btDispatcher* dispatcher) override;
+
+		int getNumManifolds() const override;
+		btPersistentManifold** getInternalManifoldPointer() override;
+		btPersistentManifold* getManifoldByIndexInternal(int index) override;
+
+		void clearAllManifold();
+
+		hdt::SpinLock m_lock;
+		std::vector<std::pair<SkinnedMeshBody*, SkinnedMeshBody*>> m_pairs;
+	};
+}
