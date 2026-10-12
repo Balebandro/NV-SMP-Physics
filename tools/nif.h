@@ -201,6 +201,7 @@ struct Triangle { uint16_t v[3]; };
 // NiTriShapeData / NiTriStripsData, read only.
 struct GeometryData {
 	std::vector<Vec3> vertices, normals;
+	std::vector<float> uvs;   // u, v per vertex (the first set), empty if none
 	std::vector<Triangle> triangles;
 	void read(const Bytes& b, bool strips) {
 		Reader r(b.data(), b.size());
@@ -215,7 +216,7 @@ struct GeometryData {
 		}
 		r.v3(); r.f32();   // bound
 		if (r.u8()) r.skip(nv * 16);   // vertex colours
-		r.skip((bsFlags & 1) * nv * 8);   // uv set
+		if (bsFlags & 1) { uvs.resize(nv * 2); for (auto& x : uvs) x = r.f32(); }   // uv set
 		r.u16();   // consistency
 		r.i32();   // additional data
 		if (!strips) {
@@ -293,6 +294,7 @@ struct SkinData {
 struct SkinPartition {
 	struct Part {
 		uint16_t numWeightsPerVertex = 4;
+		uint16_t numVertices = 0;             // as read (the vertex map may be absent: then the partition's vertices are the shape's, in order)
 		std::vector<uint16_t> bones;
 		std::vector<uint16_t> vertexMap;
 		std::vector<float> weights;           // numVertices * numWeightsPerVertex
@@ -308,6 +310,7 @@ struct SkinPartition {
 		for (auto& p : parts) {
 			uint16_t nv = r.u16(), nt = r.u16(), nb = r.u16(), ns = r.u16();
 			p.numWeightsPerVertex = r.u16();
+			p.numVertices = nv;
 			p.bones.resize(nb); for (auto& x : p.bones) x = r.u16();
 			p.hasVertexMap = r.u8(); if (p.hasVertexMap) { p.vertexMap.resize(nv); for (auto& x : p.vertexMap) x = r.u16(); }
 			p.hasVertexWeights = r.u8(); if (p.hasVertexWeights) { p.weights.resize(nv * p.numWeightsPerVertex); for (auto& x : p.weights) x = r.f32(); }

@@ -52,3 +52,4 @@ namespace logger
 	template <class... Args> void error(std::string_view f, Args&&... a) { log_at(nvsmp::LogLevel::Error, f, a...); }
 	template <class... Args> void critical(std::string_view f, Args&&... a) { log_at(nvsmp::LogLevel::Error, f, a...); }
 }
+#include "Prof.h"

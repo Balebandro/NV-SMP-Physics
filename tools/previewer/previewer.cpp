@@ -1,0 +1,1717 @@
+// NV SMP Previewer: an SMP item (a NIF with "HDT Skinned Mesh Physics Object" and its physics XML)
+// on a moving body, outside the game. The item is laid out in memory as New Vegas holds it (tools/
+// scene.cpp) and simulated by the plugin's own system builder and physics world, so what it shows is
+// what the game does. Edit the XML in any editor and save: the previewer rebuilds it.
+//
+//   NVSMPPreviewer.exe [item.nif]
+//
+// Files the NIF names (the physics XML, textures) are looked up in the item's own Data folder, Mod
+// Organizer 2's enabled mods in priority order, then the game's Data folder (loose files only).
+#include "datafiles.h"
+#include "kf.h"
+#include "scene.h"
+
+#include "hdtSkinnedMesh/hdtSkinnedMeshShape.h"
+#include "hdtSkyrimBone.h"
+
+#include "imgui.h"
+#include "imgui_impl_dx9.h"
+#include "imgui_impl_win32.h"
+
+#include <commdlg.h>
+#include <d3d9.h>
+#include <d3dcompiler.h>
+#include <shellapi.h>
+#include <shobjidl.h>
+
+#include <cmath>
+#include <deque>
+#include <filesystem>
+#include <set>
+#include <sstream>
+#include <unordered_map>
+
+#pragma comment(lib, "d3d9.lib")
+#pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "ole32.lib")
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+namespace fs = std::filesystem;
+
+// --- the log --------------------------------------------------------------------------------------------
+
+struct LogEntry
+{
+	int level;
+	std::string text;
+};
+static std::deque<LogEntry> gLog;
+static bool gShotPending = false;   // the Screenshot button: the next frame, without the panels
+static bool gLogScroll = false;
+
+static void AddLog(int level, const std::string& text)
+{
+	gLog.push_back({ level, text });
+	while (gLog.size() > 2000) gLog.pop_front();
+	gLogScroll = true;
+	OutputDebugStringA((text + "\n").c_str());
+}
+
+namespace nvsmp
+{
+	bool LogEnabled(LogLevel level) { return level >= LogLevel::Info; }
+	void LogLine(LogLevel level, const std::string& text)
+	{
+		// The builder's per-bone chatter ("Found node", "OK: constraint") only at the verbose level.
+		if (level == LogLevel::Info && (text.rfind("Found node", 0) == 0 || text.rfind("OK: constraint", 0) == 0 || text.rfind("Created bone node", 0) == 0))
+			return;
+		AddLog((int)level, text);
+	}
+}
+
+// --- small math (Z up, right-handed, as the game) ------------------------------------------------------
+
+struct V3
+{
+	float x = 0, y = 0, z = 0;
+	V3() = default;
+	V3(float a, float b, float c) : x(a), y(b), z(c) {}
+	V3(const RE::NiPoint3& p) : x(p.x), y(p.y), z(p.z) {}
+	V3 operator+(V3 o) const { return { x + o.x, y + o.y, z + o.z }; }
+	V3 operator-(V3 o) const { return { x - o.x, y - o.y, z - o.z }; }
+	V3 operator*(float s) const { return { x * s, y * s, z * s }; }
+};
+static float Dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static V3 Cross(V3 a, V3 b) { return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+static V3 Norm(V3 a) { float l = std::sqrt(Dot(a, a)); return l > 1e-8f ? a * (1.0f / l) : V3(0, 0, 1); }
+
+// Row-vector matrices (v' = v * M), as Direct3D 9's fixed function and the shaders (row_major) use.
+struct M4
+{
+	float m[4][4] = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 }, { 0, 0, 0, 1 } };
+};
+static M4 Mul(const M4& a, const M4& b)
+{
+	M4 r;
+	for (int i = 0; i < 4; i++)
+		for (int j = 0; j < 4; j++) {
+			r.m[i][j] = 0;
+			for (int k = 0; k < 4; k++) r.m[i][j] += a.m[i][k] * b.m[k][j];
+		}
+	return r;
+}
+static M4 LookAtRH(V3 eye, V3 at, V3 up)
+{
+	V3 z = Norm(eye - at), x = Norm(Cross(up, z)), y = Cross(z, x);
+	M4 r;
+	r.m[0][0] = x.x; r.m[0][1] = y.x; r.m[0][2] = z.x; r.m[0][3] = 0;
+	r.m[1][0] = x.y; r.m[1][1] = y.y; r.m[1][2] = z.y; r.m[1][3] = 0;
+	r.m[2][0] = x.z; r.m[2][1] = y.z; r.m[2][2] = z.z; r.m[2][3] = 0;
+	r.m[3][0] = -Dot(x, eye); r.m[3][1] = -Dot(y, eye); r.m[3][2] = -Dot(z, eye); r.m[3][3] = 1;
+	return r;
+}
+static M4 PerspectiveRH(float fovY, float aspect, float zn, float zf)
+{
+	float ys = 1.0f / std::tan(fovY / 2), xs = ys / aspect;
+	M4 r;
+	r.m[0][0] = xs; r.m[1][1] = ys;
+	r.m[2][2] = zf / (zn - zf); r.m[2][3] = -1;
+	r.m[3][2] = zn * zf / (zn - zf); r.m[3][3] = 0;
+	return r;
+}
+
+// --- Direct3D --------------------------------------------------------------------------------------------
+
+static HWND gWnd;
+static IDirect3D9* gD3D;
+static IDirect3DDevice9* gDev;
+static D3DPRESENT_PARAMETERS gPP;
+static UINT gResizeW, gResizeH;
+static IDirect3DVertexShader9* gVS;
+static IDirect3DPixelShader9* gPS;
+static IDirect3DVertexDeclaration9* gDecl;
+
+struct MeshVertex
+{
+	float px, py, pz, nx, ny, nz, u, v;
+};
+struct LineVertex
+{
+	float x, y, z;
+	D3DCOLOR c;
+};
+
+static const char* kShader = R"(
+row_major float4x4 gViewProj : register(c0);
+struct VSIn { float3 pos : POSITION; float3 nrm : NORMAL; float2 uv : TEXCOORD0; };
+struct VSOut { float4 pos : POSITION; float3 nrm : TEXCOORD1; float2 uv : TEXCOORD0; };
+VSOut vs(VSIn i) { VSOut o; o.pos = mul(float4(i.pos, 1), gViewProj); o.nrm = i.nrm; o.uv = i.uv; return o; }
+
+float4 gKey : register(c0);      // key light direction (toward the light)
+float4 gColor : register(c1);    // tint
+float4 gParams : register(c2);   // x: textured, y: alpha test, z: unlit
+float4 gFill : register(c3);     // fill light direction
+sampler2D gTex : register(s0);
+float4 ps(VSOut i) : COLOR
+{
+	float4 base = gParams.x > 0.5 ? tex2D(gTex, i.uv) : float4(1, 1, 1, 1);
+	if (gParams.y > 0.5) clip(base.a - 0.5);
+	base *= gColor;
+	if (gParams.z > 0.5) return base;
+	float3 n = normalize(i.nrm);
+	// Two-sided: cloth is seen from inside too.
+	float key = abs(dot(n, gKey.xyz)), fill = abs(dot(n, gFill.xyz));
+	float light = 0.28 + 0.62 * key + 0.22 * fill;
+	return float4(base.rgb * light, 1);
+}
+)";
+
+static bool CompileShaders()
+{
+	ID3DBlob *code = nullptr, *err = nullptr;
+	if (FAILED(D3DCompile(kShader, strlen(kShader), "previewer", nullptr, nullptr, "vs", "vs_3_0", 0, 0, &code, &err))) {
+		AddLog(4, std::string("vertex shader: ") + (err ? (const char*)err->GetBufferPointer() : "?"));
+		return false;
+	}
+	gDev->CreateVertexShader((DWORD*)code->GetBufferPointer(), &gVS);
+	code->Release();
+	if (FAILED(D3DCompile(kShader, strlen(kShader), "previewer", nullptr, nullptr, "ps", "ps_3_0", 0, 0, &code, &err))) {
+		AddLog(4, std::string("pixel shader: ") + (err ? (const char*)err->GetBufferPointer() : "?"));
+		return false;
+	}
+	gDev->CreatePixelShader((DWORD*)code->GetBufferPointer(), &gPS);
+	code->Release();
+	D3DVERTEXELEMENT9 el[] = {
+		{ 0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 },
+		{ 0, 12, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL, 0 },
+		{ 0, 24, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0 },
+		D3DDECL_END()
+	};
+	gDev->CreateVertexDeclaration(el, &gDecl);
+	return true;
+}
+
+static bool CreateDevice()
+{
+	gD3D = Direct3DCreate9(D3D_SDK_VERSION);
+	if (!gD3D) return false;
+	ZeroMemory(&gPP, sizeof(gPP));
+	gPP.Windowed = TRUE;
+	gPP.SwapEffect = D3DSWAPEFFECT_DISCARD;
+	gPP.BackBufferFormat = D3DFMT_UNKNOWN;
+	gPP.EnableAutoDepthStencil = TRUE;
+	gPP.AutoDepthStencilFormat = D3DFMT_D24S8;
+	gPP.PresentationInterval = D3DPRESENT_INTERVAL_ONE;
+	DWORD q = 0;
+	if (SUCCEEDED(gD3D->CheckDeviceMultiSampleType(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, TRUE, D3DMULTISAMPLE_4_SAMPLES, &q)))
+		gPP.MultiSampleType = D3DMULTISAMPLE_4_SAMPLES;
+	return SUCCEEDED(gD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, gWnd, D3DCREATE_HARDWARE_VERTEXPROCESSING, &gPP, &gDev));
+}
+
+// The back buffer as a 32-bit BMP (resolved through a plain render target: a multisampled back buffer
+// cannot be read directly).
+static bool SaveScreenshot(const std::string& path)
+{
+	IDirect3DSurface9 *back = nullptr, *resolved = nullptr, *sys = nullptr;
+	bool ok = false;
+	D3DSURFACE_DESC d;
+	if (SUCCEEDED(gDev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) && SUCCEEDED(back->GetDesc(&d)) &&
+		SUCCEEDED(gDev->CreateRenderTarget(d.Width, d.Height, D3DFMT_X8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &resolved, nullptr)) &&
+		SUCCEEDED(gDev->StretchRect(back, nullptr, resolved, nullptr, D3DTEXF_NONE)) &&
+		SUCCEEDED(gDev->CreateOffscreenPlainSurface(d.Width, d.Height, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sys, nullptr)) &&
+		SUCCEEDED(gDev->GetRenderTargetData(resolved, sys))) {
+		D3DLOCKED_RECT lr;
+		if (SUCCEEDED(sys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+			FILE* f = fopen(path.c_str(), "wb");
+			if (f) {
+				BITMAPFILEHEADER fh{};
+				BITMAPINFOHEADER ih{};
+				ih.biSize = sizeof(ih);
+				ih.biWidth = d.Width;
+				ih.biHeight = -(LONG)d.Height;   // top-down
+				ih.biPlanes = 1;
+				ih.biBitCount = 32;
+				fh.bfType = 0x4D42;
+				fh.bfOffBits = sizeof(fh) + sizeof(ih);
+				fh.bfSize = fh.bfOffBits + d.Width * d.Height * 4;
+				fwrite(&fh, sizeof(fh), 1, f);
+				fwrite(&ih, sizeof(ih), 1, f);
+				for (UINT y = 0; y < d.Height; y++) fwrite((char*)lr.pBits + y * lr.Pitch, 4, d.Width, f);
+				fclose(f);
+				ok = true;
+			}
+			sys->UnlockRect();
+		}
+	}
+	if (back) back->Release();
+	if (resolved) resolved->Release();
+	if (sys) sys->Release();
+	return ok;
+}
+
+static void ResetDevice()
+{
+	ImGui_ImplDX9_InvalidateDeviceObjects();
+	if (gDev->Reset(&gPP) == D3DERR_INVALIDCALL) AddLog(4, "device reset failed");
+	ImGui_ImplDX9_CreateDeviceObjects();
+}
+
+// --- settings (NVSMPPreviewer.ini next to the exe) -------------------------------------------------------
+
+static std::string gIniPath;
+
+static std::string IniGet(const char* key, const char* def = "")
+{
+	char buf[1024];
+	GetPrivateProfileStringA("Previewer", key, def, buf, sizeof buf, gIniPath.c_str());
+	return buf;
+}
+static void IniSet(const char* key, const std::string& value) { WritePrivateProfileStringA("Previewer", key, value.c_str(), gIniPath.c_str()); }
+
+// The Data sources set by hand (empty: detected), kept in the INI.
+static datafiles::Options gSources;
+
+static void LoadSources()
+{
+	gSources.mo2Instance = IniGet("Mo2Instance");
+	gSources.mo2Profile = IniGet("Mo2Profile");
+	gSources.gameFolder = IniGet("GameFolder");
+	gSources.useArchives = IniGet("UseArchives", "1") != "0";
+	gSources.extraFolders.clear();
+	std::stringstream extra(IniGet("ExtraFolders"));
+	std::string f;
+	while (std::getline(extra, f, '|'))
+		if (!f.empty()) gSources.extraFolders.push_back(f);
+}
+
+static void SaveSources()
+{
+	IniSet("Mo2Instance", gSources.mo2Instance);
+	IniSet("Mo2Profile", gSources.mo2Profile);
+	IniSet("GameFolder", gSources.gameFolder);
+	IniSet("UseArchives", gSources.useArchives ? "1" : "0");
+	std::string extra;
+	for (auto& f : gSources.extraFolders) extra += (extra.empty() ? "" : "|") + f;
+	IniSet("ExtraFolders", extra);
+}
+
+// --- the loaded item ----------------------------------------------------------------------------------------
+
+struct ShapeDraw
+{
+	scene::ShapeInfo info;
+	scene::Weights weights;
+	IDirect3DTexture9* texture = nullptr;
+	std::string texturePath, textureNote;
+	bool visible = true;
+	int collider = 0;   // 0 none, 1 per-vertex (cloth), 2 per-triangle (body)
+	std::vector<MeshVertex> verts;
+	std::vector<uint16_t> indices;
+};
+
+struct Settings
+{
+	// Physics (the plugin's F7 menu).
+	bool physics = true;
+	float gravity = 1.0f;
+	int minFps = 60;
+	int maxSubSteps = 4;
+	int solverIterations = 10;
+	bool collisions = true;
+	float waistCollision = 0.0f;
+	bool ground = true;
+	bool wind = false;
+	float windStrength = 2.0f;
+	float windDirection = 0.0f;   // degrees, 0 = toward +y (the body's front at start)
+	bool windGusts = true;
+	// Motion.
+	int preset = 1;
+	float speedScale = 1.0f;
+	float timeScale = 1.0f;
+	// Display.
+	bool textures = true;
+	bool wireframe = false;
+	bool showBones = false;
+	bool showConstraints = false;
+	bool showColliders = false;
+	bool showFloor = true;
+	bool autoReload = true;
+	float background[3] = { 0.17f, 0.18f, 0.20f };
+} gS;
+
+struct Item
+{
+	bool loaded = false;
+	std::string nifPath, xmlPath, xmlNamed;
+	fs::file_time_type nifTime, xmlTime;
+	datafiles::Roots roots;
+	scene::Item scene;
+	RE::BSTSmartPointer<hdt::SkyrimSystem> system;
+	std::vector<ShapeDraw> shapes;
+	int simulatedBones = 0, constraintCount = 0;
+	float builtWaist = -1;
+	// The body's animated bones and their rest locals.
+	RE::NiNode *pelvis = nullptr, *lThigh = nullptr, *rThigh = nullptr, *lCalf = nullptr, *rCalf = nullptr;
+	RE::NiTransform pelvis0, lThigh0, rThigh0, lCalf0, rCalf0;
+} gItem;
+
+static std::unordered_map<std::string, IDirect3DTexture9*> gTextureCache;
+
+static fs::file_time_type TimeOf(const std::string& p)
+{
+	std::error_code ec;
+	auto t = fs::last_write_time(p, ec);
+	return ec ? fs::file_time_type{} : t;
+}
+
+static void ApplyWorldSettings()
+{
+	auto* world = hdt::SkyrimPhysicsWorld::get();
+	gS.minFps = std::clamp(gS.minFps, 30, 240);
+	gS.maxSubSteps = std::clamp(gS.maxSubSteps, 1, 16);
+	gS.solverIterations = std::clamp(gS.solverIterations, 1, 64);
+	world->m_timeTick = 1.0f / (float)gS.minFps;
+	world->m_maxSubSteps = gS.maxSubSteps;
+	world->getSolverInfo().m_numIterations = gS.solverIterations;
+	world->setGravity(btVector3(0, 0, -9.8f * hdt::scaleSkyrim * gS.gravity));
+	world->m_enableWind = gS.wind;
+	world->m_windStrength = gS.windStrength;
+	world->m_collisionsEnabled = gS.collisions;
+	world->m_unclampedResets = false;   // the previewer's turns are deliberate
+}
+
+// Builds (or rebuilds) the physics for the loaded item from its XML.
+static void BuildSystem()
+{
+	auto* world = hdt::SkyrimPhysicsWorld::get();
+	if (gItem.system) {
+		world->removeSkinnedMeshSystem(gItem.system.get());
+		gItem.system = nullptr;   // gives the skin slots back
+	}
+	for (auto& s : gItem.shapes) s.collider = 0;
+	gItem.simulatedBones = gItem.constraintCount = 0;
+	if (gItem.scene.physicsFile.empty()) {
+		AddLog(3, "the NIF names no physics file (no \"HDT Skinned Mesh Physics Object\" string on its root)");
+		return;
+	}
+	gItem.xmlNamed = gItem.scene.physicsFile;
+	gItem.xmlPath = datafiles::Resolve(gItem.roots, gItem.xmlNamed);
+	if (gItem.xmlPath.empty()) {
+		// Not under a Data folder: next to the NIF, by file name.
+		std::string base = fs::path(gItem.xmlNamed).filename().string();
+		auto next = fs::path(gItem.nifPath).parent_path() / base;
+		if (fs::exists(next)) gItem.xmlPath = next.string();
+	}
+	gItem.xmlTime = TimeOf(gItem.xmlPath);
+	std::string xml = gItem.xmlPath;
+	scene::gReadFile = [xml](const char*) { return xml.empty() ? std::string() : datafiles::ReadFile(xml); };
+	if (xml.empty()) {
+		AddLog(4, "physics file '" + gItem.xmlNamed + "' not found in any Data folder or next to the NIF");
+		return;
+	}
+
+	hdt::DefaultBBP::PhysicsFile_t file{ gItem.xmlNamed, {} };
+	hdt::SkyrimSystemCreator creator;
+	creator.m_weightThresholdScale = 1.0f - gS.waistCollision;
+	creator.m_ground = gS.ground;
+	gItem.builtWaist = gS.waistCollision;
+	auto system = creator.createOrUpdateSystem(gItem.scene.skeleton.actor, gItem.scene.model, &file, {}, nullptr);
+	if (!system) {
+		AddLog(4, "no physics built from " + xml + " (see the messages above)");
+		return;
+	}
+	gItem.system = system;
+	world->addSkinnedMeshSystem(system.get());
+	for (auto& b : system->getBones()) gItem.simulatedBones += !b->m_rig.isStaticOrKinematicObject();
+	gItem.constraintCount = (int)system->constraints().size();
+	for (auto& g : system->constraintGroups()) gItem.constraintCount += (int)g->m_constraints.size();
+	for (auto& body : system->meshes())
+		for (auto& s : gItem.shapes)
+			if (s.info.geometry->m_name && body->m_name == RE::BSFixedString(s.info.geometry->m_name))
+				s.collider = body->m_shape && body->m_shape->asPerTriangleShape() ? 2 : 1;
+	AddLog(2, "physics: " + std::to_string(system->getBones().size()) + " bones (" + std::to_string(gItem.simulatedBones) + " simulated), " +
+		std::to_string(gItem.constraintCount) + " constraints, " + std::to_string(system->meshes().size()) + " collision bodies");
+}
+
+// --- motion ---------------------------------------------------------------------------------------------
+//
+// Two ways to move the body. With the game's skeleton and its locomotion animations found (loose .kf files
+// in the Data folders), the presets play them: crossfaded as the game blends, the body carried by each
+// clip's own root motion so the feet stay planted. Without, a procedural stride on the legs.
+
+static const char* kPresets[] = { "Stand", "Walk", "Run", "Walk in circles", "Spin in place", "Start and stop", "Jumping", "Sneak", "Sneak walk", "Drive (WASD)", "Animation file" };
+enum { kStand, kWalk, kRun, kCircles, kSpin, kStartStop, kJumping, kSneak, kSneakWalk, kDrive, kCustom };
+
+// Weapon stances: the locomotion file name prefix the game uses for each.
+static const char* kStances[] = { "Unarmed", "Pistol", "Rifle", "Automatic rifle", "One-hand melee", "Two-hand melee" };
+static const char* kStancePrefix[] = { "mt", "1hp", "2hr", "2ha", "1hm", "2hm" };
+
+struct ClipPlay
+{
+	const kf::Clip* clip = nullptr;
+	std::string key, path;
+	std::vector<RE::NiNode*> nodes;   // per track: the skeleton node it drives, or null
+	float time = 0;
+	V3 velocity;                      // root motion, actor space, units per second
+};
+
+struct Anim
+{
+	bool use = true;                  // play the game's animations when they are found
+	bool female = false;
+	bool sneak = false;               // the sneak (crouched) set
+	int stance = 0;
+	std::string skeletonPath;
+	std::map<std::string, RE::NiTransform> rest;   // every skeleton node's rest local
+	std::unordered_map<std::string, kf::Clip> cache;   // by file path
+	std::map<std::string, std::string> found;         // action ("forward") -> file, for the current stance
+	std::set<std::string> borrowed;                   // actions the stance lacks, played from unarmed
+	ClipPlay current, previous;
+	float blend = 1;                  // 0 at a switch .. 1 when the new clip has taken over
+	std::string customPath;
+	bool wasAnimating = false;
+} gAnim;
+
+struct Motion
+{
+	V3 pos;
+	float yaw = 0, speed = 0, yawRate = 0, phase = 0, bob = 0, jump = -1, time = 0;
+	V3 velocity;                      // actor space (animated mode)
+	// A jump with the game's animations: take-off, in the air, landing, then back to the locomotion.
+	enum { kGround, kTakeOff, kAir, kLanding } jumpStage = kGround;
+	float stageTime = 0, groundTime = 0;
+} gMotion;
+
+static RE::NiNode* Bone(const char* name)
+{
+	auto it = gItem.scene.skeleton.bones.find(name);
+	return it == gItem.scene.skeleton.bones.end() ? nullptr : it->second;
+}
+
+static nif::Mat3 ToNif(const RE::NiMatrix3& m)
+{
+	nif::Mat3 r;
+	for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) r.m[i][j] = m.entry[i][j];
+	return r;
+}
+static RE::NiMatrix3 ToRE(const nif::Mat3& m)
+{
+	RE::NiMatrix3 r;
+	for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) r.entry[i][j] = m.m[i][j];
+	return r;
+}
+
+static const kf::Clip* LoadClip(const std::string& path)
+{
+	if (auto it = gAnim.cache.find(path); it != gAnim.cache.end()) return &it->second;
+	try {
+		auto& c = gAnim.cache[path] = kf::Load(path);
+		return &c;
+	} catch (const std::exception& e) {
+		AddLog(4, "cannot read animation " + path + ": " + e.what());
+		gAnim.cache.erase(path);
+		return nullptr;
+	}
+}
+
+// The file the game would play for an action ("forward", "fastforward", "idle"...) with a stance prefix
+// ("mt", "1hp"...): the per-gender (kNVSE) and vanilla paths in every Data folder by priority, then, last,
+// AnimGroupOverride folders (many of those are for one weapon or one NPC). Loose files only.
+static std::string FindAnimation(const std::string& action, const char* prefix)
+{
+	std::string file = std::string(prefix) + action + ".kf";
+	std::string gender = gAnim.female ? "female" : "male";
+	// Jumps, aims and sneaks sit in characters\_male itself, the rest of the locomotion in its locomotion
+	// folder in mods; vanilla keeps much of that in characters\_male too. Both are tried, the usual one first.
+	bool top = action.rfind("jump", 0) == 0 || action == "aim" || std::string(prefix).rfind("sneak", 0) == 0;
+	std::error_code ec;
+	// Loose files, then the archives (datafiles::Resolve), the per-gender path first.
+	const std::string male = "meshes\\characters\\_male\\", loco = "meshes\\characters\\_male\\locomotion\\";
+	const std::string& first = top ? male : loco;
+	const std::string& second = top ? loco : male;
+	for (const std::string& rel : { first + gender + "\\" + file, first + file, second + gender + "\\" + file, second + file })
+		if (std::string p = datafiles::Resolve(gItem.roots, rel); !p.empty()) return p;
+	for (auto& root : gItem.roots.folders) {
+		fs::path over = fs::path(root) / "meshes" / "AnimGroupOverride";
+		if (!fs::is_directory(over, ec)) continue;
+		for (auto& d : fs::directory_iterator(over, ec)) {
+			fs::path p = top ? d.path() / "_male" / file : d.path() / "_male" / "locomotion" / file;
+			if (fs::exists(p, ec)) return p.string();
+		}
+	}
+	return {};
+}
+
+static const char* kActions[] = { "idle", "forward", "fastforward", "backward", "fastbackward", "left", "right", "fastleft", "fastright", "turnleft", "turnright",
+	"jumpstart", "jumploop", "jumpland", "jumploopforward", "jumplandforward" };
+
+// Each action for the current stance. A weapon stance's standing pose is its aim when it has no idle; what a
+// stance lacks loose is borrowed from unarmed (noted in gAnim.borrowed), as the game would show something.
+static void FindAnimations()
+{
+	gAnim.found.clear();
+	gAnim.borrowed.clear();
+	// Sneaking: the stance's sneak set ("sneak1hp..."), else unarmed sneak, else the stance standing up.
+	std::string stance = kStancePrefix[gAnim.stance];
+	std::vector<std::string> prefixes;
+	if (gAnim.sneak) { prefixes.push_back("sneak" + stance); if (gAnim.stance != 0) prefixes.push_back("sneakmt"); }
+	prefixes.push_back(stance);
+	if (gAnim.stance != 0) prefixes.push_back("mt");
+	for (const char* a : kActions) {
+		std::string p;
+		for (size_t i = 0; i < prefixes.size() && p.empty(); i++) {
+			p = FindAnimation(a, prefixes[i].c_str());
+			// A weapon stance's standing pose is its aim when it has no idle.
+			if (p.empty() && std::string(a) == "idle" && prefixes[i] != "mt" && prefixes[i] != "sneakmt") p = FindAnimation("aim", prefixes[i].c_str());
+			if (!p.empty() && i > 0) gAnim.borrowed.insert(a);
+		}
+		if (!p.empty()) gAnim.found[a] = p;
+	}
+}
+
+static void Play(ClipPlay& play, const std::string& key, const std::string& path)
+{
+	play = ClipPlay();
+	play.clip = LoadClip(path);
+	if (!play.clip) return;
+	play.key = key;
+	play.path = path;
+	for (auto& t : play.clip->tracks) {
+		auto it = gItem.scene.skeleton.bones.find(t.node);
+		play.nodes.push_back(it == gItem.scene.skeleton.bones.end() ? nullptr : it->second);
+	}
+	// Root motion: how far the accumulation root travels over one cycle.
+	for (auto& t : play.clip->tracks) {
+		if (t.node != play.clip->accumRoot) continue;
+		kf::Pose a = kf::Sample(t, play.clip->start), b = kf::Sample(t, play.clip->stop);
+		float d = play.clip->Duration();
+		if (a.hasTranslation && b.hasTranslation && d > 0)
+			play.velocity = V3(b.translation.x - a.translation.x, b.translation.y - a.translation.y, 0) * (1.0f / d);
+	}
+	play.time = play.clip->start;
+}
+
+// Switches to the clip for a key (an action, or the custom file), crossfading from the one playing.
+static bool Want(const std::string& key)
+{
+	std::string path = key == "custom" ? gAnim.customPath : (gAnim.found.count(key) ? gAnim.found[key] : std::string());
+	if (path.empty()) return false;
+	// The same action from another file (crouching mid-walk, a new stance) crossfades too.
+	if (gAnim.current.clip && gAnim.current.key == key && gAnim.current.path == path) return true;
+	ClipPlay next;
+	Play(next, key, path);
+	if (!next.clip) return false;
+	gAnim.previous = gAnim.current;
+	gAnim.current = next;
+	gAnim.blend = gAnim.previous.clip ? 0.0f : 1.0f;
+	return true;
+}
+
+static void Advance(ClipPlay& p, float dt)
+{
+	if (!p.clip) return;
+	p.time += dt;
+	float d = p.clip->Duration();
+	if (d <= 0) { p.time = p.clip->start; return; }
+	if (p.clip->loops) p.time = p.clip->start + fmodf(p.time - p.clip->start, d);
+	else p.time = std::min(p.time, p.clip->stop);
+}
+
+// Poses the skeleton: every node at rest, the accumulation root at the identity (its rotation and height
+// are in NonAccum's keys; its travel moves the actor), then the clips, crossfaded.
+static void ApplyClips()
+{
+	for (auto& [name, local] : gAnim.rest)
+		if (auto* n = Bone(name.c_str())) n->local = local;
+	struct P { kf::Quat q; nif::Vec3 t; float s; };
+	std::unordered_map<RE::NiNode*, P> pose;
+	auto start = [&](RE::NiNode* n) -> P& {
+		auto it = pose.find(n);
+		if (it != pose.end()) return it->second;
+		return pose[n] = { kf::FromMatrix(ToNif(n->local.rotate)), { n->local.translate.x, n->local.translate.y, n->local.translate.z }, n->local.scale };
+	};
+	auto apply = [&](const ClipPlay& play, float w) {
+		if (!play.clip) return;
+		for (size_t i = 0; i < play.clip->tracks.size(); i++) {
+			RE::NiNode* n = play.nodes[i];
+			if (!n || play.clip->tracks[i].node == play.clip->accumRoot) continue;
+			kf::Pose s = kf::Sample(play.clip->tracks[i], play.time);
+			P& p = start(n);
+			if (s.hasRotation) p.q = w >= 1 ? s.rotation : kf::Slerp(p.q, s.rotation, w);
+			if (s.hasTranslation) p.t = { p.t.x + (s.translation.x - p.t.x) * w, p.t.y + (s.translation.y - p.t.y) * w, p.t.z + (s.translation.z - p.t.z) * w };
+			if (s.hasScale) p.s = p.s + (s.scale - p.s) * w;
+		}
+	};
+	const kf::Clip* c = gAnim.current.clip;
+	if (c && !c->accumRoot.empty())
+		if (auto* root = Bone(c->accumRoot.c_str())) root->local = RE::NiTransform();
+	if (gAnim.blend < 1 && gAnim.previous.clip) apply(gAnim.previous, 1.0f);
+	apply(gAnim.current, gAnim.blend < 1 && gAnim.previous.clip ? gAnim.blend : 1.0f);
+	for (auto& [n, p] : pose) {
+		n->local.rotate = ToRE(kf::ToMatrix(p.q));
+		n->local.translate = { p.t.x, p.t.y, p.t.z };
+		n->local.scale = p.s;
+	}
+}
+
+static bool Animated()
+{
+	return gAnim.use && !gAnim.skeletonPath.empty() && (gAnim.found.count("idle") || (gS.preset == kCustom && !gAnim.customPath.empty()));
+}
+
+static void UpdateMotion(float dt)
+{
+	auto& m = gMotion;
+	m.time += dt;
+	ImGuiIO& io = ImGui::GetIO();
+	bool animated = Animated();
+	if (animated != gAnim.wasAnimating) {
+		// Switching modes: every node back to rest, and the clips start over.
+		for (auto& [name, local] : gAnim.rest)
+			if (auto* n = Bone(name.c_str())) n->local = local;
+		gAnim.current = gAnim.previous = ClipPlay();
+		gAnim.wasAnimating = animated;
+	}
+
+	float targetSpeed = 0, targetYawRate = 0, strafe = 0;
+	bool jumpNow = false;
+	std::string want = "idle";
+	bool run = false;
+	switch (gS.preset) {
+	case kWalk: targetSpeed = 150; want = "forward"; break;
+	case kSneak: break;   // the idle, from the sneak set (the preset turns sneaking on)
+	case kSneakWalk: targetSpeed = 150; want = "forward"; break;
+	case kRun: targetSpeed = 400; want = "fastforward"; break;
+	case kCircles: targetSpeed = 150; targetYawRate = 150.0f / 220.0f; want = "forward"; break;
+	case kSpin: targetYawRate = 3.0f; want = gAnim.found.count("turnleft") ? "turnleft" : "idle"; break;
+	case kStartStop: run = fmodf(m.time, 5.0f) < 2.5f; targetSpeed = run ? 350.0f : 0.0f; want = run ? "fastforward" : "idle"; break;
+	case kJumping: jumpNow = m.groundTime > 1.4f; break;
+	case kDrive:
+		if (!io.WantCaptureKeyboard) {
+			run = ImGui::IsKeyDown(ImGuiKey_LeftShift);
+			if (ImGui::IsKeyDown(ImGuiKey_W)) { targetSpeed = run ? 400.0f : 150.0f; want = run ? "fastforward" : "forward"; }
+			else if (ImGui::IsKeyDown(ImGuiKey_S)) { targetSpeed = -100.0f; want = run ? "fastbackward" : "backward"; }
+			else if (ImGui::IsKeyDown(ImGuiKey_Q)) { strafe = run ? -300.0f : -120.0f; want = run ? "fastleft" : "left"; }
+			else if (ImGui::IsKeyDown(ImGuiKey_E)) { strafe = run ? 300.0f : 120.0f; want = run ? "fastright" : "right"; }
+			if (ImGui::IsKeyDown(ImGuiKey_A)) targetYawRate = 2.5f;
+			if (ImGui::IsKeyDown(ImGuiKey_D)) targetYawRate = -2.5f;
+			if (want == "idle" && targetYawRate != 0) want = targetYawRate > 0 ? "turnleft" : "turnright";
+			jumpNow = ImGui::IsKeyPressed(ImGuiKey_Space);
+			// C crouches and stands, as the game's sneak key does (Ctrl is the body drag here).
+			if (ImGui::IsKeyPressed(ImGuiKey_C, false)) { gAnim.sneak = !gAnim.sneak; FindAnimations(); }
+		}
+		break;
+	case kCustom: want = "custom"; break;
+	}
+	bool onGround = m.jump < 0 && m.jumpStage == Motion::kGround;
+	jumpNow = jumpNow && onGround;
+	m.groundTime = onGround && !jumpNow ? m.groundTime + dt : 0.0f;
+
+	float k = 1.0f - std::exp(-dt * 8.0f);
+	V3 velocity;   // actor space
+	if (animated) {
+		// A jump: the take-off clip (if installed loose), the in-air loop for the flight, the landing clip,
+		// then the locomotion again. Moving, the forward variants where there are.
+		bool moving = std::fabs(m.velocity.y) > 60.0f;
+		auto has = [](const char* a) { return gAnim.found.count(a) > 0; };
+		auto clipDone = [&]() { return gAnim.current.clip && m.stageTime >= gAnim.current.clip->Duration() / std::max(0.05f, gS.speedScale); };
+		if (jumpNow) {
+			m.jumpStage = has("jumpstart") ? Motion::kTakeOff : Motion::kAir;
+			m.stageTime = 0;
+			if (m.jumpStage == Motion::kAir) m.jump = 0;
+			jumpNow = false;   // the flight starts when the take-off ends
+		}
+		m.stageTime += dt;
+		switch (m.jumpStage) {
+		case Motion::kTakeOff:
+			want = "jumpstart";
+			if (gAnim.current.key == "jumpstart" && clipDone()) { m.jumpStage = Motion::kAir; m.stageTime = 0; m.jump = 0; }
+			break;
+		case Motion::kAir:
+			want = moving && has("jumploopforward") ? "jumploopforward" : "jumploop";
+			if (m.jump < 0) { m.jumpStage = Motion::kLanding; m.stageTime = 0; }
+			break;
+		case Motion::kLanding:
+			want = moving && has("jumplandforward") ? "jumplandforward" : "jumpland";
+			if (!has(want.c_str()) || (gAnim.current.key == want && clipDone())) m.jumpStage = Motion::kGround;
+			break;
+		default:
+			break;
+		}
+		bool airborne = m.jumpStage == Motion::kTakeOff || m.jumpStage == Motion::kAir;
+		// Fall back along the way the game would (turns and strafes to idle, runs to walks).
+		if (!Want(want)) {
+			std::string alt = want.rfind("fast", 0) == 0 ? want.substr(4) : (want.find("turn") == 0 ? "idle" : "idle");
+			if (!Want(alt)) Want("idle");
+		}
+		float rate = gS.speedScale;
+		Advance(gAnim.current, dt * rate);
+		Advance(gAnim.previous, dt * rate);
+		gAnim.blend = std::min(1.0f, gAnim.blend + dt / 0.25f);
+		ApplyClips();
+		// The body travels as the clip does; the preset's speed only where a clip has no root motion.
+		V3 clipV = gAnim.current.velocity, prevV = gAnim.previous.clip ? gAnim.previous.velocity : clipV;
+		V3 v = prevV + (clipV - prevV) * gAnim.blend;
+		bool hasRootMotion = std::fabs(clipV.x) + std::fabs(clipV.y) > 1.0f;
+		velocity = hasRootMotion ? v * rate : V3(strafe, targetSpeed, 0) * gS.speedScale;
+		if (!airborne) m.velocity = m.velocity + (velocity - m.velocity) * k;   // in the air, the momentum carries
+		velocity = m.velocity;
+	} else {
+		targetSpeed *= gS.speedScale;
+		m.speed += (targetSpeed - m.speed) * k;
+		velocity = V3(strafe * gS.speedScale, m.speed, 0);
+	}
+	m.yawRate += (targetYawRate - m.yawRate) * k;
+	m.yaw += m.yawRate * dt;
+	V3 fwd(-std::sin(m.yaw), std::cos(m.yaw), 0), right(std::cos(m.yaw), std::sin(m.yaw), 0);
+	m.pos = m.pos + fwd * (velocity.y * dt) + right * (velocity.x * dt);
+
+	float z = 0;
+	if (jumpNow) m.jump = 0;
+	if (m.jump >= 0) {
+		m.jump += dt;
+		const float T = 0.75f;
+		if (m.jump > T) m.jump = -1;
+		else z = 4.0f * 55.0f * (m.jump / T) * (1 - m.jump / T);
+	}
+
+	float newBob = 0;
+
+	if (!animated) {
+		// Legs: a stride cycle by distance, wider and quicker with speed; the calves bend on the back swing.
+		float v = std::fabs(m.speed);
+		m.phase += dt * 2.0f * 3.14159f * (0.5f + v / 300.0f) * (v > 1 ? 1.0f : 0.0f);
+		float stride = std::min(0.8f, 0.49f * v / 150.0f) * (m.speed < 0 ? -1.0f : 1.0f);
+		float swing = stride * std::sin(m.phase);
+		float tuck = m.jump >= 0 ? 0.6f * std::sin(3.14159f * m.jump / 0.75f) : 0.0f;
+		newBob = 2.0f * std::sin(m.phase * 2.0f) * std::min(1.0f, v / 150.0f);
+		if (gItem.lThigh) gItem.lThigh->local.rotate = gItem.lThigh0.rotate * scene::RotX(swing - tuck);
+		if (gItem.rThigh) gItem.rThigh->local.rotate = gItem.rThigh0.rotate * scene::RotX(-swing - tuck);
+		if (gItem.lCalf) gItem.lCalf->local.rotate = gItem.lCalf0.rotate * scene::RotX(std::max(0.0f, -swing) * 1.2f + tuck * 1.6f);
+		if (gItem.rCalf) gItem.rCalf->local.rotate = gItem.rCalf0.rotate * scene::RotX(std::max(0.0f, swing) * 1.2f + tuck * 1.6f);
+
+	}
+
+	auto* actor = gItem.scene.skeleton.actor;
+	actor->local.rotate = scene::RotZ(m.yaw);
+	V3 at = m.pos;
+	actor->local.translate = { at.x, at.y, z + newBob };
+	actor->world = actor->local;
+	hdt::updateTransformUpDown(actor);
+}
+
+static void OpenAnimationDialog()
+{
+	char file[MAX_PATH] = {};
+	OPENFILENAMEA ofn{ sizeof(ofn) };
+	ofn.hwndOwner = gWnd;
+	ofn.lpstrFilter = "Animations (*.kf)\0*.kf\0All files\0*.*\0";
+	ofn.lpstrFile = file;
+	ofn.nMaxFile = MAX_PATH;
+	ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+	std::string dir = gAnim.customPath.empty() ? (gAnim.found.count("idle") ? fs::path(gAnim.found["idle"]).parent_path().string() : "") : fs::path(gAnim.customPath).parent_path().string();
+	ofn.lpstrInitialDir = dir.empty() ? nullptr : dir.c_str();
+	if (GetOpenFileNameA(&ofn) && LoadClip(file)) {
+		gAnim.customPath = file;
+		gAnim.current = gAnim.previous = ClipPlay();   // replay from the start even if it was playing
+		gS.preset = kCustom;
+		AddLog(2, std::string("animation: ") + file);
+	}
+}
+
+
+
+static void LoadItem(const std::string& path)
+{
+	auto* world = hdt::SkyrimPhysicsWorld::get();
+	if (gItem.system) {
+		world->removeSkinnedMeshSystem(gItem.system.get());
+		gItem.system = nullptr;
+	}
+	AddLog(2, "loading " + path);
+	try {
+		Item next;
+		next.nifPath = path;
+		next.nifTime = TimeOf(path);
+		next.roots = datafiles::Discover(path, gSources);
+		// The game's skeleton, as the item will be on in game (and as the animations are made for).
+		gAnim.skeletonPath = datafiles::Resolve(next.roots, "meshes\\characters\\_male\\skeleton.nif");
+		try {
+			next.scene = scene::Load(path, gAnim.skeletonPath);
+		} catch (const std::exception& e) {
+			if (gAnim.skeletonPath.empty()) throw;
+			AddLog(3, "cannot read the skeleton " + gAnim.skeletonPath + " (" + e.what() + "): using the item's bind pose");
+			gAnim.skeletonPath.clear();
+			next.scene = scene::Load(path);
+		}
+		next.loaded = true;
+		gItem = std::move(next);
+	} catch (const std::exception& e) {
+		AddLog(4, std::string("cannot read ") + path + ": " + e.what());
+		return;
+	}
+	IniSet("LastFile", path);
+	gMotion = Motion();
+	gAnim.current = gAnim.previous = ClipPlay();
+	gAnim.wasAnimating = false;
+	gAnim.rest.clear();
+	for (auto& [name, node] : gItem.scene.skeleton.bones) gAnim.rest[name] = node->local;
+	{
+		std::string file = fs::path(path).stem().string();
+		for (auto& c : file) c = (char)tolower((unsigned char)c);
+		gAnim.female = file.size() > 2 && (file.compare(file.size() - 2, 2, "_f") == 0 || file.find("female") != std::string::npos);
+	}
+	FindAnimations();
+	if (gAnim.skeletonPath.empty()) AddLog(3, "no skeleton.nif found loose in the Data folders: the procedural motion is used");
+	else AddLog(2, "skeleton: " + gAnim.skeletonPath + "; " + std::to_string(gAnim.found.size()) + " locomotion animations found (" + (gAnim.female ? "female" : "male") + ")");
+	gItem.pelvis = Bone("Bip01 Pelvis");
+	gItem.lThigh = Bone("Bip01 L Thigh"); gItem.rThigh = Bone("Bip01 R Thigh");
+	gItem.lCalf = Bone("Bip01 L Calf"); gItem.rCalf = Bone("Bip01 R Calf");
+	if (gItem.pelvis) gItem.pelvis0 = gItem.pelvis->local;
+	if (gItem.lThigh) gItem.lThigh0 = gItem.lThigh->local;
+	if (gItem.rThigh) gItem.rThigh0 = gItem.rThigh->local;
+	if (gItem.lCalf) gItem.lCalf0 = gItem.lCalf->local;
+	if (gItem.rCalf) gItem.rCalf0 = gItem.rCalf->local;
+
+	for (auto& info : gItem.scene.shapes) {
+		ShapeDraw d;
+		d.info = info;
+		d.weights = scene::WeightsOf(info.geometry);
+		auto* td = (RE::NiTriShapeData*)info.geometry->data;
+		d.indices.assign(td->triList, td->triList + td->triListLength);
+		d.verts.resize(td->vertexCount);
+		if (!info.diffuse.empty()) {
+			d.texturePath = datafiles::Resolve(gItem.roots, info.diffuse);
+			if (d.texturePath.empty()) d.textureNote = "not found in any Data folder or archive";
+			else if (auto it = gTextureCache.find(d.texturePath); it != gTextureCache.end()) d.texture = it->second;
+			else {
+				std::string err;
+				d.texture = datafiles::LoadDDS(gDev, d.texturePath, &err);
+				d.textureNote = err;
+				gTextureCache[d.texturePath] = d.texture;
+			}
+		}
+		// Gore caps (the stumps a dismemberment shows) are hidden in game until a limb comes off.
+		{
+			std::string n = info.geometry->m_name ? info.geometry->m_name : "";
+			for (auto& c : n) c = (char)tolower((unsigned char)c);
+			if (n.find("cap") != std::string::npos || n.find("meathead") != std::string::npos) d.visible = false;
+		}
+		gItem.shapes.push_back(std::move(d));
+	}
+	AddLog(2, std::to_string(gItem.shapes.size()) + " shapes, skeleton of " + std::to_string(gItem.scene.skeleton.bones.size()) + " bones; " +
+		std::to_string(gItem.roots.folders.size()) + " Data folders and " + std::to_string(gItem.roots.archives.size()) + " archives searched");
+	auto& r = gItem.roots;
+	AddLog(2, r.mo2Instance.empty() ? std::string("MO2: none found") : "MO2: " + r.mo2Instance + ", profile '" + r.mo2Profile + "' (" + r.mo2How + ")");
+	AddLog(2, r.gameData.empty() ? std::string("game: not found") : "game: " + r.gameData + " (" + r.gameHow + ")");
+	for (auto& n : r.notes) AddLog(3, n);
+	BuildSystem();
+}
+
+static void OpenDialog()
+{
+	char file[MAX_PATH] = {};
+	OPENFILENAMEA ofn{ sizeof(ofn) };
+	ofn.hwndOwner = gWnd;
+	ofn.lpstrFilter = "NIF meshes (*.nif)\0*.nif\0All files\0*.*\0";
+	ofn.lpstrFile = file;
+	ofn.nMaxFile = MAX_PATH;
+	ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+	std::string last = IniGet("LastFile");
+	std::string dir = last.empty() ? "" : fs::path(last).parent_path().string();
+	ofn.lpstrInitialDir = dir.empty() ? nullptr : dir.c_str();
+	if (GetOpenFileNameA(&ofn)) LoadItem(file);
+}
+
+// A file picked with the system dialog (filter as "Name\0pattern\0"), or empty.
+static std::string PickFile(const char* filter, const std::string& startIn)
+{
+	char file[MAX_PATH] = {};
+	OPENFILENAMEA ofn{ sizeof(ofn) };
+	ofn.hwndOwner = gWnd;
+	ofn.lpstrFilter = filter;
+	ofn.lpstrFile = file;
+	ofn.nMaxFile = MAX_PATH;
+	ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+	ofn.lpstrInitialDir = startIn.empty() ? nullptr : startIn.c_str();
+	return GetOpenFileNameA(&ofn) ? std::string(file) : std::string();
+}
+
+// A folder picked with the system dialog, or empty.
+static std::string PickFolder()
+{
+	std::string result;
+	IFileOpenDialog* dlg = nullptr;
+	if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) {
+		DWORD opts = 0;
+		dlg->GetOptions(&opts);
+		dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+		IShellItem* item = nullptr;
+		if (SUCCEEDED(dlg->Show(gWnd)) && SUCCEEDED(dlg->GetResult(&item))) {
+			PWSTR path = nullptr;
+			if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+				char buf[MAX_PATH * 2];
+				WideCharToMultiByte(CP_ACP, 0, path, -1, buf, sizeof buf, nullptr, nullptr);
+				result = buf;
+				CoTaskMemFree(path);
+			}
+			item->Release();
+		}
+		dlg->Release();
+	}
+	return result;
+}
+
+static void UpdateWind(float t)
+{
+	auto* world = hdt::SkyrimPhysicsWorld::get();
+	if (!gS.wind) { world->setWind(btVector3(0, 0, 0)); return; }
+	float a = gS.windDirection * 3.14159f / 180.0f;
+	float gust = gS.windGusts ? 0.55f + 0.45f * (0.6f * std::sin(t * 0.9f) + 0.4f * std::sin(t * 2.3f + 1.0f)) : 1.0f;
+	world->setWind(btVector3(-std::sin(a), std::cos(a), 0) * (gS.windStrength * hdt::scaleSkyrim * gust));
+}
+
+// --- camera -----------------------------------------------------------------------------------------------
+
+struct Camera
+{
+	float yaw = 0.5f, pitch = 0.12f, dist = 250.0f;
+	V3 pan;
+	V3 target;
+	bool init = false;
+} gCam;
+
+static V3 FocusPoint()
+{
+	if (gItem.pelvis) return V3(gItem.pelvis->world.translate) - V3(0, 0, 22);
+	return V3(gItem.scene.skeleton.actor ? gItem.scene.skeleton.actor->world.translate : RE::NiPoint3{}) + V3(0, 0, 70);
+}
+
+static void UpdateCamera(float dt)
+{
+	ImGuiIO& io = ImGui::GetIO();
+	V3 focus = FocusPoint();
+	if (!gCam.init) { gCam.target = focus; gCam.init = true; }
+	float k = 1.0f - std::exp(-dt * 10.0f);
+	gCam.target = gCam.target + (focus - gCam.target) * k;
+	if (!io.WantCaptureMouse) {
+		if (ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0)) {
+			gCam.yaw -= io.MouseDelta.x * 0.008f;
+			gCam.pitch = std::clamp(gCam.pitch + io.MouseDelta.y * 0.008f, -1.4f, 1.4f);
+		}
+		if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0)) {
+			V3 right(std::cos(gCam.yaw), std::sin(gCam.yaw), 0);
+			gCam.pan = gCam.pan + right * (-io.MouseDelta.x * gCam.dist * 0.0015f) + V3(0, 0, io.MouseDelta.y * gCam.dist * 0.0015f);
+		}
+		if (io.MouseWheel != 0) gCam.dist = std::clamp(gCam.dist * std::pow(0.88f, io.MouseWheel), 20.0f, 2000.0f);
+		// Ctrl + left drag: drag the body around (the cloth feels it like any other move).
+		if (io.KeyCtrl && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0)) {
+			V3 right(std::cos(gCam.yaw), std::sin(gCam.yaw), 0), fwd(-std::sin(gCam.yaw), std::cos(gCam.yaw), 0);
+			float s = gCam.dist * 0.0022f;
+			gMotion.pos = gMotion.pos + right * (io.MouseDelta.x * s) + fwd * (-io.MouseDelta.y * s);
+		}
+	}
+	if (!io.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_F)) { gCam.pan = V3(); gCam.dist = 250.0f; }
+}
+
+static V3 CameraEye()
+{
+	V3 at = gCam.target + gCam.pan;
+	// yaw 0 looks at the body's front (+y): the eye sits on +y.
+	V3 dir(-std::sin(gCam.yaw) * std::cos(gCam.pitch), std::cos(gCam.yaw) * std::cos(gCam.pitch), std::sin(gCam.pitch));
+	return at + dir * gCam.dist;
+}
+
+// --- drawing ----------------------------------------------------------------------------------------------
+
+static void SkinShape(ShapeDraw& s)
+{
+	auto* g = s.info.geometry;
+	int n = (int)s.verts.size();
+	bool hasNormals = (int)s.info.normals.size() == n;
+	for (int v = 0; v < n; v++) {
+		RE::NiPoint3 p = g->skinInstance ? scene::SkinVertex(g, v, s.weights) : g->world * g->data->vertices[v];
+		auto& o = s.verts[v];
+		o.px = p.x; o.py = p.y; o.pz = p.z;
+		if (hasNormals) {
+			RE::NiPoint3 nn = g->skinInstance ? scene::SkinNormal(g, s.info.normals[v], v, s.weights)
+			                                  : g->world.rotate * RE::NiPoint3{ s.info.normals[v].x, s.info.normals[v].y, s.info.normals[v].z };
+			o.nx = nn.x; o.ny = nn.y; o.nz = nn.z;
+		}
+		if (v < (int)s.info.uvs.size()) { o.u = s.info.uvs[v].first; o.v = s.info.uvs[v].second; }
+	}
+	if (!hasNormals) {
+		for (auto& o : s.verts) o.nx = o.ny = o.nz = 0;
+		for (size_t t = 0; t + 2 < s.indices.size(); t += 3) {
+			auto &a = s.verts[s.indices[t]], &b = s.verts[s.indices[t + 1]], &c = s.verts[s.indices[t + 2]];
+			V3 fn = Cross(V3(b.px - a.px, b.py - a.py, b.pz - a.pz), V3(c.px - a.px, c.py - a.py, c.pz - a.pz));
+			for (auto* o : { &a, &b, &c }) { o->nx += fn.x; o->ny += fn.y; o->nz += fn.z; }
+		}
+	}
+}
+
+static void SetPS(const float color[4], float textured, float alphaTest, float unlit)
+{
+	V3 key = Norm(V3(0.35f, 0.6f, 0.7f)), fill = Norm(V3(-0.6f, -0.4f, 0.2f));
+	float c[16] = { key.x, key.y, key.z, 0, color[0], color[1], color[2], color[3], textured, alphaTest, unlit, 0, fill.x, fill.y, fill.z, 0 };
+	gDev->SetPixelShaderConstantF(0, c, 4);
+}
+
+static void DrawLines(const std::vector<LineVertex>& lines, D3DPRIMITIVETYPE type, bool onTop)
+{
+	if (lines.empty()) return;
+	gDev->SetVertexShader(nullptr);
+	gDev->SetPixelShader(nullptr);
+	gDev->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE);
+	gDev->SetTexture(0, nullptr);
+	gDev->SetRenderState(D3DRS_LIGHTING, FALSE);
+	gDev->SetRenderState(D3DRS_ZENABLE, onTop ? FALSE : TRUE);
+	gDev->SetRenderState(D3DRS_POINTSIZE_MIN, 0);
+	float ps = 6.0f;
+	gDev->SetRenderState(D3DRS_POINTSIZE, *(DWORD*)&ps);
+	UINT count = type == D3DPT_LINELIST ? (UINT)lines.size() / 2 : (UINT)lines.size();
+	gDev->DrawPrimitiveUP(type, count, lines.data(), sizeof(LineVertex));
+	gDev->SetRenderState(D3DRS_ZENABLE, TRUE);
+}
+
+static void DrawScene(const M4& viewProj, const M4& view, const M4& proj)
+{
+	gDev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+	gDev->SetRenderState(D3DRS_ZENABLE, TRUE);
+	gDev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+	gDev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+	gDev->SetRenderState(D3DRS_MULTISAMPLEANTIALIAS, TRUE);
+	M4 id;
+	gDev->SetTransform(D3DTS_WORLD, (D3DMATRIX*)&id);
+	gDev->SetTransform(D3DTS_VIEW, (D3DMATRIX*)&view);
+	gDev->SetTransform(D3DTS_PROJECTION, (D3DMATRIX*)&proj);
+
+	// The floor: a grid around the body.
+	if (gS.showFloor) {
+		std::vector<LineVertex> grid;
+		const float cell = 32.0f;
+		const int n = 20;
+		float cx = std::floor(gMotion.pos.x / cell) * cell, cy = std::floor(gMotion.pos.y / cell) * cell;
+		for (int i = -n; i <= n; i++) {
+			D3DCOLOR c = i == 0 ? D3DCOLOR_ARGB(255, 90, 95, 105) : D3DCOLOR_ARGB(255, 62, 66, 74);
+			grid.push_back({ cx + i * cell, cy - n * cell, 0, c });
+			grid.push_back({ cx + i * cell, cy + n * cell, 0, c });
+			grid.push_back({ cx - n * cell, cy + i * cell, 0, c });
+			grid.push_back({ cx + n * cell, cy + i * cell, 0, c });
+		}
+		DrawLines(grid, D3DPT_LINELIST, false);
+	}
+
+	// The item.
+	gDev->SetVertexShader(gVS);
+	gDev->SetPixelShader(gPS);
+	gDev->SetVertexDeclaration(gDecl);
+	gDev->SetVertexShaderConstantF(0, (float*)&viewProj, 4);
+	gDev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_ANISOTROPIC);
+	gDev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+	gDev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+	gDev->SetSamplerState(0, D3DSAMP_MAXANISOTROPY, 8);
+	// Shapes without a usable texture: quiet greys, a little apart so neighbouring shapes read.
+	static const float kPalette[][4] = { { 0.46f, 0.44f, 0.42f, 1 }, { 0.40f, 0.41f, 0.43f, 1 }, { 0.44f, 0.42f, 0.40f, 1 }, { 0.38f, 0.39f, 0.41f, 1 }, { 0.48f, 0.46f, 0.44f, 1 }, { 0.42f, 0.43f, 0.45f, 1 } };
+	for (size_t i = 0; i < gItem.shapes.size(); i++) {
+		auto& s = gItem.shapes[i];
+		if (!s.visible || s.indices.empty()) continue;
+		SkinShape(s);
+		bool tex = gS.textures && s.texture && !s.info.uvs.empty();
+		const float white[4] = { 1, 1, 1, 1 };
+		SetPS(tex ? white : kPalette[i % 6], tex ? 1.0f : 0.0f, s.info.alpha && tex ? 1.0f : 0.0f, 0);
+		gDev->SetTexture(0, tex ? s.texture : nullptr);
+		gDev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, (UINT)s.verts.size(), (UINT)s.indices.size() / 3, s.indices.data(), D3DFMT_INDEX16, s.verts.data(), sizeof(MeshVertex));
+	}
+	// Wireframe and collision shapes on top of the surfaces.
+	gDev->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
+	gDev->SetRenderState(D3DRS_DEPTHBIAS, 0);
+	gDev->SetTexture(0, nullptr);
+	for (auto& s : gItem.shapes) {
+		if (!s.visible || s.indices.empty()) continue;
+		bool collider = gS.showColliders && s.collider;
+		if (!gS.wireframe && !collider) continue;
+		const float cloth[4] = { 1.0f, 0.62f, 0.15f, 1 }, body[4] = { 0.25f, 0.85f, 1.0f, 1 }, wire[4] = { 0.05f, 0.05f, 0.05f, 1 };
+		SetPS(collider ? (s.collider == 1 ? cloth : body) : wire, 0, 0, 1);
+		gDev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, (UINT)s.verts.size(), (UINT)s.indices.size() / 3, s.indices.data(), D3DFMT_INDEX16, s.verts.data(), sizeof(MeshVertex));
+	}
+	gDev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+
+	// Bones and constraints, through everything.
+	if (gItem.system && (gS.showBones || gS.showConstraints)) {
+		std::vector<LineVertex> lines, points;
+		auto P = [](const RE::NiPoint3& p) { return V3(p); };
+		auto add = [&](V3 a, V3 b, D3DCOLOR c) { lines.push_back({ a.x, a.y, a.z, c }); lines.push_back({ b.x, b.y, b.z, c }); };
+		if (gS.showConstraints) {
+			auto addC = [&](hdt::BoneScaleConstraint* c, D3DCOLOR col) {
+				auto a = c->m_boneA->m_rig.getWorldTransform().getOrigin(), b = c->m_boneB->m_rig.getWorldTransform().getOrigin();
+				add(V3(a.x(), a.y(), a.z()), V3(b.x(), b.y(), b.z()), col);
+			};
+			for (auto& c : gItem.system->constraints()) addC(c.get(), D3DCOLOR_ARGB(255, 120, 230, 120));
+			int gi = 0;
+			for (auto& g : gItem.system->constraintGroups()) {
+				D3DCOLOR col = (gi++ & 1) ? D3DCOLOR_ARGB(255, 90, 200, 255) : D3DCOLOR_ARGB(255, 120, 230, 120);
+				for (auto& c : g->m_constraints) addC(c.get(), col);
+			}
+		}
+		if (gS.showBones) {
+			for (auto& b : gItem.system->getBones()) {
+				auto* bone = static_cast<hdt::SkyrimBone*>(b.get());
+				bool dyn = !bone->m_rig.isStaticOrKinematicObject();
+				D3DCOLOR c = dyn ? D3DCOLOR_ARGB(255, 255, 170, 40) : D3DCOLOR_ARGB(255, 150, 160, 180);
+				V3 p = P(bone->m_node->world.translate);
+				points.push_back({ p.x, p.y, p.z, c });
+				RE::NiAVObject* parent = bone->m_anchor ? (RE::NiAVObject*)bone->m_anchor.get() : (RE::NiAVObject*)bone->m_node->parent;
+				if (parent && parent != gItem.scene.skeleton.actor) add(P(parent->world.translate), p, dyn ? D3DCOLOR_ARGB(255, 200, 130, 30) : D3DCOLOR_ARGB(255, 100, 108, 125));
+			}
+		}
+		DrawLines(lines, D3DPT_LINELIST, true);
+		DrawLines(points, D3DPT_POINTLIST, true);
+	}
+}
+
+// --- the panels -------------------------------------------------------------------------------------------
+
+static void Help(const char* text)
+{
+	ImGui::SameLine();
+	ImGui::TextDisabled("(?)");
+	if (ImGui::BeginItemTooltip()) {
+		ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+		ImGui::TextUnformatted(text);
+		ImGui::PopTextWrapPos();
+		ImGui::EndTooltip();
+	}
+}
+
+static void Panels(float fps)
+{
+	auto* world = hdt::SkyrimPhysicsWorld::get();
+	ImGuiIO& io = ImGui::GetIO();
+	ImGui::SetNextWindowPos(ImVec2(8, 8), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(ImVec2(360, io.DisplaySize.y - 16), ImGuiCond_FirstUseEver);
+	ImGui::Begin("NV SMP Previewer");
+
+	if (ImGui::Button("Open NIF...")) OpenDialog();
+	ImGui::SameLine();
+	ImGui::BeginDisabled(!gItem.loaded);
+	if (ImGui::Button("Reload")) LoadItem(gItem.nifPath);
+	ImGui::SameLine();
+	if (ImGui::Button("Edit XML") && !gItem.xmlPath.empty()) ShellExecuteA(gWnd, "open", gItem.xmlPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+	ImGui::SameLine();
+	if (ImGui::Button("Folder")) ShellExecuteA(gWnd, "open", fs::path(gItem.nifPath).parent_path().string().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+	ImGui::EndDisabled();
+	ImGui::SameLine();
+	if (ImGui::Button("Screenshot")) gShotPending = true;
+	ImGui::Checkbox("Reload when the files change", &gS.autoReload);
+	if (gItem.loaded) {
+		ImGui::TextWrapped("NIF: %s", gItem.nifPath.c_str());
+		if (gItem.xmlPath.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "XML: %s (not found)", gItem.xmlNamed.empty() ? "none named" : gItem.xmlNamed.c_str());
+		else ImGui::TextWrapped("XML: %s", gItem.xmlPath.c_str());
+		if (gItem.system)
+			ImGui::Text("%zu bones (%d simulated), %d constraints, %zu bodies", gItem.system->getBones().size(), gItem.simulatedBones, gItem.constraintCount, gItem.system->meshes().size());
+		ImGui::Text("physics %.2f ms/step   %.0f fps", world->m_averageStepMs, fps);
+	} else {
+		ImGui::TextWrapped("Open an SMP NIF (or drop one on the window).");
+	}
+
+	if (ImGui::CollapsingHeader("Motion", ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (ImGui::Combo("Motion##preset", &gS.preset, kPresets, IM_ARRAYSIZE(kPresets))) {   // own ID: the header is "Motion" too
+			// The sneak presets crouch; leaving them stands up.
+			bool sneakPreset = gS.preset == kSneak || gS.preset == kSneakWalk;
+			if (sneakPreset != gAnim.sneak && (sneakPreset || gS.preset != kDrive)) { gAnim.sneak = sneakPreset; FindAnimations(); }
+		}
+		if (gS.preset == kDrive) ImGui::TextDisabled("W/S move, Q/E strafe, A/D turn, Shift runs, Space jumps, C sneaks");
+		bool canAnimate = !gAnim.skeletonPath.empty();
+		ImGui::BeginDisabled(!canAnimate);
+		ImGui::Checkbox("Game animations", &gAnim.use);
+		ImGui::EndDisabled();
+		Help(canAnimate ? "The game's skeleton and the locomotion animations installed loose (MO2 mods, Data), as the game would pick them. Off: a procedural stride."
+		                : "No skeleton.nif found loose in the Data folders: the procedural stride is used.");
+		if (canAnimate && gAnim.use) {
+			bool rescan = ImGui::Combo("Stance", &gAnim.stance, kStances, IM_ARRAYSIZE(kStances));
+			ImGui::SameLine();
+			rescan |= ImGui::Checkbox("Female", &gAnim.female);
+			ImGui::SameLine();
+			rescan |= ImGui::Checkbox("Sneak", &gAnim.sneak);
+			if (rescan) { FindAnimations(); gAnim.current = gAnim.previous = ClipPlay(); }
+			if (ImGui::Button("Play animation file...")) OpenAnimationDialog();
+			if (gAnim.current.clip) {
+				ImGui::TextDisabled("%s  %.2f / %.2f s", fs::path(gAnim.current.path).filename().string().c_str(), gAnim.current.time - gAnim.current.clip->start, gAnim.current.clip->Duration());
+				if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", gAnim.current.path.c_str());
+			}
+			if (ImGui::TreeNode("Animations found", "Animations found (%zu of %zu)", gAnim.found.size(), IM_ARRAYSIZE(kActions))) {
+				for (const char* a : kActions) {
+					auto it = gAnim.found.find(a);
+					if (it == gAnim.found.end()) ImGui::TextDisabled("%s%s: not installed", kStancePrefix[gAnim.stance], a);
+					else {
+						std::string shown = fs::path(it->second).stem().string();
+						if (gAnim.borrowed.count(a)) ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "%s%s: borrowed %s (none for this stance)", kStancePrefix[gAnim.stance], a, shown.c_str());
+						else ImGui::Text("%s%s%s", kStancePrefix[gAnim.stance], a, shown.find("aim") != std::string::npos && std::string(a) == "idle" ? " (aim)" : "");
+						if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", it->second.c_str());
+					}
+				}
+				ImGui::TreePop();
+			}
+		}
+		ImGui::SliderFloat("Speed", &gS.speedScale, 0.1f, 2.0f, "%.2f x");
+		ImGui::SliderFloat("Time", &gS.timeScale, 0.05f, 1.0f, "%.2f x"); Help("Slow motion: the body and the physics both slow down.");
+		if (ImGui::Button("Back to start")) { gMotion = Motion(); gAnim.current = gAnim.previous = ClipPlay(); world->resetSystems(); }
+		ImGui::TextDisabled("Ctrl + drag: move the body by hand");
+	}
+
+	if (ImGui::CollapsingHeader("Physics", ImGuiTreeNodeFlags_DefaultOpen)) {
+		bool changed = false;
+		if (ImGui::Button("Reset physics")) { AddLog(2, "physics reset"); BuildSystem(); }
+		Help("As the game's F7 menu: throws the physics away and builds it again from the XML, the cloth at rest on the body as it is now.");
+		ImGui::SameLine();
+		if (ImGui::Button("Reset pose")) world->resetSystems();
+		Help("Only puts the cloth back at rest, keeping the physics as built.");
+		ImGui::Checkbox("Simulate", &gS.physics);
+		changed |= ImGui::SliderFloat("Gravity", &gS.gravity, 0.0f, 3.0f, "%.2f x");
+		changed |= ImGui::SliderInt("Rate (min fps)", &gS.minFps, 30, 240); Help("Physics steps per second at least (FSMP's min-fps).");
+		changed |= ImGui::SliderInt("Max substeps", &gS.maxSubSteps, 1, 16);
+		changed |= ImGui::SliderInt("Solver iterations", &gS.solverIterations, 1, 64);
+		changed |= ImGui::Checkbox("Collisions", &gS.collisions);
+		ImGui::SameLine();
+		if (ImGui::Checkbox("Ground collision", &gS.ground) && gItem.loaded) BuildSystem();
+		Help("As the game's F7 menu: a ground plane at the feet the cloth rests on when crouching or sitting (the floor grid is at its height).");
+		ImGui::SliderFloat("Waist collision", &gS.waistCollision, 0.0f, 1.0f, "%.2f");
+		bool waistReleased = ImGui::IsItemDeactivatedAfterEdit();
+		Help("As in the game's F7 menu: the rows the physics file keeps out of collision. 0 = they follow the body, 1 = they collide. Rebuilds on release.");
+		if (waistReleased && gItem.loaded) BuildSystem();
+		changed |= ImGui::Checkbox("Wind", &gS.wind);
+		if (gS.wind) {
+			changed |= ImGui::SliderFloat("Wind strength", &gS.windStrength, 0.0f, 10.0f, "%.2f");
+			ImGui::SliderFloat("Wind from", &gS.windDirection, -180.0f, 180.0f, "%.0f deg");
+			ImGui::Checkbox("Gusts", &gS.windGusts);
+		}
+		if (changed) ApplyWorldSettings();
+	}
+
+	if (ImGui::CollapsingHeader("Display", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::Checkbox("Textures", &gS.textures); ImGui::SameLine();
+		ImGui::Checkbox("Wireframe", &gS.wireframe); ImGui::SameLine();
+		ImGui::Checkbox("Floor", &gS.showFloor);
+		ImGui::Checkbox("Bones", &gS.showBones); ImGui::SameLine();
+		ImGui::Checkbox("Constraints", &gS.showConstraints); ImGui::SameLine();
+		ImGui::Checkbox("Collision", &gS.showColliders);
+		Help("Bones: orange simulated, grey animated. Constraints: the links between bones. Collision: orange = cloth (per-vertex), blue = body (per-triangle).");
+		ImGui::ColorEdit3("Background", gS.background, ImGuiColorEditFlags_NoInputs);
+		if (gItem.loaded && ImGui::TreeNode("Shapes")) {
+			for (size_t i = 0; i < gItem.shapes.size(); i++) {
+				auto& s = gItem.shapes[i];
+				ImGui::PushID((int)i);   // shapes can share a name
+				ImGui::Checkbox(s.info.geometry->m_name ? s.info.geometry->m_name : "(unnamed)", &s.visible);
+				if (s.collider) { ImGui::SameLine(); ImGui::TextColored(s.collider == 1 ? ImVec4(1, 0.62f, 0.15f, 1) : ImVec4(0.25f, 0.85f, 1, 1), s.collider == 1 ? "cloth" : "body"); }
+				if (!s.textureNote.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", s.info.diffuse.c_str(), s.textureNote.c_str());
+				ImGui::PopID();
+			}
+			ImGui::TreePop();
+		}
+	}
+
+	if (ImGui::CollapsingHeader("Data sources")) {
+		auto& r = gItem.roots;
+		bool changed = false;
+		ImGui::TextDisabled("Mod Organizer 2");
+		if (r.mo2Instance.empty()) ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "none found");
+		else { ImGui::TextWrapped("%s", r.mo2Instance.c_str()); ImGui::TextDisabled("(%s)", r.mo2How.c_str()); }
+		if (ImGui::Button("Choose instance...")) {
+			std::string f = PickFile("MO2 settings (ModOrganizer.ini)\0ModOrganizer.ini\0", r.mo2Instance);
+			if (!f.empty()) { gSources.mo2Instance = fs::path(f).parent_path().string(); gSources.mo2Profile.clear(); changed = true; }
+		}
+		Help("A portable instance's folder, or a global one's (%LOCALAPPDATA%\\ModOrganizer\\<name>): pick its ModOrganizer.ini.");
+		ImGui::SameLine();
+		ImGui::BeginDisabled(gSources.mo2Instance.empty());
+		if (ImGui::Button("Auto##mo2")) { gSources.mo2Instance.clear(); gSources.mo2Profile.clear(); changed = true; }
+		ImGui::EndDisabled();
+		if (!r.mo2Profiles.empty() && ImGui::BeginCombo("Profile", r.mo2Profile.c_str())) {
+			for (auto& p : r.mo2Profiles)
+				if (ImGui::Selectable(p.c_str(), p == r.mo2Profile)) { gSources.mo2Profile = p; changed = true; }
+			ImGui::EndCombo();
+		}
+
+		ImGui::Spacing();
+		ImGui::TextDisabled("Game");
+		if (r.gameData.empty()) ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "not found");
+		else { ImGui::TextWrapped("%s", r.gameData.c_str()); ImGui::TextDisabled("(%s)", r.gameHow.c_str()); }
+		if (ImGui::Button("Choose game...")) {
+			std::string f = PickFile("Fallout New Vegas (FalloutNV.exe)\0FalloutNV.exe\0", r.gameData);
+			if (!f.empty()) { gSources.gameFolder = fs::path(f).parent_path().string(); changed = true; }
+		}
+		ImGui::SameLine();
+		ImGui::BeginDisabled(gSources.gameFolder.empty());
+		if (ImGui::Button("Auto##game")) { gSources.gameFolder.clear(); changed = true; }
+		ImGui::EndDisabled();
+
+		ImGui::Spacing();
+		char label[64];
+		snprintf(label, sizeof label, "Read BSA archives (%zu)", r.archives.size());
+		changed |= ImGui::Checkbox(label, &gSources.useArchives);
+		Help("The vanilla and DLC archives and the mods' own: animations, skeletons and textures that are not installed loose. Loose files win, as in game.");
+
+		ImGui::TextDisabled("Extra folders");
+		Help("Searched after the mods, before the game: a Data folder of a manual install, a mod being made outside MO2...");
+		for (size_t i = 0; i < gSources.extraFolders.size(); i++) {
+			ImGui::PushID((int)i);
+			bool remove = ImGui::SmallButton("x");
+			ImGui::SameLine();
+			ImGui::TextUnformatted(gSources.extraFolders[i].c_str());
+			ImGui::PopID();
+			if (remove) { gSources.extraFolders.erase(gSources.extraFolders.begin() + i); changed = true; break; }
+		}
+		if (ImGui::Button("Add folder...")) {
+			std::string f = PickFolder();
+			if (!f.empty()) { gSources.extraFolders.push_back(f); changed = true; }
+		}
+
+		for (auto& n : r.notes) ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "%s", n.c_str());
+		if (ImGui::TreeNode("Search order", "Search order (%zu folders, %zu archives)", r.folders.size(), r.archives.size())) {
+			for (auto& f : r.folders) ImGui::TextUnformatted(f.c_str());
+			for (auto& a : r.archives) ImGui::TextDisabled("%s (%zu files)", a->Path().c_str(), a->FileCount());
+			ImGui::TreePop();
+		}
+		if (changed) {
+			SaveSources();
+			if (gItem.loaded) LoadItem(gItem.nifPath);
+		}
+	}
+	ImGui::TextDisabled("Right drag: orbit   Middle drag: pan   Wheel: zoom   F: recentre");
+	ImGui::End();
+
+	// The log.
+	ImGui::SetNextWindowPos(ImVec2(376, io.DisplaySize.y - 168), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x - 384, 160), ImGuiCond_FirstUseEver);
+	ImGui::Begin("Log");
+	if (ImGui::SmallButton("Clear")) gLog.clear();
+	ImGui::BeginChild("lines");
+	for (auto& e : gLog) {
+		ImVec4 c = e.level >= 4 ? ImVec4(1, 0.45f, 0.4f, 1) : e.level == 3 ? ImVec4(1, 0.8f, 0.4f, 1) : ImVec4(0.8f, 0.82f, 0.86f, 1);
+		ImGui::TextColored(c, "%s", e.text.c_str());
+	}
+	if (gLogScroll) { ImGui::SetScrollHereY(1.0f); gLogScroll = false; }
+	ImGui::EndChild();
+	ImGui::End();
+}
+
+// --- the window -----------------------------------------------------------------------------------------
+
+static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) return true;
+	switch (msg) {
+	case WM_SIZE:
+		if (wParam != SIZE_MINIMIZED) { gResizeW = LOWORD(lParam); gResizeH = HIWORD(lParam); }
+		return 0;
+	case WM_DROPFILES: {
+		char file[MAX_PATH];
+		if (DragQueryFileA((HDROP)wParam, 0, file, MAX_PATH)) LoadItem(file);
+		DragFinish((HDROP)wParam);
+		return 0;
+	}
+	case WM_SYSCOMMAND:
+		if ((wParam & 0xfff0) == SC_KEYMENU) return 0;
+		break;
+	case WM_DESTROY:
+		PostQuitMessage(0);
+		return 0;
+	}
+	return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
+{
+	char exe[MAX_PATH];
+	GetModuleFileNameA(nullptr, exe, MAX_PATH);
+	gIniPath = (fs::path(exe).parent_path() / "NVSMPPreviewer.ini").string();
+
+	WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, inst, LoadIcon(nullptr, IDI_APPLICATION), LoadCursor(nullptr, IDC_ARROW), nullptr, nullptr, L"NVSMPPreviewer", nullptr };
+	RegisterClassExW(&wc);
+	gWnd = CreateWindowW(wc.lpszClassName, L"NV SMP Previewer", WS_OVERLAPPEDWINDOW, 100, 60, 1600, 960, nullptr, nullptr, inst, nullptr);
+	if (!CreateDevice()) {
+		MessageBoxA(nullptr, "Could not create a Direct3D 9 device.", "NV SMP Previewer", MB_ICONERROR);
+		return 1;
+	}
+	DragAcceptFiles(gWnd, TRUE);
+	ShowWindow(gWnd, SW_SHOWDEFAULT);
+	UpdateWindow(gWnd);
+
+	IMGUI_CHECKVERSION();
+	ImGui::CreateContext();
+	ImGuiIO& io = ImGui::GetIO();
+	io.IniFilename = nullptr;
+	ImGui::StyleColorsDark();
+	ImGui::GetStyle().WindowRounding = 4.0f;
+	ImGui_ImplWin32_Init(gWnd);
+	ImGui_ImplDX9_Init(gDev);
+	CompileShaders();
+	CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);   // the folder picker
+	LoadSources();
+
+	ApplyWorldSettings();
+	AddLog(2, "NV SMP Previewer: FSMP physics core, Bullet " + std::to_string(btGetVersion()));
+
+	// Command line: [item.nif] and, for automated captures, --motion N --shots prefix --every frames
+	// --count n --show bones,constraints,collision,wire --yaw deg --pitch deg --dist units --noui --exit.
+	int argc = 0;
+	LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+	std::vector<std::string> args;
+	for (int i = 1; i < argc; i++) {
+		char buf[1024];
+		WideCharToMultiByte(CP_ACP, 0, argv[i], -1, buf, sizeof buf, nullptr, nullptr);
+		args.push_back(buf);
+	}
+	LocalFree(argv);
+	std::string start, shots, jitterOut, clipOut;   // --jitter / --clip file: how much the cloth shakes / clips (see below)
+	int shotEvery = 20, shotCount = 0;
+	bool noUi = false, exitAfter = false;
+	for (size_t i = 0; i < args.size(); i++) {
+		const std::string& a = args[i];
+		auto next = [&]() { return i + 1 < args.size() ? args[++i] : std::string(); };
+		if (a == "--motion") gS.preset = std::clamp(atoi(next().c_str()), 0, IM_ARRAYSIZE(kPresets) - 1);
+		else if (a == "--shots") shots = next();
+		else if (a == "--every") shotEvery = std::max(1, atoi(next().c_str()));
+		else if (a == "--count") shotCount = atoi(next().c_str());
+		else if (a == "--yaw") gCam.yaw = (float)atof(next().c_str()) * 3.14159f / 180.0f;
+		else if (a == "--pitch") gCam.pitch = (float)atof(next().c_str()) * 3.14159f / 180.0f;
+		else if (a == "--dist") gCam.dist = (float)atof(next().c_str());
+		else if (a == "--noui") noUi = true;
+		else if (a == "--noanim") gAnim.use = false;
+		else if (a == "--sneak") gAnim.sneak = true;
+		else if (a == "--noground") gS.ground = false;
+		else if (a == "--nocollisions") gS.collisions = false;
+		else if (a == "--iterations") gS.solverIterations = atoi(next().c_str());
+		else if (a == "--jitter") jitterOut = next();
+		else if (a == "--clip") clipOut = next();
+		else if (a == "--stance") gAnim.stance = std::clamp(atoi(next().c_str()), 0, IM_ARRAYSIZE(kStances) - 1);
+		else if (a == "--kf") { gAnim.customPath = next(); gS.preset = kCustom; }
+		else if (a == "--exit") exitAfter = true;
+		else if (a == "--show") {
+			std::string s = next();
+			gS.showBones = s.find("bones") != std::string::npos;
+			gS.showConstraints = s.find("constraints") != std::string::npos;
+			gS.showColliders = s.find("collision") != std::string::npos;
+			gS.wireframe = s.find("wire") != std::string::npos;
+		} else if (a.rfind("--", 0) != 0) start = a;
+	}
+	ApplyWorldSettings();   // again: the command line may have changed them
+	if (start.empty()) start = IniGet("LastFile");
+	if (!start.empty() && fs::exists(start)) LoadItem(start);
+	int frameNo = 0, shotsTaken = 0;
+
+	LARGE_INTEGER freq, last, now;
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&last);
+	float fps = 60, reloadCheck = 0, wallTime = 0;
+	bool done = false;
+	while (!done) {
+		MSG msg;
+		while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+			if (msg.message == WM_QUIT) done = true;
+		}
+		if (done) break;
+		if (gResizeW && gResizeH) {
+			gPP.BackBufferWidth = gResizeW;
+			gPP.BackBufferHeight = gResizeH;
+			gResizeW = gResizeH = 0;
+			ResetDevice();
+		}
+		QueryPerformanceCounter(&now);
+		float dt = std::min(0.1f, (float)(now.QuadPart - last.QuadPart) / (float)freq.QuadPart);
+		last = now;
+		wallTime += dt;
+		fps += (1.0f / std::max(dt, 1e-4f) - fps) * 0.05f;
+
+		ImGui_ImplDX9_NewFrame();
+		ImGui_ImplWin32_NewFrame();
+		ImGui::NewFrame();
+
+		// Edited files: the XML rebuilds the physics, the NIF reloads everything.
+		reloadCheck += dt;
+		if (gItem.loaded && gS.autoReload && reloadCheck > 0.5f) {
+			reloadCheck = 0;
+			if (TimeOf(gItem.nifPath) != gItem.nifTime) LoadItem(gItem.nifPath);
+			else if (!gItem.xmlPath.empty() && TimeOf(gItem.xmlPath) != gItem.xmlTime) { AddLog(2, "the XML changed: rebuilding"); BuildSystem(); }
+		}
+
+		if (gItem.loaded) {
+			float simDt = jitterOut.empty() && clipOut.empty() ? dt * gS.timeScale : 1.0f / 120.0f;   // measuring: a fixed step, comparable runs
+			UpdateMotion(simDt);
+			UpdateWind(wallTime);
+			if (gS.physics && gItem.system) hdt::SkyrimPhysicsWorld::get()->doUpdate(simDt);
+
+			// --jitter: the simulated bones' frame-to-frame shake in the actor's frame, as the second difference
+			// of their positions (smooth swinging leaves it near 0; fighting contacts make it large), over 4 s
+			// after 2 s of settling, then written out with the worst bones and the program closes.
+			// --clip: how much of the cloth gets inside the legs, against the leg shape fitted from the "Legs"
+			// mesh (tapered: a lower-quartile radius at each end of each thigh and shin), overall and for the
+			// top two cloth rows (hip height), over the same 4 s.
+			if (!clipOut.empty() && gItem.system && frameNo >= 240) {
+				struct Seg { RE::NiAVObject* a; RE::NiAVObject* b; float ra, rb; };
+				static std::vector<Seg> segs;
+				static ShapeDraw* cloth = nullptr;
+				static std::vector<int> skirt;
+				static std::set<int> upper;
+				static int samples = 0, inside = 0, upperSamples = 0, upperInside = 0, frames = 0;
+				static float deepest = 0, upperDeepest = 0;
+				auto dist = [](const Seg& g, const RE::NiPoint3& p, float& t) {
+					RE::NiPoint3 a = g.a->world.translate, ab = g.b->world.translate - a, ap = p - a;
+					float len2 = std::max(ab.x * ab.x + ab.y * ab.y + ab.z * ab.z, 1e-6f);
+					t = std::clamp((ap.x * ab.x + ap.y * ab.y + ap.z * ab.z) / len2, 0.0f, 1.0f);
+					return (p - (a + ab * t)).Length();
+				};
+				if (segs.empty()) {
+					for (const char* side : { "L", "R" }) {
+						auto* th = Bone((std::string("Bip01 ") + side + " Thigh").c_str());
+						auto* ca = Bone((std::string("Bip01 ") + side + " Calf").c_str());
+						auto* fo = Bone((std::string("Bip01 ") + side + " Foot").c_str());
+						if (th && ca) segs.push_back({ th, ca, 0, 0 });
+						if (ca && fo) segs.push_back({ ca, fo, 0, 0 });
+					}
+					ShapeDraw* legs = nullptr;
+					for (auto& s : gItem.shapes) {
+						if (s.info.geometry->m_name && _stricmp(s.info.geometry->m_name, "Legs") == 0) legs = &s;
+						if (s.collider == 1 && !cloth) cloth = &s;
+					}
+					if (legs) {
+						std::vector<std::vector<float>> all(segs.size()), nearA(segs.size()), nearB(segs.size());
+						for (int v = 0; v < (int)legs->weights.size(); v++) {
+							RE::NiPoint3 q = scene::SkinVertex(legs->info.geometry, v, legs->weights);
+							int best = -1;
+							float bd = 1e9f, bt = 0;
+							for (size_t i = 0; i < segs.size(); i++) { float t, d = dist(segs[i], q, t); if (d < bd) { bd = d; bt = t; best = (int)i; } }
+							if (best < 0) continue;
+							all[best].push_back(bd);
+							if (bt < 0.33f) nearA[best].push_back(bd);
+							if (bt > 0.67f) nearB[best].push_back(bd);
+						}
+						auto quartile = [](std::vector<float> v) { std::sort(v.begin(), v.end()); return v[v.size() / 4]; };
+						for (size_t i = 0; i < segs.size(); i++) {
+							if (all[i].empty()) continue;
+							float whole = quartile(all[i]);
+							segs[i].ra = nearA[i].size() >= 10 ? quartile(nearA[i]) : whole;
+							segs[i].rb = nearB[i].size() >= 10 ? quartile(nearB[i]) : whole;
+						}
+					}
+					if (cloth)
+						for (int v = 0; v < (int)cloth->weights.size(); v++)
+							for (auto& [slot, w] : cloth->weights[v]) {
+								std::string n = cloth->info.geometry->skinInstance->bones[slot]->m_name ? cloth->info.geometry->skinInstance->bones[slot]->m_name : "";
+								if (w <= 0.3f || _strnicmp(n.c_str(), "SMP", 3) != 0) continue;
+								skirt.push_back(v);
+								if (n.size() > 3 && (n.compare(n.size() - 3, 3, " R0") == 0 || n.compare(n.size() - 3, 3, " R1") == 0)) upper.insert(v);
+								break;
+							}
+				}
+				if (cloth && frameNo % 2 == 0)
+					for (int v : skirt) {
+						RE::NiPoint3 p = scene::SkinVertex(cloth->info.geometry, v, cloth->weights);
+						float depth = -1e9f;
+						for (auto& g : segs) {
+							if (g.ra <= 0) continue;
+							float t, d = dist(g, p, t);
+							depth = std::max(depth, g.ra + (g.rb - g.ra) * t - d);
+						}
+						bool in = depth > 0.5f;
+						samples++; inside += in;
+						if (in) deepest = std::max(deepest, depth);
+						if (upper.count(v)) { upperSamples++; upperInside += in; if (in) upperDeepest = std::max(upperDeepest, depth); }
+					}
+				if (++frames == 480) {
+					FILE* f = fopen(clipOut.c_str(), "w");
+					if (f) {
+						fprintf(f, "cloth inside the legs: %.2f%% of samples, deepest %.1f units\n", samples ? 100.0 * inside / samples : 0.0, deepest);
+						fprintf(f, "  at hip height (top rows): %.2f%% of samples, deepest %.1f units\n", upperSamples ? 100.0 * upperInside / upperSamples : 0.0, upperDeepest);
+						for (auto& g : segs) fprintf(f, "  leg %s: radius %.1f to %.1f\n", g.a->m_name, g.ra, g.rb);
+						fclose(f);
+					}
+					done = true;
+				}
+			}
+
+			static std::map<std::string, std::vector<RE::NiPoint3>> track;
+			static int measured = 0;
+			if (!jitterOut.empty() && gItem.system && frameNo >= 240) {
+				RE::NiTransform toActor = gItem.scene.skeleton.actor->world.Invert();
+				for (auto& b : gItem.system->getBones()) {
+					if (b->m_rig.isStaticOrKinematicObject()) continue;
+					auto* bone = static_cast<hdt::SkyrimBone*>(b.get());
+					track[bone->m_name.c_str()].push_back(toActor * bone->m_node->world.translate);
+				}
+				if (++measured == 480) {
+					std::vector<std::pair<double, std::string>> perBone;
+					double total = 0;
+					int count = 0;
+					for (auto& [name, pts] : track) {
+						double sum = 0;
+						for (size_t i = 2; i < pts.size(); i++) sum += (pts[i] - pts[i - 1] * 2.0f + pts[i - 2]).Length();
+						double avg = sum / std::max<size_t>(1, pts.size() - 2);
+						perBone.push_back({ avg, name });
+						total += avg;
+						count++;
+					}
+					std::sort(perBone.rbegin(), perBone.rend());
+					FILE* f = fopen(jitterOut.c_str(), "w");
+					if (f) {
+						fprintf(f, "shake: average %.4f units per frame over %d bones\n", count ? total / count : 0.0, count);
+						for (size_t i = 0; i < perBone.size() && i < 6; i++) fprintf(f, "  %-18s %.4f\n", perBone[i].second.c_str(), perBone[i].first);
+						fclose(f);
+					}
+					done = true;
+				}
+			}
+		}
+		UpdateCamera(dt);
+		Panels(fps);
+		ImGui::EndFrame();
+
+		RECT rc;
+		GetClientRect(gWnd, &rc);
+		float aspect = (float)std::max(1L, rc.right) / (float)std::max(1L, rc.bottom);
+		M4 view = LookAtRH(CameraEye(), gCam.target + gCam.pan, V3(0, 0, 1));
+		M4 proj = PerspectiveRH(0.75f, aspect, 2.0f, 20000.0f);
+		M4 viewProj = Mul(view, proj);
+
+		D3DCOLOR bg = D3DCOLOR_RGBA((int)(gS.background[0] * 255), (int)(gS.background[1] * 255), (int)(gS.background[2] * 255), 255);
+		gDev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, bg, 1.0f, 0);
+		if (SUCCEEDED(gDev->BeginScene())) {
+			if (gItem.loaded) DrawScene(viewProj, view, proj);
+			ImGui::Render();
+			if (!noUi && !gShotPending) ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+			gDev->EndScene();
+		}
+		frameNo++;
+		if (gShotPending) {
+			gShotPending = false;
+			char name[64];
+			SYSTEMTIME st;
+			GetLocalTime(&st);
+			snprintf(name, sizeof name, "NVSMPPreviewer %04d-%02d-%02d %02d%02d%02d.bmp", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+			fs::path dir = fs::path(gIniPath).parent_path() / "screenshots";
+			fs::create_directories(dir);
+			std::string p = (dir / name).string();
+			if (SaveScreenshot(p)) AddLog(2, "screenshot: " + p);
+		}
+		if (!shots.empty() && shotsTaken < shotCount && frameNo % shotEvery == 0) {
+			char p[1024];
+			snprintf(p, sizeof p, "%s%02d.bmp", shots.c_str(), shotsTaken++);
+			SaveScreenshot(p);
+			if (shotsTaken == shotCount && exitAfter) done = true;
+		}
+		HRESULT hr = gDev->Present(nullptr, nullptr, nullptr, nullptr);
+		if (hr == D3DERR_DEVICELOST && gDev->TestCooperativeLevel() == D3DERR_DEVICENOTRESET) ResetDevice();
+	}
+
+	ImGui_ImplDX9_Shutdown();
+	ImGui_ImplWin32_Shutdown();
+	ImGui::DestroyContext();
+	return 0;
+}

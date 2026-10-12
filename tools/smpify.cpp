@@ -2,6 +2,7 @@
 //
 //   smpify in.nif out.nif "Coat Shape" "Data\relative\path.xml" out.xml [options]
 //     --collide "Shape"       a shape of the same NIF the coat collides with (repeatable; e.g. "Legs")
+//     --virtual-legs "Shape"  collide with smooth leg capsules fitted to that shape instead (e.g. "Legs")
 //     --grid cols rows        cloth bone grid (default 11 x 5)
 //     --top z                 skin-space height of the waist row (default 66)
 //     --angle degrees         grid spans -angle..+angle around the body, 0 = back (default 140: front open)
@@ -88,15 +89,17 @@ static void addStringExtra(File& f, AVObject& av, const std::string& name, const
 int main(int argc, char** argv)
 {
 	if (argc < 6) {
-		printf("usage: smpify in.nif out.nif \"Coat Shape\" \"Data\\relative\\physics.xml\" out.xml [--collide \"Shape\"]... [--grid cols rows] [--top z] [--angle deg]\n");
+		printf("usage: smpify in.nif out.nif \"Coat Shape\" \"Data\\relative\\physics.xml\" out.xml [--collide \"Shape\"]... [--virtual-legs \"Shape\"] [--grid cols rows] [--top z] [--angle deg]\n");
 		return 1;
 	}
 	int cols = 11, rows = 5;
 	float zTop = 66.0f, angleMax = 140.0f;
 	std::vector<std::string> colliders;
+	std::string virtualLegs;   // --virtual-legs "Shape": smooth leg capsules fitted to that shape, not its triangles
 	for (int i = 6; i < argc; i++) {
 		std::string a = argv[i];
 		if (a == "--collide" && i + 1 < argc) colliders.push_back(argv[++i]);
+		else if (a == "--virtual-legs" && i + 1 < argc) virtualLegs = argv[++i];
 		else if (a == "--grid" && i + 2 < argc) { cols = atoi(argv[++i]); rows = atoi(argv[++i]); }
 		else if (a == "--top" && i + 1 < argc) zTop = (float)atof(argv[++i]);
 		else if (a == "--angle" && i + 1 < argc) angleMax = (float)atof(argv[++i]);
@@ -333,7 +336,10 @@ int main(int argc, char** argv)
 			if (g.data >= 0 && f.blocks[g.data].size() > 6) f.blocks[g.data][6] |= 0x01 | 0x20;
 		};
 		keepData(shapeBlock);
-		for (auto& c : colliders) {
+		// The shapes the physics reads: the colliders, and the one the virtual legs are fitted to.
+		std::vector<std::string> bodyShapes = colliders;
+		if (!virtualLegs.empty()) bodyShapes.push_back(virtualLegs);
+		for (auto& c : bodyShapes) {
 			int blk = findBlockByName(f, c);
 			if (blk >= 0) keepData(blk);
 		}
@@ -345,7 +351,7 @@ int main(int argc, char** argv)
 
 		// The physics XML.
 		std::set<std::string> kinematic(boneNames.begin(), boneNames.begin() + bodyBoneCount);
-		for (auto& c : colliders) {
+		for (auto& c : bodyShapes) {
 			int blk = findBlockByName(f, c);
 			if (blk < 0) throw std::runtime_error("collision shape not found: " + c);
 			Geometry og;
@@ -436,7 +442,24 @@ int main(int argc, char** argv)
 		line("\t\t<margin>1</margin>");
 		line("\t\t<tag>cloth</tag>");
 		line("\t\t<no-collide-with-tag>cloth</no-collide-with-tag>");
+		// The top rows sit tight over the hips. Against the leg mesh, posed, the body is always within the margins
+		// there and the contacts shove those bones out into a lump: only the hanging part of the coat collides.
+		// Against the slimmer, smooth virtual legs, the vertices mostly on those rows collide too (threshold 0.5):
+		// measured on the game's run, that ends the coat clipping into the thighs at the hips, and sneaking stays
+		// as calm as before (fully on, the crouched thighs fight the waist anchors).
+		const char* topThreshold = virtualLegs.empty() ? "1" : "0.5";
+		for (auto& p : grid)
+			if (p.r < 2) line("\t\t<weight-threshold bone=\"" + p.name + "\">" + topThreshold + "</weight-threshold>");
 		line("\t</per-vertex-shape>");
+		if (!virtualLegs.empty()) {
+			line("\t<!-- The legs as smooth tapered capsules fitted to " + xmlEscape(virtualLegs) + " (the plugin builds them). -->");
+			line("\t<nv-virtual-legs fit=\"" + xmlEscape(virtualLegs) + "\">");
+			line("\t\t<margin>0.5</margin>");
+			line("\t\t<penetration>3</penetration>");
+			line("\t\t<tag>body</tag>");
+			line("\t\t<no-collide-with-tag>body</no-collide-with-tag>");
+			line("\t</nv-virtual-legs>");
+		}
 		for (auto& c : colliders) {
 			line("\t<per-triangle-shape name=\"" + xmlEscape(c) + "\">");
 			line("\t\t<margin>0.5</margin>");
@@ -449,7 +472,7 @@ int main(int argc, char** argv)
 		std::ofstream xo(xmlOut, std::ios::binary);
 		if (!xo) throw std::runtime_error("cannot write " + xmlOut);
 		xo << x;
-		snprintf(buf, sizeof buf, "wrote %s and %s (%d cloth bones, %zu collision shapes)\n", argv[2], xmlOut.c_str(), cols * rows, colliders.size() + 1);
+		snprintf(buf, sizeof buf, "wrote %s and %s (%d cloth bones, %zu collision shapes)\n", argv[2], xmlOut.c_str(), cols * rows, colliders.size() + 1 + (virtualLegs.empty() ? 0 : 1));
 		printf("%s", buf);
 	} catch (std::exception& e) {
 		printf("error: %s\n", e.what());

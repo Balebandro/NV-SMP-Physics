@@ -25,6 +25,7 @@ namespace hdt
 		size_t systemCount() const { return m_systems.size(); }
 		int bodyCount() const { return getNumCollisionObjects(); }
 		using SkinnedMeshWorld::updateConstraintsForBone;
+		using SkinnedMeshWorld::m_collisionsEnabled;
 
 		std::unique_lock<std::mutex> lockSimulation() { return std::unique_lock(m_lock); }
 

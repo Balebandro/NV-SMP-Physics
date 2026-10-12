@@ -187,11 +187,19 @@ namespace hdt
 	{
 		BT_PROFILE("performDiscreteCollisionDetection");
 
+		{
+		NVSMP_PROF(BonesAndBounds);
 		for (auto& system : m_systems) {
 			system->internalUpdate();
 		}
+		}
+
+		if (!m_collisionsEnabled)
+			return;
 
 		btDispatcherInfo& dispatchInfo = getDispatchInfo();
+		{
+		NVSMP_PROF(Broadphase);
 
 		for (int i = 0; i < m_collisionObjects.size(); i++) {
 			btCollisionObject* colObj = m_collisionObjects[i];
@@ -207,6 +215,8 @@ namespace hdt
 		}
 
 		m_broadphasePairCache->calculateOverlappingPairs(m_dispatcher1);
+		}
+		NVSMP_PROF(Narrowphase);
 
 		if (m_dispatcher1) {
 			m_dispatcher1->dispatchAllCollisionPairs(m_broadphasePairCache->getOverlappingPairCache(), dispatchInfo, m_dispatcher1);
@@ -303,6 +313,7 @@ namespace hdt
 
 	void SkinnedMeshWorld::predictUnconstraintMotion(btScalar timeStep)
 	{
+		NVSMP_PROF(Integrate);
 		struct UpdaterPredictUnconstraintMotion : public btIParallelForBody
 		{
 			btScalar timeStep;
@@ -334,6 +345,7 @@ namespace hdt
 
 	void SkinnedMeshWorld::integrateTransforms(btScalar timeStep)
 	{
+		NVSMP_PROF(Integrate);
 		for (int i = 0; i < m_collisionObjects.size(); ++i) {
 			auto body = m_collisionObjects[i];
 			if (body->isKinematicObject()) {
@@ -422,6 +434,7 @@ namespace hdt
 	// simulation islands and dispatches each to a solver from the pool on separate threads.
 	void SkinnedMeshWorld::solveConstraints(btContactSolverInfo& solverInfo)
 	{
+		NVSMP_PROF(Solve);
 		BT_PROFILE("solveConstraints");
 		if (!m_collisionObjects.size())
 			return;

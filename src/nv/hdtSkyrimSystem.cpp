@@ -13,12 +13,18 @@
 #include "hdtSkyrimPhysicsWorld.h"
 
 #include <cctype>
+#include <sstream>
+#include <unordered_set>
 
 namespace hdt
 {
 	static constexpr float PI = 3.1415926535897932384626433832795f;
 
 	btEmptyShape SkyrimSystemCreator::BoneTemplate::emptyShape[1];
+
+	// See SkyrimSystem::isRetiredNode. Never released (a few KB per unequip).
+	static std::vector<RE::NiPointer<RE::NiAVObject>> g_retiredNodes;
+	static std::unordered_set<const RE::NiAVObject*> g_retiredSet;
 
 	// NiSkinPartition (Gamebryo 2.x) as the game keeps it: the partitions the renderer skins with.
 	struct NiSkinPartitionNV
@@ -197,11 +203,28 @@ namespace hdt
 
 	SkyrimSystem::~SkyrimSystem()
 	{
-		// The skin slots go back to what the game had put there before the nodes they point at go.
+		// The skin slots go back to what the game had put there before the nodes they point at go. A slot the game has
+		// re-pointed since (the item detached and attached again) keeps the game's binding.
+		// The skin is held, so its bone array lives as long as it still is the one the slot was put in.
+		// An item the game detached is not touched at all, and its nodes are kept (see m_itemDetached).
+		int restored = 0, retired = 0;
 		for (auto& s : m_boundSlots) {
-			if (s.skin && s.skin->bones && s.slot < s.skin->boneCount)
-				s.skin->bones[s.slot] = s.original.get();
+			if (!m_itemDetached && s.holds()) {
+				s.skin->bones[s.slot] = s.original;
+				++restored;
+			} else if (s.bound && !isRetiredNode(s.bound)) {
+				g_retiredNodes.emplace_back(s.bound);
+				g_retiredSet.insert(s.bound);
+				++retired;
+			}
 		}
+		if (!m_boundSlots.empty())
+			logger::info("[SMP] system removed: {} skin slot(s) put back, {} node(s) kept", restored, retired);
+	}
+
+	bool SkyrimSystem::isRetiredNode(const RE::NiAVObject* node)
+	{
+		return g_retiredSet.count(node) != 0;
 	}
 
 	float SkyrimSystem::prepareForRead(float timeStep)
@@ -314,6 +337,11 @@ namespace hdt
 			return;
 		if (auto* g = castNiGeometry(obj)) {
 			const char* list = g->FindStringExtra("SMP Bones");
+			if (list) {
+				++m_listedShapes;
+				if (!g->skinInstance || !g->skinInstance->boneCount)
+					logger::warn("[SMP] {} lists its bones but has no skin yet", g->GetName());
+			}
 			if (list && g->skinInstance) {
 				uint32_t slot = 0;
 				const char* p = list;
@@ -422,7 +450,13 @@ namespace hdt
 			auto* s = u.geometry->skinInstance;
 			if (!s || !s->bones || u.slot >= s->boneCount)
 				continue;
-			m_mesh->m_boundSlots.push_back({ RE::NiPointer<RE::NiSkinInstance>(s), u.slot, RE::NiPointer<RE::NiAVObject>(s->bones[u.slot]) });
+			// A slot still holding an earlier system's node was never bound by the game: it goes back to the skeleton root.
+			RE::NiAVObject* original = s->bones[u.slot];
+			if (SkyrimSystem::isRetiredNode(original))
+				original = m_skeleton;
+			else if (original != m_skeleton)   // only counted: it may be a stale pointer to a freed object, so it is not read
+				++m_staleSlots;
+			m_mesh->m_boundSlots.push_back({ RE::NiPointer<RE::NiSkinInstance>(s), u.slot, original, node, s->bones });
 			s->bones[u.slot] = node;
 		}
 		logger::info("Created bone node {} on {}, {} skin slot(s)", name.c_str(), anchor->GetName(), it->second.size());
@@ -439,7 +473,7 @@ namespace hdt
 		auto loaded = readAllFile(path.c_str());
 		if (loaded.empty()) {
 			logger::error("[SMP] physics file '{}' not found", path.c_str());
-			return nullptr;
+			return bindOnlySystem(skeleton, model);
 		}
 
 		m_renameMap = std::move(renameMap);
@@ -453,7 +487,7 @@ namespace hdt
 		m_reader->nextStartElement();
 		if (m_reader->GetName() != "system") {
 			logger::error("[SMP] '{}' is not an SMP physics file (no <system>)", path.c_str());
-			return nullptr;
+			return bindOnlySystem(skeleton, model);
 		}
 
 		auto meshNameMap = file->second;
@@ -462,6 +496,8 @@ namespace hdt
 		m_boneIndex.clear();
 		m_extraBones.clear();
 		m_createdNodes.clear();
+		m_listedShapes = 0;
+		m_staleSlots = 0;
 		collectExtraBones(model);
 
 		try {
@@ -484,6 +520,12 @@ namespace hdt
 						}
 					} else if (name == "per-triangle-shape") {
 						auto shape = readPerTriangleShape(&meshNameMap);
+						if (shape && shape->m_vertices.size()) {
+							m_mesh->m_meshes.push_back(shape);
+							shape->m_mesh = m_mesh.get();
+						}
+					} else if (name == "nv-virtual-legs") {
+						auto shape = readVirtualLegs();
 						if (shape && shape->m_vertices.size()) {
 							m_mesh->m_meshes.push_back(shape);
 							shape->m_mesh = m_mesh.get();
@@ -538,7 +580,16 @@ namespace hdt
 			}
 		} catch (const std::string& err) {
 			logger::error("xml parse error - {}", err.c_str());
-			return nullptr;
+			m_deferredBuilds.clear();
+			m_mesh = nullptr;   // gives its skin slots back first
+			return bindOnlySystem(skeleton, model);
+		}
+
+		if (m_reader->GetErrorCode() != Xml::ErrorCode::None) {
+			logger::error("xml parse error - {}", m_reader->GetErrorMessage());
+			m_deferredBuilds.clear();
+			m_mesh = nullptr;
+			return bindOnlySystem(skeleton, model);
 		}
 
 		for (const auto& db : m_deferredBuilds) {
@@ -548,9 +599,10 @@ namespace hdt
 		}
 		m_deferredBuilds.clear();
 
-		if (m_reader->GetErrorCode() != Xml::ErrorCode::None) {
-			logger::error("xml parse error - {}", m_reader->GetErrorMessage());
-			return nullptr;
+		if (m_ground) {
+			bool simulatedBody = false;
+			for (auto& b : m_mesh->m_meshes) simulatedBody |= !b->m_isKinematic;
+			if (simulatedBody) addGroundPlane();
 		}
 
 		m_mesh->m_skeleton = hdt::make_nismart(m_skeleton);
@@ -559,7 +611,274 @@ namespace hdt
 			return static_cast<SkyrimBone*>(a.get())->m_depth < static_cast<SkyrimBone*>(b.get())->m_depth;
 		});
 
+		if (m_staleSlots)
+			logger::info("[SMP] {} skin slot(s) of the item's bones held something other than the skeleton root (left from an earlier attach; not referenced)", m_staleSlots);
 		return m_mesh->valid() ? m_mesh : nullptr;
+	}
+
+	// New Vegas: the ground under the actor, so cloth rests on it when crouching or sitting instead of
+	// sinking through. A square of two triangles facing up, skinned to an animation-driven bone carried
+	// on the actor's root (its feet; the root keeps upright), colliding as a per-triangle body tagged
+	// "ground" with this actor's own cloth only. An item opts out with <no-collide-with-tag>ground.
+	void SkyrimSystemCreator::addGroundPlane()
+	{
+		auto* node = createNode("SMP Ground");
+		if (!node)
+			return;
+		BoneTemplate kinematic;   // mass 0: driven, never simulated
+		auto* bone = new SkyrimBone("SMP Ground", node, m_skeleton, kinematic);
+		bone->m_anchor = m_skeleton;
+		bone->m_anchorToNode = RE::NiTransform();
+		bone->m_anchorToNode.translate.z = m_groundOffset;
+		bone->m_depth = 1;
+		bone->readTransform(RESET_PHYSICS);
+		m_mesh->m_bones.push_back(hdt::make_smart(bone));
+		indexBone(bone);
+
+		const float half = 150.0f;   // a 300-unit square: well past any garment's reach
+		auto body = RE::make_smart<SkyrimBody>();
+		body->m_name = "SMP Ground";
+		body->m_shared = SkyrimBody::SharedType::SHARED_INTERNAL;
+		body->m_tags.push_back("ground");
+		body->m_noCollideWithTags.insert("ground");
+		body->m_noCollideWithTags.insert("body");
+		btQsTransform identity;
+		body->addBone(bone, identity, BoundingSphere(btVector3(0, 0, 0), half * 1.5f));
+		const float corners[4][2] = { { -half, -half }, { half, -half }, { half, half }, { -half, half } };
+		body->m_vertices.resize(4);
+		for (int i = 0; i < 4; i++) {
+			auto& v = body->m_vertices[i];
+			v.m_skinPos = btVector3(corners[i][0], corners[i][1], 0);
+			v.m_weight[0] = 1.0f;
+			v.m_boneIdx[0] = 0;
+			for (int k = 1; k < 4; k++) { v.m_weight[k] = 0.0f; v.m_boneIdx[k] = 0; }
+		}
+		auto shape = RE::make_smart<PerTriangleShape>(body.get());
+		shape->addTriangle(0, 1, 2);   // counter-clockwise from above: the normal points up
+		shape->addTriangle(0, 2, 3);
+		shape->m_shapeProp.margin = 0.5f;
+		shape->m_shapeProp.penetration = 15.0f;   // anything up to 15 units under the ground is pushed back up
+		body->finishBuild();
+		m_mesh->m_meshes.push_back(body);
+		body->m_mesh = m_mesh.get();
+		logger::info("[SMP] ground plane added at the actor's feet");
+	}
+
+	// New Vegas: <nv-virtual-legs fit="Legs" scale="0.9"> - smooth collision for the legs, in place of their
+	// mesh. A capsule along each thigh (hip to knee) and shin (knee to ankle), a closed low-poly mesh skinned to
+	// that bone, as one per-triangle body. Each radius is fitted to the shape(s) named in "fit" (comma
+	// separated): the leg mesh's thinner side around that bone, times "scale". Slimmer than the trousers and
+	// without their creases, cloth can collide right up to the hips without being caught inside them. Takes the
+	// per-triangle shape's elements (margin, penetration, tag, no-collide-with-tag, can-collide-with-tag).
+	RE::BSTSmartPointer<SkyrimBody> SkyrimSystemCreator::readVirtualLegs()
+	{
+		std::string fit = m_reader->getAttribute("fit", "");
+		float scale = 0.9f;
+		if (auto s = m_reader->getAttribute("scale", ""); !s.empty()) scale = (float)atof(s.c_str());
+
+		// Tapered: a radius at each end (a thigh is wide at the hip, narrow at the knee), straight between.
+		struct Segment { const char* from; const char* to; float fallbackA, fallbackB; SkyrimBone* bone = nullptr; RE::NiPoint3 a, b; std::vector<std::pair<float, float>> d; float ra = 0, rb = 0; };
+		Segment segs[4] = {
+			{ "Bip01 L Thigh", "Bip01 L Calf", 8.0f, 5.5f }, { "Bip01 L Calf", "Bip01 L Foot", 5.0f, 3.5f },
+			{ "Bip01 R Thigh", "Bip01 R Calf", 8.0f, 5.5f }, { "Bip01 R Calf", "Bip01 R Foot", 5.0f, 3.5f },
+		};
+		// Distance from the segment, and where along it (0 at the joint it starts from, 1 at the next).
+		auto segDist = [](const Segment& s, const RE::NiPoint3& p, float* along = nullptr) {
+			RE::NiPoint3 ab = s.b - s.a, ap = p - s.a;
+			float len2 = std::max(ab.x * ab.x + ab.y * ab.y + ab.z * ab.z, 1e-6f);
+			float t = std::clamp((ap.x * ab.x + ap.y * ab.y + ap.z * ab.z) / len2, 0.0f, 1.0f);
+			if (along) *along = t;
+			return (p - (s.a + ab * t)).Length();
+		};
+		for (auto& s : segs) {
+			auto* from = findObjectByName(s.from);
+			auto* to = findObjectByName(s.to);
+			if (!from || !to) {
+				logger::warn("[SMP] nv-virtual-legs: no {} or {} in the skeleton, skipped", s.from, s.to);
+				m_reader->skipCurrentElement();
+				return nullptr;
+			}
+			s.bone = getOrCreateBone(s.from);
+			if (!s.bone) {
+				m_reader->skipCurrentElement();
+				return nullptr;
+			}
+			s.a = from->world.translate;
+			s.b = to->world.translate;
+		}
+
+		// Fit: every vertex of the named shapes, posed, to its nearest segment.
+		std::stringstream names(fit);
+		std::string name;
+		while (std::getline(names, name, ',')) {
+			while (!name.empty() && name.front() == ' ') name.erase(0, 1);
+			while (!name.empty() && name.back() == ' ') name.pop_back();
+			auto* g = castNiGeometry(findObject(m_model, name.c_str()));
+			std::vector<std::vector<std::pair<int, float>>> weights;
+			if (!g || !g->skinInstance || !g->skinInstance->skinData || !g->data || !g->data->vertices || !CollectWeights(g, weights)) {
+				logger::warn("[SMP] nv-virtual-legs: cannot fit to '{}' (not a skinned shape kept in memory)", name);
+				continue;
+			}
+			auto* skin = g->skinInstance;
+			for (int v = 0; v < g->data->vertexCount; v++) {
+				RE::NiPoint3 p{};
+				for (auto& [slot, w] : weights[v])
+					if (slot < (int)skin->boneCount && skin->bones[slot])
+						p = p + (skin->bones[slot]->world * skin->skinData->boneData[slot].skinToBone) * g->data->vertices[v] * w;
+				int best = 0;
+				float bt = 0, bd = segDist(segs[0], p, &bt);
+				for (int i = 1; i < 4; i++) {
+					float t;
+					if (float d = segDist(segs[i], p, &t); d < bd) { bd = d; bt = t; best = i; }
+				}
+				segs[best].d.push_back({ bt, bd });
+			}
+		}
+		// Each end's radius: the leg's thinner side (the lower quartile of the distances) over the third of the
+		// segment nearest that end, slimmed by the scale. Too few vertices: the whole segment's, else a default.
+		auto quartile = [](std::vector<float> v) { std::sort(v.begin(), v.end()); return v[v.size() / 4]; };
+		for (auto& s : segs) {
+			std::vector<float> all, nearA, nearB;
+			for (auto& [t, d] : s.d) {
+				all.push_back(d);
+				if (t < 0.33f) nearA.push_back(d);
+				if (t > 0.67f) nearB.push_back(d);
+			}
+			if (all.size() < 20) { s.ra = s.fallbackA; s.rb = s.fallbackB; continue; }
+			float whole = quartile(all);
+			s.ra = (nearA.size() >= 10 ? quartile(nearA) : whole) * scale;
+			s.rb = (nearB.size() >= 10 ? quartile(nearB) : whole) * scale;
+		}
+
+		auto body = RE::make_smart<SkyrimBody>();
+		body->m_name = "SMP Virtual Legs";
+		auto shape = RE::make_smart<PerTriangleShape>(body.get());
+		const int around = 10;
+		for (auto& s : segs) {
+			// The capsule in the world, then into its bone's space (the body is skinned in bone space).
+			RE::NiPoint3 axis = s.b - s.a;
+			float len = axis.Length();
+			axis = len > 1e-4f ? axis * (1.0f / len) : RE::NiPoint3{ 0, 0, -1 };
+			RE::NiPoint3 ref = std::fabs(axis.z) < 0.9f ? RE::NiPoint3{ 0, 0, 1 } : RE::NiPoint3{ 1, 0, 0 };
+			RE::NiPoint3 u{ axis.y * ref.z - axis.z * ref.y, axis.z * ref.x - axis.x * ref.z, axis.x * ref.y - axis.y * ref.x };
+			u = u * (1.0f / u.Length());
+			RE::NiPoint3 v{ axis.y * u.z - axis.z * u.y, axis.z * u.x - axis.x * u.z, axis.x * u.y - axis.y * u.x };
+			RE::NiTransform toBone = s.bone->m_node->world.Invert();
+			int boneIdx = body->addBone(s.bone, btQsTransform(), BoundingSphere(convertNi(toBone * ((s.a + s.b) * 0.5f)), len * 0.5f + std::max(s.ra, s.rb)));
+			int first = (int)body->m_vertices.size();
+			auto add = [&](const RE::NiPoint3& world) {
+				Vertex vx;
+				vx.m_skinPos = convertNi(toBone * world);
+				vx.m_weight[0] = 1.0f;
+				vx.m_boneIdx[0] = boneIdx;
+				for (int k = 1; k < 4; k++) { vx.m_weight[k] = 0.0f; vx.m_boneIdx[k] = boneIdx; }
+				body->m_vertices.push_back(vx);
+			};
+			// Rings: each end cap as two latitude rings, the cylinder between; then the two poles' rings.
+			const float caps[] = { -0.866f, -0.5f, 0.0f };   // sin of -60, -30, 0 degrees
+			struct Ring { RE::NiPoint3 c; float r; };
+			std::vector<Ring> rings;
+			for (float sn : caps) rings.push_back({ s.a + axis * (sn * s.ra), s.ra * std::sqrt(1 - sn * sn) });
+			for (int i = 2; i >= 0; i--) rings.push_back({ s.b + axis * (-caps[i] * s.rb), s.rb * std::sqrt(1 - caps[i] * caps[i]) });
+			add(s.a - axis * s.ra);   // the poles
+			add(s.b + axis * s.rb);
+			for (auto& r : rings)
+				for (int k = 0; k < around; k++) {
+					float ang = 6.2831853f * k / around;
+					add(r.c + (u * std::cos(ang) + v * std::sin(ang)) * r.r);
+				}
+			// Triangles, wound so their normals point outward: away from the nearest point of the axis segment.
+			btVector3 A = convertNi(toBone * s.a), B = convertNi(toBone * s.b);
+			auto tri = [&](int i0, int i1, int i2) {
+				auto P = [&](int i) { return body->m_vertices[first + i].m_skinPos; };
+				btVector3 n = (P(i1) - P(i0)).cross(P(i2) - P(i0));
+				btVector3 c = (P(i0) + P(i1) + P(i2)) / 3.0f;
+				btVector3 ab = B - A;
+				float t = std::clamp((c - A).dot(ab) / std::max(ab.length2(), 1e-6f), 0.0f, 1.0f);
+				if (n.dot(c - (A + ab * t)) < 0) std::swap(i1, i2);
+				shape->addTriangle(first + i0, first + i1, first + i2);
+			};
+			const int ringCount = (int)rings.size();
+			auto ringV = [&](int r, int k) { return 2 + r * around + (k % around); };
+			for (int k = 0; k < around; k++) {
+				tri(0, ringV(0, k), ringV(0, k + 1));
+				tri(1, ringV(ringCount - 1, k + 1), ringV(ringCount - 1, k));
+				for (int r = 0; r + 1 < ringCount; r++) {
+					tri(ringV(r, k), ringV(r + 1, k), ringV(r + 1, k + 1));
+					tri(ringV(r, k), ringV(r + 1, k + 1), ringV(r, k + 1));
+				}
+			}
+			logger::info("[SMP] virtual legs: {} to {}, radius {:.1f} to {:.1f}{}", s.from, s.to, s.ra, s.rb, s.d.size() >= 20 ? "" : " (default, nothing fitted)");
+		}
+
+		shape->m_shapeProp.margin = 0.5f;
+		shape->m_shapeProp.penetration = 3.0f;
+		while (m_reader->Inspect()) {
+			if (m_reader->GetInspected() == XMLReader::Inspected::StartTag) {
+				auto nodeName = m_reader->GetName();
+				if (nodeName == "margin") shape->m_shapeProp.margin = m_reader->readFloat();
+				else if (nodeName == "prenetration" || nodeName == "penetration") shape->m_shapeProp.penetration = m_reader->readFloat();
+				else if (nodeName == "tag") body->m_tags.push_back(m_reader->readText());
+				else if (nodeName == "no-collide-with-tag") body->m_noCollideWithTags.insert(m_reader->readText());
+				else if (nodeName == "can-collide-with-tag") body->m_canCollideWithTags.insert(m_reader->readText());
+				else { logger::warn("unknown element - {}", nodeName.c_str()); m_reader->skipCurrentElement(); }
+			} else if (m_reader->GetInspected() == XMLReader::Inspected::EndTag) {
+				break;
+			}
+		}
+		m_deferredBuilds.push_back({ body.get(), nullptr });
+		return body;
+	}
+
+	bool SkyrimSystemCreator::complete()
+	{
+		if (m_listedShapes && m_extraBones.empty())
+			return false;   // shapes list bones but none had a skin to bind them to
+		int missing = 0;
+		for (auto& [key, uses] : m_extraBones)
+			if (!m_createdNodes.count(key) && !findObjectByName(uses.front().name.c_str()))
+				++missing;
+		if (missing)
+			logger::warn("[SMP] {} of the item's bones got no node", missing);
+		return missing == 0;
+	}
+
+	RE::BSTSmartPointer<SkyrimSystem> SkyrimSystemCreator::bindOnlySystem(RE::NiNode* skeleton, RE::NiAVObject* model)
+	{
+		m_skeleton = skeleton;
+		m_model = model;
+		m_reader = nullptr;
+		m_boneTemplates.clear();   // the default template: mass 0, kinematic
+		m_mesh = RE::make_smart<SkyrimSystem>(skeleton);
+		m_boneIndex.clear();
+		m_extraBones.clear();
+		m_createdNodes.clear();
+		m_listedShapes = 0;
+		m_staleSlots = 0;
+		collectExtraBones(model);
+
+		// Every bone the item lists that the skeleton lacks, with the default (mass 0, kinematic) template.
+		// Parents first, so each bone's depth (its update order) comes after its anchor's.
+		std::function<void(const std::string&)> create = [&](const std::string& name) {
+			auto it = m_extraBones.find(Lower(name.c_str()));
+			if (it == m_extraBones.end() || findBoneFromIndex(name.c_str()))
+				return;
+			if (!m_createdNodes.count(Lower(name.c_str())) && findObjectByName(name.c_str()))
+				return;   // the skeleton has it
+			create(it->second.front().parent);
+			createBoneFromNodeName(name.c_str());
+		};
+		for (auto& [key, uses] : m_extraBones)
+			create(uses.front().name);
+		if (!m_mesh->valid())
+			return nullptr;
+
+		m_mesh->m_skeleton = hdt::make_nismart(m_skeleton);
+		std::sort(m_mesh->m_bones.begin(), m_mesh->m_bones.end(), [](const auto& a, const auto& b) {
+			return static_cast<SkyrimBone*>(a.get())->m_depth < static_cast<SkyrimBone*>(b.get())->m_depth;
+		});
+		logger::warn("[SMP] {}: no usable physics, {} of its bones placed at rest without simulation", model->GetName(), m_mesh->getBones().size());
+		return m_mesh;
 	}
 
 	RE::BSTSmartPointer<ConstraintGroup> SkyrimSystemCreator::readConstraintGroup()
@@ -1047,7 +1366,7 @@ namespace hdt
 						body->m_noCollideWithBones.insert(bone);
 				} else if (nodeName == "weight-threshold") {
 					auto boneName = m_reader->getAttribute("bone");
-					float wt = m_reader->readFloat();
+					float wt = m_reader->readFloat() * m_weightThresholdScale;
 					for (int i = 0; i < body->m_skinnedBones.size(); ++i) {
 						if (body->m_skinnedBones[i].ptr->m_name == getRenamedBone(boneName)) {
 							body->m_skinnedBones[i].weightThreshold = wt;
@@ -1147,7 +1466,7 @@ namespace hdt
 						body->m_noCollideWithBones.insert(bone);
 				} else if (nodeName == "weight-threshold") {
 					auto boneName = m_reader->getAttribute("bone");
-					float wt = m_reader->readFloat();
+					float wt = m_reader->readFloat() * m_weightThresholdScale;
 					for (int i = 0; i < body->m_skinnedBones.size(); ++i) {
 						if (body->m_skinnedBones[i].ptr->m_name == getRenamedBone(boneName)) {
 							body->m_skinnedBones[i].weightThreshold = wt;

@@ -4,6 +4,7 @@
 // draws (TESMain's call to DrawWorld_WaitForParallelUpdate), the actor manager finds the items with
 // SMP physics files, and the physics world reads the animated pose, steps Bullet and writes the
 // simulated bones back, so the bones it writes are the ones rendered this frame.
+#include <share.h>
 #include "ActorManager.h"
 #include "Game.h"
 #include "Menu.h"
@@ -13,6 +14,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <fstream>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
 
 namespace nvsmp
 {
@@ -23,6 +26,7 @@ namespace nvsmp
 	static char gIniPath[MAX_PATH];
 	static bool gFailed = false;
 	static int gLastGameFrame = -1;
+	static bool gLoading = false;   // between xNVSE's pre-load and post-load messages
 
 	bool LogEnabled(LogLevel level) { return gLog && (int)level >= gSettings.logLevel; }
 
@@ -65,7 +69,8 @@ namespace nvsmp
 			{ "bEnabled", 0, 0, &s.enabled }, { "fMaxDistance", &s.maxDistance }, { "iMaxActors", 0, &s.maxActors },
 			{ "iMinFps", 0, &s.minFps }, { "iMaxSubSteps", 0, &s.maxSubSteps }, { "iSolverIterations", 0, &s.solverIterations },
 			{ "fGravityScale", &s.gravityScale }, { "bUnclampedResets", 0, 0, &s.unclampedResets }, { "fResetAngle", &s.resetAngle },
-			{ "bWind", 0, 0, &s.wind }, { "fWindStrength", &s.windStrength }, { "bWindInInteriors", 0, 0, &s.windInInteriors },
+			{ "bWind", 0, 0, &s.wind }, { "fWindStrength", &s.windStrength }, { "bWindInInteriors", 0, 0, &s.windInInteriors }, { "bCollisions", 0, 0, &s.collisions },
+			{ "fWaistCollision", &s.waistCollision }, { "bGround", 0, 0, &s.ground },
 			{ "iMenuKey", 0, &s.menuKey }, { "iLogLevel", 0, &s.logLevel },
 		};
 	}
@@ -86,6 +91,9 @@ namespace nvsmp
 		world->m_enableWind = s.wind;
 		world->m_windStrength = s.windStrength;
 		world->disabled = !s.enabled;
+		world->m_collisionsEnabled = s.collisions;
+		s.waistCollision = std::clamp(s.waistCollision, 0.0f, 1.0f);
+		ActorManager::instance()->applyCollision();
 		Menu::SetKey(s.menuKey);
 	}
 
@@ -154,7 +162,10 @@ namespace nvsmp
 			return;
 		gLastGameFrame = gameFrame;
 		Menu::Tick();
+		if (gLoading)
+			return;
 
+		ActorManager::instance()->rebuildIfPending();
 		if (Menu::ConsumeReset()) {
 			ActorManager::instance()->clear();
 		}
@@ -170,18 +181,71 @@ namespace nvsmp
 		float dt = Game::FrameTime();
 		if (dt > FLT_EPSILON)   // 0 while paused: the bones keep their last simulated pose
 			hdt::SkyrimPhysicsWorld::get()->doUpdate(std::min(dt, 0.25f));
+
+		// Every 120 frames (by count, so it shows even if the frame time reads 0): what the physics is doing.
+		static int sinceReport = 0;
+		if (++sinceReport >= 120) {
+			sinceReport = 0;
+			logger::info("[stats] frame time {:.4f} s, {} system(s) in the world", dt, hdt::SkyrimPhysicsWorld::get()->systemCount());
+			ActorManager::instance()->report();
+		}
+	}
+
+	// Where the fault was, filled by the exception filter: the code, the faulting address, and the return
+	// addresses inside this DLL found on the stack (callers, as offsets from the DLL's base to look up in the pdb).
+	static char gFailureWhere[512];
+
+	static void DescribeAddress(char* out, size_t size, uintptr_t address)
+	{
+		HMODULE module = nullptr;
+		char path[MAX_PATH] = "?";
+		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)address, &module)) {
+			GetModuleFileNameA(module, path, MAX_PATH);
+			const char* name = strrchr(path, '\\');
+			snprintf(out, size, "%s+%X", name ? name + 1 : path, (unsigned)(address - (uintptr_t)module));
+		} else
+			snprintf(out, size, "%08X", (unsigned)address);
+	}
+
+	static int RecordFailure(EXCEPTION_POINTERS* info)
+	{
+		char where[128];
+		DescribeAddress(where, sizeof(where), (uintptr_t)info->ExceptionRecord->ExceptionAddress);
+		int len = snprintf(gFailureWhere, sizeof(gFailureWhere), "code %08X at %s", (unsigned)info->ExceptionRecord->ExceptionCode, where);
+		if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && info->ExceptionRecord->NumberParameters >= 2)
+			len += snprintf(gFailureWhere + len, sizeof(gFailureWhere) - len, " (%s %08X)",
+				info->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading", (unsigned)info->ExceptionRecord->ExceptionInformation[1]);
+
+		// Callers: return addresses into this DLL among the first stack slots.
+		HMODULE self = nullptr;
+		GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&RecordFailure, &self);
+		MODULEINFO mi = {};
+		if (self && GetModuleInformation(GetCurrentProcess(), self, &mi, sizeof(mi))) {
+			uintptr_t lo = (uintptr_t)mi.lpBaseOfDll, hi = lo + mi.SizeOfImage;
+			const uint32_t* sp = (const uint32_t*)info->ContextRecord->Esp;
+			len += snprintf(gFailureWhere + len, sizeof(gFailureWhere) - len, "; stack:");
+			for (int i = 0, found = 0; i < 512 && found < 12 && len < (int)sizeof(gFailureWhere) - 16; i++) {
+				if (IsBadReadPtr(sp + i, 4)) break;
+				uintptr_t v = sp[i];
+				if (v > lo && v < hi) {
+					len += snprintf(gFailureWhere + len, sizeof(gFailureWhere) - len, " +%X", (unsigned)(v - lo));
+					found++;
+				}
+			}
+		}
+		return EXCEPTION_EXECUTE_HANDLER;
 	}
 
 	static void ReportFailure()
 	{
-		LogLine(LogLevel::Error, "exception in the physics update; NV SMP Physics is off for the rest of this session");
+		LogLine(LogLevel::Error, std::string("exception in the physics update; NV SMP Physics is off for the rest of this session: ") + gFailureWhere);
 	}
 
 	static void SafeUpdate()
 	{
 		__try {
 			Update();
-		} __except (EXCEPTION_EXECUTE_HANDLER) {
+		} __except (RecordFailure(GetExceptionInformation())) {
 			gFailed = true;
 			ReportFailure();
 		}
@@ -302,6 +366,7 @@ struct NVSEInterface
 	void* registerCommand;
 	void* setOpcodeBase;
 	void* (*QueryInterface)(uint32_t id);
+	uint32_t (*GetPluginHandle)();
 };
 
 struct NVSEDataInterface
@@ -310,7 +375,42 @@ struct NVSEDataInterface
 	void* (*GetSingleton)(uint32_t id);
 };
 
-static constexpr uint32_t kInterface_Data = 7, kNVSEData_DIHookControl = 1;
+struct NVSEMessage
+{
+	const char* sender;
+	uint32_t type;
+	uint32_t dataLen;
+	void* data;
+};
+
+struct NVSEMessagingInterface
+{
+	uint32_t version;
+	bool (*RegisterListener)(uint32_t listener, const char* sender, void (*handler)(NVSEMessage*));
+};
+
+static constexpr uint32_t kInterface_Messaging = 2, kInterface_Data = 7, kNVSEData_DIHookControl = 1;
+enum : uint32_t { kMessage_ExitToMainMenu = 2, kMessage_PreLoadGame = 6, kMessage_PostLoadGame = 8, kMessage_NewGame = 14 };
+
+// A load replaces every actor's 3D, partly on the loading thread: the systems go while the old 3D is
+// still whole, and nothing is scanned or built until the load is over.
+static void OnNVSEMessage(NVSEMessage* msg)
+{
+	using namespace nvsmp;
+	switch (msg->type) {
+	case kMessage_PreLoadGame:
+	case kMessage_ExitToMainMenu:
+		gLoading = true;
+		ActorManager::instance()->clear();
+		Log("%s: physics cleared", msg->type == kMessage_PreLoadGame ? "loading a save" : "main menu");
+		break;
+	case kMessage_PostLoadGame:
+	case kMessage_NewGame:
+		gLoading = false;
+		Log("save loaded: physics resumes");
+		break;
+	}
+}
 static HMODULE gSelf = nullptr;
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID)
@@ -338,11 +438,15 @@ extern "C"
 		GetModuleFileNameA(gSelf, gIniPath, MAX_PATH);
 		if (char* dot = strrchr(gIniPath, '.'))
 			strcpy_s(dot, gIniPath + MAX_PATH - dot, ".ini");
-		fopen_s(&gLog, "NVSMPPhysics.log", "w");
+		gLog = _fsopen("NVSMPPhysics.log", "w", _SH_DENYWR);   // readable while the game runs
 		LoadSettings();
 		Log("NV SMP Physics 1 loaded (FSMP physics core, Bullet %d)", btGetVersion());
 		if (auto data = (NVSEDataInterface*)nvse->QueryInterface(kInterface_Data))
 			Menu::SetInputHook(data->GetSingleton(kNVSEData_DIHookControl));
+		if (auto messaging = (NVSEMessagingInterface*)nvse->QueryInterface(kInterface_Messaging))
+			messaging->RegisterListener(nvse->GetPluginHandle(), "NVSE", OnNVSEMessage);
+		else
+			Log("no xNVSE messaging: physics is not paused across loads");
 		for (uint32_t s : Game::kWaitForParallelUpdateCalls)
 			PatchCall(s);
 		return true;

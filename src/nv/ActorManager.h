@@ -25,6 +25,12 @@ namespace nvsmp
 		void update();
 		// Drops every system (settings changed, menu reset, game load).
 		void clear();
+		// Writes each system's state to the log (see the .cpp).
+		void report();
+		// After a settings change: marks every system for a rebuild if a built-in collision setting changed.
+		void applyCollision();
+		// Once per frame, before update: does that rebuild.
+		void rebuildIfPending();
 
 		ActorStats stats;
 
@@ -36,14 +42,27 @@ namespace nvsmp
 			std::string file;
 			RE::BSTSmartPointer<hdt::SkyrimSystem> system;
 			unsigned frame = 0;                   // last frame it was seen
+			unsigned buildAt = 0;                 // frame of the next build
+			int builds = 0;
 			bool failed = false;
+			bool waiting = false;                 // the game has not bound its skin yet
 		};
 
+		static constexpr unsigned kSettleFrames = 10, kRetryFrames = 30;
+		static constexpr int kMaxBuilds = 4;
+
+		void build(Item& item);
+		static bool rebound(const Item& item);   // the game re-pointed a skin slot the system had bound
+		static bool skinsBound(RE::NiAVObject* obj, int depth = 0);
 		void scanActor(RE::NiNode* root);
 		void scan(RE::NiNode* root, RE::NiAVObject* obj, int depth);
 		void found(RE::NiNode* root, RE::NiAVObject* model, const char* file);
 
 		std::map<std::pair<void*, void*>, Item> m_items;   // by (skeleton, model)
 		unsigned m_frame = 0;
+		std::string m_playerRootName;   // what the last scan took as the player's 3D (for the log)
+		float m_builtWaistCollision = -1.0f;   // the waist collision the systems were built with
+		int m_builtGround = -1;                // and the ground setting
+		bool m_rebuildPending = false;         // a collision setting changed: rebuild at the next update
 	};
 }

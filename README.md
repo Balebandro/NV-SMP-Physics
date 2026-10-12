@@ -29,6 +29,20 @@ Once a frame, right after New Vegas has animated every actor and before it draws
   `NiSkinPartition` the renderer uses (partition-local vertex indices through a vertex map, lists or
   strips).
 
+### Additions to SMP
+
+- **Ground.** Every system with simulated cloth gets a ground plane at the actor's feet (a 300-unit square
+  on an animation-driven bone carried on the actor's root, colliding as a per-triangle body tagged `ground`
+  with that actor's own cloth), so cloth rests on the floor when crouching or sitting. An item opts out with
+  `<no-collide-with-tag>ground</no-collide-with-tag>`; `bGround` in the INI (and the menu) turns it off.
+  Flat at the feet: on slopes and stairs it is approximate.
+- **Names match case-insensitively**, as Skyrim's `BSFixedString` does, so ported XMLs keep working.
+- **Virtual legs.** `<nv-virtual-legs fit="Legs" scale="0.9">` (with a per-triangle shape's margin,
+  penetration and tags) collides against smooth tapered capsules on the thighs and shins instead of a leg
+  mesh, each end's radius fitted to the named shape(s). Without the trousers' creases and tight hips, cloth
+  can collide up to the waist. `smpify --virtual-legs Legs` writes it (and lets the coat's top rows collide
+  partly, threshold 0.5); on the game's run that ended the coat clipping into the thighs at the hips.
+
 ## Layout
 
 | Path | What |
@@ -41,6 +55,10 @@ Once a frame, right after New Vegas has animated every actor and before it draws
 | `extern/imgui` | Dear ImGui, for the menu |
 | `tools/smpify.cpp` | Makes a skinned coat or skirt an SMP item: cloth bone grid, reweighting, partitions, `SMP Bones`, the XML |
 | `tools/systemtest.cpp` | Runs the plugin's builder and world on a NIF outside the game, laid out as the game has it in memory, and walks it |
+| `tools/scene.cpp` | That in-memory NIF, shared by the test and the previewer |
+| `tools/previewer` | NV SMP Previewer: the item on a moving body in a window, with the plugin's own physics |
+| `tools/nifcheck.cpp` | What a tool changed in a NIF, block by block, and whether every skin partition is consistent |
+| `tools/kf.cpp` | Reads and samples `.kf` animations (keyframed and B-spline); `tools/kfcheck.cpp` poses a skeleton with them |
 
 ### Changes to FSMP's core
 
@@ -54,7 +72,8 @@ Visual Studio 2022 C++ build tools (x86).
 
 ```
 build.bat                  the plugin: build\NVSMPPhysics.dll
-tools\build_tools.bat      smpify.exe and systemtest.exe
+tools\build_tools.bat      smpify.exe, nifcheck.exe and systemtest.exe
+tools\build_previewer.bat  build\NVSMPPreviewer.exe
 tools\make_content.sh      the Ranger coat (build\content)
 ```
 
@@ -62,6 +81,23 @@ tools\make_content.sh      the Ranger coat (build\content)
 
 Copy `NVSMPPhysics.dll` and `NVSMPPhysics.ini` to `Data\nvse\Plugins`, with the items' meshes and XML.
 Needs xNVSE. The menu is on F7. The log is `NVSMPPhysics.log` in the game folder.
+
+## Previewing an item
+
+`NVSMPPreviewer.exe [item.nif]` (or drop a NIF on its window) shows an SMP item on a body that walks, runs,
+turns, jumps or sways, or that you drive with WASD, simulated by the plugin's own system builder and physics
+world: what it shows is what the game does. It finds the physics XML, the skeleton, the animations and the
+textures as the game would: loose files in the NIF's own Data folder, Mod Organizer 2's enabled mods (in
+priority order), extra folders and the game's Data folder, then the BSA archives (the mods', then the game's;
+`tools/previewer/bsa.cpp`, `inflate.cpp`). The MO2 instance is the one the NIF is inside (portable or global,
+any name, MO2's own path settings honoured), else MO2's New Vegas instance; the game folder comes from MO2,
+else the GOG, Bethesda or Steam registry entries. All of it can be set by hand under Data sources. With the game's `skeleton.nif` found, the body is that skeleton and
+the presets play the game's locomotion animations (`tools/kf.cpp`: keyframed and compressed B-spline
+`.kf` files), in the stance and gender chosen, as the game would pick them (kNVSE's gender and
+AnimGroupOverride folders first), crossfaded, the body carried by each clip's root motion; "Play animation
+file..." plays any `.kf`. Save the XML in any editor and it rebuilds. Overlays show the bones
+(orange simulated, grey animated), the constraints and the collision shapes; the physics settings are the
+in-game menu's. Ctrl + drag moves the body by hand; Screenshot saves the view to `screenshots\`.
 
 ## Making an item
 

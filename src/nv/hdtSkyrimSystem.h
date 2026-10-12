@@ -29,6 +29,9 @@ namespace hdt
 		float prepareForRead(float timeStep) override;
 
 		const std::vector<RE::BSTSmartPointer<SkinnedMeshBody>>& meshes() const { return m_meshes; }
+		// For drawing the system (the previewer).
+		const std::vector<RE::BSTSmartPointer<BoneScaleConstraint>>& constraints() const { return m_constraints; }
+		const std::vector<RE::BSTSmartPointer<ConstraintGroup>>& constraintGroups() const { return m_constraintGroups; }
 
 		RE::NiPointer<RE::NiNode> m_skeleton;
 		RE::NiPointer<RE::NiNode> m_oldRoot;
@@ -44,9 +47,21 @@ namespace hdt
 		{
 			RE::NiPointer<RE::NiSkinInstance> skin;
 			uint32_t slot;
-			RE::NiPointer<RE::NiAVObject> original;
+			RE::NiAVObject* original = nullptr;   // what the game had there: no reference taken, it may be a stale pointer to a freed object
+			RE::NiAVObject* bound = nullptr;   // the node this system put there: if the slot no longer holds it, the game re-pointed the skin
+			RE::NiAVObject** array = nullptr;  // the skin's bone array then: if the skin has another one, the game rebound it
+			// The slot still holds this system's node, in the array it was put in (else nothing of it may be touched).
+			bool holds() const { return skin && skin->bones == array && slot < skin->boneCount && skin->bones[slot] == bound; }
 		};
 		std::vector<SkinSlot> m_boundSlots;
+
+		// A node a system put in a skin slot it did not put back when it went (the item had left the actor): kept alive
+		// for the session, since the game hands the skin back on the next equip still pointing at it. True for such a node.
+		static bool isRetiredNode(const RE::NiAVObject* node);
+		// Set before the system goes when the game detached the item (unequipped, rebound or unbound its skin): the
+		// slots are then left alone and the nodes retired (putting the slots back then left the item unbound on the
+		// next equip: the actor turned invisible). Not set (an item still worn: menu reset, settings): put back.
+		bool m_itemDetached = false;
 	};
 
 	class XMLReader;
@@ -57,6 +72,19 @@ namespace hdt
 		SkyrimSystemCreator();
 
 		RE::BSTSmartPointer<SkyrimSystem> createOrUpdateSystem(RE::NiNode* skeleton, RE::NiAVObject* model, DefaultBBP::PhysicsFile_t* file, std::unordered_map<RE::BSFixedString, RE::BSFixedString>&& renameMap, SkyrimSystem* old_system);
+
+		// After a build: whether every bone the item lists got its node. An item caught halfway through
+		// the game attaching it can be missing them; the caller builds it again a little later.
+		bool complete();
+
+		// New Vegas: scales every weight-threshold the physics file sets (the menu's waist collision: 1 -
+		// waist). Applied at build, so FSMP drops exactly the colliders that cannot collide.
+		float m_weightThresholdScale = 1.0f;
+
+		// New Vegas: a ground plane at the actor's feet for the cloth to rest on (see addGroundPlane), raised
+		// or lowered by the offset (game units).
+		bool m_ground = true;
+		float m_groundOffset = 0.0f;
 
 	protected:
 		struct PooledStringHash
@@ -236,7 +264,14 @@ namespace hdt
 		};
 		std::unordered_map<std::string, std::vector<ExtraBone>> m_extraBones;   // by bone name (lower case)
 		std::unordered_map<std::string, RE::NiNode*> m_createdNodes;            // this build's extra-bone nodes
+		int m_listedShapes = 0;                                                 // shapes with "SMP Bones"
+		int m_staleSlots = 0;                                                   // item-bone slots that held a pointer other than the skeleton root
 		void collectExtraBones(RE::NiAVObject* obj, int depth = 0);
+		// When the physics file is missing or broken: the item's own bones alone, kinematic, carried
+		// on their parents, so it renders at rest instead of stretched toward the skeleton root.
+		RE::BSTSmartPointer<SkyrimSystem> bindOnlySystem(RE::NiNode* skeleton, RE::NiAVObject* model);
+		void addGroundPlane();
+		RE::BSTSmartPointer<SkyrimBody> readVirtualLegs();
 		RE::NiNode* createExtraBoneNode(const std::string& name, RE::NiTransform& anchorToNode, RE::NiNode*& anchor);
 		std::string skinSlotName(RE::NiGeometry* geometry, uint32_t slot);
 	};

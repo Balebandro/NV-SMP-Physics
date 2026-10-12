@@ -188,6 +188,9 @@ static void BuildUI() {
 		changed |= ImGui::SliderInt("Rate (min fps)", &s.minFps, 30, 240); Help("Physics steps per second at most (FSMP's min-fps). Higher = smoother and more accurate, and more expensive.");
 		changed |= ImGui::SliderInt("Max substeps", &s.maxSubSteps, 1, 16); Help("A frame longer than this many steps drops the rest instead of catching up.");
 		changed |= ImGui::SliderInt("Solver iterations", &s.solverIterations, 1, 64); Help("Higher = stiffer constraints, more expensive.");
+		changed |= ImGui::Checkbox("Collisions", &s.collisions); Help("Off: the cloth passes through the body. For telling whether a collision shape pushes it.");
+		changed |= ImGui::SliderFloat("Waist collision", &s.waistCollision, 0.0f, 1.0f, "%.2f"); Help("The tight rows at the waist and hips, which the physics file leaves out of collision: 0 = they follow the body, 1 = they collide like the rest. Changing it rebuilds the physics (a short reset).");
+		changed |= ImGui::Checkbox("Ground collision", &s.ground); Help("The cloth rests on the ground at the actor's feet instead of sinking through it when crouching or sitting. Changing it rebuilds the physics.");
 		changed |= ImGui::Checkbox("Reset on fast turns", &s.unclampedResets); Help("Turning faster than the angle below (per second) starts the physics over in its rest pose, as after a teleport.");
 		changed |= ImGui::SliderFloat("Reset angle", &s.resetAngle, 10.0f, 360.0f, "%.0f");
 	}

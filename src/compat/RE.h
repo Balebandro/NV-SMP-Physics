@@ -9,6 +9,8 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <cctype>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -17,13 +19,25 @@ namespace RE
 	namespace detail
 	{
 		// Every distinct string once, for the life of the process, as the game's string pool keeps
-		// them: equal strings share one pointer, so comparing and hashing go by pointer.
+		// them: equal strings share one pointer, so comparing and hashing go by pointer. Equal ignores
+		// case, as Skyrim's BSFixedString does (so an SMP XML matches "Cape" to "cape"); the first
+		// spelling seen is the one kept.
 		inline const char* Intern(std::string_view s)
 		{
 			static std::mutex lock;
-			static std::unordered_set<std::string> pool;
+			static std::unordered_map<std::string, std::string> pool;   // lower case -> first spelling
+			std::string key(s);
+			for (auto& c : key) c = (char)std::tolower((unsigned char)c);
 			std::lock_guard<std::mutex> guard(lock);
-			return pool.emplace(s).first->c_str();
+			return pool.try_emplace(std::move(key), s).first->second.c_str();
+		}
+
+		inline int CompareNoCase(const char* a, const char* b)
+		{
+			for (;; ++a, ++b) {
+				int ca = std::tolower((unsigned char)*a), cb = std::tolower((unsigned char)*b);
+				if (ca != cb || !ca) return ca - cb;
+			}
 		}
 	}
 
@@ -44,9 +58,9 @@ namespace RE
 
 		friend bool operator==(const BSFixedString& a, const BSFixedString& b) noexcept { return a.m_data == b.m_data; }
 		friend bool operator!=(const BSFixedString& a, const BSFixedString& b) noexcept { return a.m_data != b.m_data; }
-		friend bool operator==(const BSFixedString& a, const char* b) noexcept { return std::strcmp(a.m_data, b ? b : "") == 0; }
+		friend bool operator==(const BSFixedString& a, const char* b) noexcept { return detail::CompareNoCase(a.m_data, b ? b : "") == 0; }
 		friend bool operator!=(const BSFixedString& a, const char* b) noexcept { return !(a == b); }
-		friend bool operator<(const BSFixedString& a, const BSFixedString& b) noexcept { return std::strcmp(a.m_data, b.m_data) < 0; }
+		friend bool operator<(const BSFixedString& a, const BSFixedString& b) noexcept { return detail::CompareNoCase(a.m_data, b.m_data) < 0; }
 
 	private:
 		const char* m_data;

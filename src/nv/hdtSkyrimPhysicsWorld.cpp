@@ -55,7 +55,10 @@ namespace hdt
 		if (m_accumulatedInterval * 2.0f > tick) {
 			const auto remainingTimeStep = std::min(m_accumulatedInterval, tick * m_maxSubSteps);
 
-			readTransform(remainingTimeStep);
+			{
+				NVSMP_PROF(ReadTransform);
+				readTransform(remainingTimeStep);
+			}
 			m_resetPc -= m_resetPc > 0;
 
 			auto offset = applyTranslationOffset();
@@ -63,7 +66,10 @@ namespace hdt
 			restoreTranslationOffset(offset);
 			m_accumulatedInterval = 0;
 
-			writeTransform();
+			{
+				NVSMP_PROF(WriteTransform);
+				writeTransform();
+			}
 		}
 
 		QueryPerformanceCounter(&t1);

@@ -10,11 +10,16 @@
 #include "hdtSkyrimPhysicsWorld.h"
 #include "hdtSkyrimSystem.h"
 #include "nif.h"
+#include "scene.h"
+#include "sampler.h"
 
 #include <cstdio>
 #include <fstream>
 #include <functional>
 #include <map>
+#include <set>
+
+using namespace scene;
 
 namespace nvsmp
 {
@@ -27,294 +32,67 @@ namespace nvsmp
 	}
 }
 
-// --- fake objects with the game's layout -------------------------------------------------------------
 
-static void* __fastcall ReturnSelf(void* self, void*) { return self; }
-static void* __fastcall ReturnNull(void*, void*) { return nullptr; }
-static void __fastcall DeleteNothing(void*, void*) {}
-
-static void* gNodeVtbl[16], *gGeomVtbl[16], *gOtherVtbl[16];
-static void InitVtables()
+// A picture of the skinned shapes, flat-shaded with a depth buffer, orthographic in the given frame
+// (y forward, z up): view 0 from the front (looking down -y), 1 from the right side (looking down -x).
+// Written as a binary PPM; each shape gets its own colour.
+static void Render(const char* path, const std::vector<RE::NiGeometry*>& geoms, const RE::NiTransform& frame, int view)
 {
-	for (int i = 0; i < 16; i++) gNodeVtbl[i] = gGeomVtbl[i] = gOtherVtbl[i] = (void*)ReturnNull;
-	gNodeVtbl[1] = gGeomVtbl[1] = gOtherVtbl[1] = (void*)DeleteNothing;
-	gNodeVtbl[3] = (void*)ReturnSelf;   // IsNode
-	gGeomVtbl[6] = (void*)ReturnSelf;   // IsGeometry
-}
-
-template <class T>
-static T* Alloc(size_t size, void** vtbl)
-{
-	auto* p = (T*)calloc(1, std::max(size, sizeof(T)));
-	((RE::NiObject*)p)->vtbl = vtbl;
-	((RE::NiObject*)p)->refCount = 1000;   // never freed during the test
-	return p;
-}
-
-static RE::NiNode* NewNode(const std::string& name)
-{
-	auto* n = Alloc<RE::NiNode>(0xAC, gNodeVtbl);
-	n->m_name = _strdup(name.c_str());
-	n->local = RE::NiTransform();   // identity: calloc left the rotations all zero
-	n->world = RE::NiTransform();
-	return n;
-}
-
-static void AddChild(RE::NiNode* parent, RE::NiAVObject* child)
-{
-	auto** arr = (RE::NiAVObject**)realloc(parent->children, sizeof(void*) * (parent->childFirstFree + 1));
-	parent->children = arr;
-	arr[parent->childFirstFree++] = child;
-	parent->childCount = parent->childFirstFree;
-	child->parent = parent;
-}
-
-static void AddStringExtra(RE::NiObjectNET* obj, const char* name, const std::string& value)
-{
-	auto* e = Alloc<RE::NiStringExtraData>(0x10, gOtherVtbl);
-	e->name = _strdup(name);
-	e->value = _strdup(value.c_str());
-	obj->extraData = (RE::NiExtraData**)realloc(obj->extraData, sizeof(void*) * (obj->extraDataCount + 1));
-	obj->extraData[obj->extraDataCount++] = e;
-}
-
-static RE::NiTransform ToRE(const nif::Transform& t)
-{
-	RE::NiTransform r;
-	for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) r.rotate.entry[i][j] = t.rot.m[i][j];
-	r.translate = { t.trans.x, t.trans.y, t.trans.z };
-	r.scale = t.scale;
-	return r;
-}
-
-namespace hdt
-{
-	RE::NiNode* createNode(const char* name) { return NewNode(name); }
-
-	static std::string gXmlPath;
-	std::string readAllFile(const char*)
-	{
-		std::ifstream in(gXmlPath, std::ios::binary);
-		return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-	}
-}
-
-static std::string StrName(const nif::File& f, int block)
-{
-	nif::Reader r(f.blocks[block].data(), f.blocks[block].size());
-	uint32_t s = r.u32();
-	return s < f.strings.size() ? f.strings[s] : "";
-}
-
-// --- the skeleton -------------------------------------------------------------------------------------
-
-struct Skeleton
-{
-	RE::NiNode* actor;   // the actor's 3D root (what the plugin calls the skeleton)
-	RE::NiNode* bip01;   // the skeleton root the game points unknown skin slots at
-	std::map<std::string, RE::NiNode*> bones;
-	std::map<std::string, RE::NiTransform> bind;   // world bind pose
-};
-
-static const char* kParents[][2] = {
-	{ "Bip01 Pelvis", "Bip01" }, { "Bip01 Spine", "Bip01 Pelvis" }, { "Bip01 Spine1", "Bip01 Spine" }, { "Bip01 Spine2", "Bip01 Spine1" },
-	{ "Bip01 Neck1", "Bip01 Spine2" }, { "Bip01 L Clavicle", "Bip01 Spine2" }, { "Bip01 R Clavicle", "Bip01 Spine2" },
-	{ "Bip01 L UpperArm", "Bip01 L Clavicle" }, { "Bip01 R UpperArm", "Bip01 R Clavicle" },
-	{ "Bip01 LUpArmTwistBone", "Bip01 L UpperArm" }, { "Bip01 RUpArmTwistBone", "Bip01 R UpperArm" },
-	{ "Bip01 L Thigh", "Bip01 Pelvis" }, { "Bip01 R Thigh", "Bip01 Pelvis" }, { "Bip01 L Calf", "Bip01 L Thigh" }, { "Bip01 R Calf", "Bip01 R Thigh" },
-	{ "Bip01 L Foot", "Bip01 L Calf" }, { "Bip01 R Foot", "Bip01 R Calf" }, { "Bip01 L Toe0", "Bip01 L Foot" }, { "Bip01 R Toe0", "Bip01 R Foot" },
-};
-
-static const char* ParentOf(const std::string& name)
-{
-	for (auto& p : kParents) if (name == p[0]) return p[1];
-	return "Bip01";
-}
-
-static void BuildSkeleton(const nif::File& f, Skeleton& sk)
-{
-	sk.actor = NewNode("TestActor");
-	sk.bip01 = NewNode("Bip01");
-	AddChild(sk.actor, sk.bip01);
-	sk.bones["Bip01"] = sk.bip01;
-	sk.bind["Bip01"] = RE::NiTransform();
-	// World bind of every bone any shape is skinned to: the inverse of its skin-to-bone (skin space
-	// is the NIF's root space, which the actor's root sits at).
-	for (size_t blk = 0; blk < f.blocks.size(); blk++) {
-		const std::string& t = f.typeOf(blk);
-		if (t != "NiSkinInstance" && t != "BSDismemberSkinInstance") continue;
-		nif::SkinInstance si;
-		si.read(f.blocks[blk], t == "BSDismemberSkinInstance");
-		nif::SkinData sd;
-		sd.read(f.blocks[si.data]);
-		for (size_t i = 0; i < si.bones.size(); i++) {
-			std::string name = StrName(f, si.bones[i]);
-			if (name.rfind("Bip01", 0) != 0 || sk.bind.count(name)) continue;
-			sk.bind[name] = ToRE(sd.skinTransform.inverse() * sd.bones[i].skinToBone.inverse());
-		}
-	}
-	// Parents first, so every local is relative to a placed parent.
-	std::function<RE::NiNode*(const std::string&)> make = [&](const std::string& name) -> RE::NiNode* {
-		if (auto it = sk.bones.find(name); it != sk.bones.end()) return it->second;
-		std::string parentName = ParentOf(name);
-		RE::NiNode* parent = sk.bind.count(parentName) ? make(parentName) : sk.bip01;
-		auto* node = NewNode(name);
-		AddChild(parent, node);
-		node->world = sk.bind[name];
-		node->local = parent->world.Invert() * node->world;
-		sk.bones[name] = node;
-		return node;
+	const int W = 600, H = 900;
+	std::vector<float> depth(W * H, -1e30f);
+	std::vector<uint8_t> rgb(W * H * 3, 40);
+	const float colours[][3] = { { 150, 110, 70 }, { 90, 90, 110 }, { 80, 150, 80 }, { 160, 80, 80 }, { 160, 160, 80 }, { 80, 160, 160 } };
+	RE::NiTransform inv = frame.Invert();
+	// The frame's origin is at the pelvis: show 60 units above to 100 below, 50 either side.
+	auto toScreen = [&](RE::NiPoint3 p, float& sx, float& sy, float& sz) {
+		float across = view == 0 ? -p.x : p.y, toward = view == 0 ? p.y : p.x;
+		sx = (across + 50.0f) / 100.0f * W;
+		sy = (60.0f - p.z) / 160.0f * H;
+		sz = toward;   // the camera sits on +y (front) / +x (right side): nearer = larger
 	};
-	for (auto& [name, xf] : sk.bind) make(name);
-}
-
-// --- the item -----------------------------------------------------------------------------------------
-
-struct Shape
-{
-	RE::NiGeometry* geometry;
-	std::vector<std::string> boneNames;
-};
-
-static RE::NiGeometry* BuildShape(const nif::File& f, int blk, Skeleton& sk, std::vector<std::string>& boneNames)
-{
-	nif::Geometry g;
-	g.read(f.blocks[blk]);
-	bool strips = f.typeOf(g.data) == "NiTriStripsData";
-	nif::GeometryData gd;
-	gd.read(f.blocks[g.data], strips);
-	auto* geom = Alloc<RE::NiGeometry>(0xC4, gGeomVtbl);
-	geom->m_name = _strdup(StrName(f, blk).c_str());
-	geom->local = RE::NiTransform();
-	geom->world = RE::NiTransform();
-	for (int e : g.av.extraData) {
-		if (f.typeOf(e) != "NiStringExtraData") continue;
-		nif::Reader r(f.blocks[e].data(), f.blocks[e].size());
-		uint32_t n = r.u32(), v = r.u32();
-		AddStringExtra(geom, f.strings[n].c_str(), f.strings[v]);
-	}
-
-	auto* data = Alloc<RE::NiTriShapeData>(0x58, gOtherVtbl);
-	data->vertexCount = (uint16_t)gd.vertices.size();
-	data->vertices = (RE::NiPoint3*)malloc(sizeof(RE::NiPoint3) * gd.vertices.size());
-	for (size_t i = 0; i < gd.vertices.size(); i++) data->vertices[i] = { gd.vertices[i].x, gd.vertices[i].y, gd.vertices[i].z };
-	data->triangleCount = (uint16_t)gd.triangles.size();
-	data->triListLength = (uint32_t)gd.triangles.size() * 3;
-	data->triList = (uint16_t*)malloc(sizeof(uint16_t) * data->triListLength);
-	for (size_t t = 0; t < gd.triangles.size(); t++) for (int k = 0; k < 3; k++) data->triList[t * 3 + k] = gd.triangles[t].v[k];
-	geom->data = data;
-
-	if (g.skin < 0) return geom;
-	nif::SkinInstance si;
-	si.read(f.blocks[g.skin], f.typeOf(g.skin) == "BSDismemberSkinInstance");
-	nif::SkinData sd;
-	sd.read(f.blocks[si.data]);
-	nif::SkinPartition sp;
-	sp.read(f.blocks[si.partition]);
-
-	auto* skin = Alloc<RE::NiSkinInstance>(0x34, gOtherVtbl);
-	auto* skinData = Alloc<RE::NiSkinData>(0x48, gOtherVtbl);
-	skinData->rootParentToSkin = ToRE(sd.skinTransform);
-	skinData->boneCount = (uint32_t)sd.bones.size();
-	skinData->boneData = (RE::NiSkinData::BoneData*)calloc(sd.bones.size(), sizeof(RE::NiSkinData::BoneData));
-	for (size_t b = 0; b < sd.bones.size(); b++) {
-		auto& bd = skinData->boneData[b];
-		bd.skinToBone = ToRE(sd.bones[b].skinToBone);
-		bd.bound = { { sd.bones[b].center.x, sd.bones[b].center.y, sd.bones[b].center.z }, sd.bones[b].radius };
-	}
-	skin->skinData = skinData;
-	skin->boneCount = (uint32_t)si.bones.size();
-	skin->bones = (RE::NiAVObject**)calloc(si.bones.size(), sizeof(void*));
-	// The game's attach: slots of skeleton bones point at them, the rest at the skeleton root.
-	for (size_t i = 0; i < si.bones.size(); i++) {
-		std::string name = StrName(f, si.bones[i]);
-		boneNames.push_back(name);
-		auto it = sk.bones.find(name);
-		skin->bones[i] = it != sk.bones.end() ? (RE::NiAVObject*)it->second : (RE::NiAVObject*)sk.bip01;
-	}
-
-	// NiSkinPartition: count, then 0x2C-byte partition records.
-	struct PartitionNV { void** vtbl; volatile long ref; uint32_t count; uint8_t* parts; };
-	auto* part = (PartitionNV*)calloc(1, sizeof(PartitionNV));
-	part->vtbl = gOtherVtbl;
-	part->count = (uint32_t)sp.parts.size();
-	part->parts = (uint8_t*)calloc(sp.parts.size(), 0x2C);
-	for (size_t i = 0; i < sp.parts.size(); i++) {
-		auto& p = sp.parts[i];
-		uint8_t* rec = part->parts + i * 0x2C;
-		auto copy16 = [](const std::vector<uint16_t>& v) { auto* a = (uint16_t*)malloc(v.size() * 2 + 2); memcpy(a, v.data(), v.size() * 2); return a; };
-		*(uint16_t**)(rec + 0x04) = copy16(p.bones);
-		auto* w = (float*)malloc(p.weights.size() * 4 + 4);
-		memcpy(w, p.weights.data(), p.weights.size() * 4);
-		*(float**)(rec + 0x08) = w;
-		*(uint16_t**)(rec + 0x0C) = copy16(p.vertexMap);
-		auto* pal = (uint8_t*)malloc(p.boneIndices.size() + 1);
-		memcpy(pal, p.boneIndices.data(), p.boneIndices.size());
-		*(uint8_t**)(rec + 0x10) = pal;
-		std::vector<uint16_t> tri;
-		std::vector<uint16_t> lens;
-		if (p.strips.empty()) for (auto& t : p.triangles) { tri.push_back(t.v[0]); tri.push_back(t.v[1]); tri.push_back(t.v[2]); }
-		else for (auto& s : p.strips) { lens.push_back((uint16_t)s.size()); tri.insert(tri.end(), s.begin(), s.end()); }
-		*(uint16_t**)(rec + 0x14) = copy16(tri);
-		*(uint16_t**)(rec + 0x18) = lens.empty() ? nullptr : copy16(lens);
-		*(uint16_t*)(rec + 0x1C) = (uint16_t)p.vertexMap.size();
-		*(uint16_t*)(rec + 0x1E) = (uint16_t)p.triangles.size();
-		*(uint16_t*)(rec + 0x20) = (uint16_t)p.bones.size();
-		*(uint16_t*)(rec + 0x22) = (uint16_t)p.strips.size();
-		*(uint16_t*)(rec + 0x24) = p.numWeightsPerVertex;
-	}
-	skin->skinPartition = part;
-	geom->skinInstance = skin;
-	return geom;
-}
-
-// A vertex in the world as the game skins it: sum of weight * bone world * skin-to-bone * vertex.
-static RE::NiPoint3 SkinVertex(RE::NiGeometry* g, int v, const std::vector<std::vector<std::pair<int, float>>>& weights)
-{
-	RE::NiPoint3 out{};
-	for (auto& [slot, w] : weights[v]) {
-		auto* b = g->skinInstance->bones[slot];
-		RE::NiPoint3 p = (b->world * g->skinInstance->skinData->boneData[slot].skinToBone) * g->data->vertices[v];
-		out = out + p * w;
-	}
-	return out;
-}
-
-static std::vector<std::vector<std::pair<int, float>>> WeightsOf(RE::NiGeometry* g)
-{
-	std::vector<std::vector<std::pair<int, float>>> w(g->data->vertexCount);
-	struct PartitionNV { void** vtbl; volatile long ref; uint32_t count; uint8_t* parts; };
-	auto* sp = (PartitionNV*)g->skinInstance->skinPartition;
-	for (uint32_t i = 0; i < sp->count; i++) {
-		uint8_t* rec = sp->parts + i * 0x2C;
-		auto* bones = *(uint16_t**)(rec + 0x04);
-		auto* ws = *(float**)(rec + 0x08);
-		auto* map = *(uint16_t**)(rec + 0x0C);
-		auto* pal = *(uint8_t**)(rec + 0x10);
-		uint16_t nv = *(uint16_t*)(rec + 0x1C), per = *(uint16_t*)(rec + 0x24);
-		for (uint16_t v = 0; v < nv; v++) {
-			if (!w[map[v]].empty()) continue;
-			for (uint16_t k = 0; k < per; k++) if (ws[v * per + k] > 0) w[map[v]].push_back({ bones[pal[v * per + k]], ws[v * per + k] });
+	for (size_t gi = 0; gi < geoms.size(); gi++) {
+		auto* g = geoms[gi];
+		auto weights = WeightsOf(g);
+		std::vector<RE::NiPoint3> pts(g->data->vertexCount);
+		for (int v = 0; v < g->data->vertexCount; v++) pts[v] = inv * SkinVertex(g, v, weights);
+		auto* td = (RE::NiTriShapeData*)g->data;
+		const float* c = colours[gi % 6];
+		for (uint32_t t = 0; t + 2 < td->triListLength; t += 3) {
+			RE::NiPoint3 a = pts[td->triList[t]], b = pts[td->triList[t + 1]], d = pts[td->triList[t + 2]];
+			RE::NiPoint3 e1 = b - a, e2 = d - a;
+			RE::NiPoint3 n(e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x);
+			float len = n.Length();
+			if (len < 1e-8f) continue;
+			float facing = std::fabs((view == 0 ? n.y : n.x) / len);
+			float shade = 0.35f + 0.65f * facing;
+			float x[3], y[3], z[3];
+			toScreen(a, x[0], y[0], z[0]); toScreen(b, x[1], y[1], z[1]); toScreen(d, x[2], y[2], z[2]);
+			int x0 = std::max(0, (int)std::floor(std::min({ x[0], x[1], x[2] }))), x1 = std::min(W - 1, (int)std::ceil(std::max({ x[0], x[1], x[2] })));
+			int y0 = std::max(0, (int)std::floor(std::min({ y[0], y[1], y[2] }))), y1 = std::min(H - 1, (int)std::ceil(std::max({ y[0], y[1], y[2] })));
+			float area = (x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0]);
+			if (std::fabs(area) < 1e-6f) continue;
+			for (int py = y0; py <= y1; py++)
+				for (int px = x0; px <= x1; px++) {
+					float fx = px + 0.5f, fy = py + 0.5f;
+					float w0 = ((x[1] - fx) * (y[2] - fy) - (x[2] - fx) * (y[1] - fy)) / area;
+					float w1 = ((x[2] - fx) * (y[0] - fy) - (x[0] - fx) * (y[2] - fy)) / area;
+					float w2 = 1 - w0 - w1;
+					if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+					float zz = w0 * z[0] + w1 * z[1] + w2 * z[2];
+					int i = py * W + px;
+					if (zz <= depth[i]) continue;
+					depth[i] = zz;
+					for (int k = 0; k < 3; k++) rgb[i * 3 + k] = (uint8_t)std::min(255.0f, c[k] * shade);
+				}
 		}
 	}
-	return w;
+	FILE* f = fopen(path, "wb");
+	if (!f) return;
+	fprintf(f, "P6\n%d %d\n255\n", W, H);
+	fwrite(rgb.data(), 1, rgb.size(), f);
+	fclose(f);
 }
 
-static RE::NiMatrix3 RotX(float a)
-{
-	RE::NiMatrix3 m;
-	m.entry[1][1] = cosf(a); m.entry[1][2] = -sinf(a);
-	m.entry[2][1] = sinf(a); m.entry[2][2] = cosf(a);
-	return m;
-}
-
-static RE::NiMatrix3 RotZ(float a)
-{
-	RE::NiMatrix3 m;
-	m.entry[0][0] = cosf(a); m.entry[0][1] = -sinf(a);
-	m.entry[1][0] = sinf(a); m.entry[1][1] = cosf(a);
-	return m;
-}
 
 int main(int argc, char** argv)
 {
@@ -324,42 +102,39 @@ int main(int argc, char** argv)
 	}
 	setvbuf(stdout, nullptr, _IONBF, 0);
 	int frames = argc > 3 ? atoi(argv[3]) : 600;
-	hdt::gXmlPath = argv[2];
-	InitVtables();
+	// The NIF names its physics file relative to Data; the test has it on the command line. The file
+	// name must match, as the game's lookup would need it to.
+	const std::string xmlPath = argv[2];
+	scene::gReadFile = [xmlPath](const char* path) -> std::string {
+		auto base = [](std::string p) {
+			for (auto& c : p) if (c == '/') c = '\\';
+			auto s = p.find_last_of('\\');
+			return s == std::string::npos ? p : p.substr(s + 1);
+		};
+		if (_stricmp(base(path).c_str(), base(xmlPath).c_str()) != 0) {
+			printf("  the NIF names physics file '%s', not '%s'\n", path, xmlPath.c_str());
+			return {};
+		}
+		std::ifstream in(xmlPath, std::ios::binary);
+		return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+	};
 	try {
-		nif::File f;
-		f.load(argv[1]);
-		Skeleton sk;
-		BuildSkeleton(f, sk);
+		scene::Item item = scene::Load(argv[1]);
+		auto& sk = item.skeleton;
+		auto* model = item.model;
+		auto& shapes = item.byName;
 		printf("skeleton: %zu bones\n", sk.bones.size());
 
-		// The item's root under the actor, its shapes under it, as the game attaches armor.
-		auto* model = NewNode("Scene Root");
-		AddChild(sk.actor, model);
-		{
-			nif::AVObject root;
-			nif::Reader r(f.blocks[f.roots[0]].data(), f.blocks[f.roots[0]].size());
-			root.read(r, true);
-			for (int e : root.extraData) {
-				nif::Reader er(f.blocks[e].data(), f.blocks[e].size());
-				uint32_t n = er.u32(), v = er.u32();
-				AddStringExtra(model, f.strings[n].c_str(), f.strings[v]);
-			}
+		// Build, as the actor manager does: from the file the item's root names.
+		const char* named = item.physicsFile.empty() ? nullptr : item.physicsFile.c_str();
+		if (!named) {
+			printf("FAIL: the NIF's root names no physics file\n");
+			return 2;
 		}
-		std::map<std::string, RE::NiGeometry*> shapes;
-		for (size_t blk = 0; blk < f.blocks.size(); blk++) {
-			const std::string& t = f.typeOf(blk);
-			if (t != "NiTriShape" && t != "NiTriStrips") continue;
-			std::vector<std::string> names;
-			auto* g = BuildShape(f, (int)blk, sk, names);
-			AddChild(model, g);
-			shapes[g->m_name] = g;
-		}
-		hdt::updateTransformUpDown(sk.actor);
-
-		// Build, as the actor manager does.
-		hdt::DefaultBBP::PhysicsFile_t file{ "physics.xml", {} };
+		printf("physics file: %s\n", named);
+		hdt::DefaultBBP::PhysicsFile_t file{ named, {} };
 		hdt::SkyrimSystemCreator creator;
+		creator.m_ground = getenv("SYSTEMTEST_NOGROUND") == nullptr;
 		auto system = creator.createOrUpdateSystem(sk.actor, model, &file, {}, nullptr);
 		if (!system) {
 			printf("FAIL: no system built\n");
@@ -376,7 +151,7 @@ int main(int argc, char** argv)
 		auto coatWeights = coat ? WeightsOf(coat) : decltype(WeightsOf(nullptr)){};
 		auto legWeights = legs ? WeightsOf(legs) : decltype(WeightsOf(nullptr)){};
 		std::vector<int> skirt;
-		if (coat) for (int v = 0; v < coat->data->vertexCount; v++) for (auto& [slot, w] : coatWeights[v]) if (std::string(coat->skinInstance->bones[slot]->m_name).rfind("SMP Coat", 0) == 0 && w > 0.3f) { skirt.push_back(v); break; }
+		if (coat) for (int v = 0; v < coat->data->vertexCount; v++) for (auto& [slot, w] : coatWeights[v]) if (_strnicmp(coat->skinInstance->bones[slot]->m_name, "SMP Coat", 8) == 0 && w > 0.3f) { skirt.push_back(v); break; }
 		printf("%zu skirt vertices on simulated bones\n", skirt.size());
 
 		auto* pelvis = sk.bones["Bip01 Pelvis"];
@@ -387,14 +162,82 @@ int main(int argc, char** argv)
 		for (auto& b : system->getBones()) if (b->m_name == RE::BSFixedString("SMP Coat C05 R4")) hem = static_cast<hdt::SkyrimBone*>(b.get());
 
 		const float dt = 1.0f / 60.0f;
+		// SYSTEMTEST_CROUCH=units: the body sinks that far over the first second (the actor's root, and with it
+		// the ground plane, stays): the lowest the coat then gets, against the ground.
+		const float crouch = getenv("SYSTEMTEST_CROUCH") ? (float)atof(getenv("SYSTEMTEST_CROUCH")) : 0.0f;
+		const RE::NiTransform bip01Rest = sk.bip01->local;
+		float lowestCoat = 1e9f;
 		float maxSwing = 0, minClear = 1e9f, sumClear = 0;
 		int clearSamples = 0;
 		bool bad = false;
 		const bool still = getenv("SYSTEMTEST_STILL") != nullptr;
+		// SYSTEMTEST_RUN: a run instead of a walk (400 units/s, thighs +/-45 deg at 1.5 Hz).
+		const bool run = getenv("SYSTEMTEST_RUN") != nullptr;
+		const float speed = run ? 400.0f : 150.0f, stride = run ? 0.79f : 0.49f, rate = run ? 1.5f : 1.0f;
+
+		// The legs as tapered capsules (thigh to calf, calf to foot), as thick as the leg mesh around each end
+		// at rest: a skirt vertex closer to a leg's bone line than that is inside the leg.
+		struct Segment { RE::NiAVObject* a; RE::NiAVObject* b; float ra, rb; };
+		std::vector<Segment> segs;
+		for (const char* side : { "L", "R" }) {
+			auto* th = sk.bones[std::string("Bip01 ") + side + " Thigh"];
+			auto* ca = sk.bones[std::string("Bip01 ") + side + " Calf"];
+			auto* fo = sk.bones[std::string("Bip01 ") + side + " Foot"];
+			if (th && ca) segs.push_back({ th, ca, 0, 0 });
+			if (ca && fo) segs.push_back({ ca, fo, 0, 0 });
+		}
+		// Distance from a segment's bone line, and where along it.
+		auto segDistT = [](const Segment& g, const RE::NiPoint3& p, float& t) {
+			RE::NiPoint3 a = g.a->world.translate, ab = g.b->world.translate - a, ap = p - a;
+			float len2 = std::max(ab.x * ab.x + ab.y * ab.y + ab.z * ab.z, 1e-6f);
+			t = std::clamp((ap.x * ab.x + ap.y * ab.y + ap.z * ab.z) / len2, 0.0f, 1.0f);
+			return (p - (a + ab * t)).Length();
+		};
+		auto segDist = [&](const Segment& g, const RE::NiPoint3& p) { float t; return segDistT(g, p, t); };
+		// How deep a point is inside a segment's tapered capsule (negative: outside).
+		auto segDepth = [&](const Segment& g, const RE::NiPoint3& p) { float t; float d = segDistT(g, p, t); return g.ra + (g.rb - g.ra) * t - d; };
+		if (legs) {
+			std::vector<std::vector<float>> all(segs.size()), nearA(segs.size()), nearB(segs.size());
+			for (int v = 0; v < legs->data->vertexCount; v++) {
+				RE::NiPoint3 q = SkinVertex(legs, v, legWeights);
+				int best = -1;
+				float bd = 1e9f, bt = 0;
+				for (size_t i = 0; i < segs.size(); i++) {
+					float t, x = segDistT(segs[i], q, t);
+					if (x < bd) { bd = x; bt = t; best = (int)i; }
+				}
+				if (best < 0) continue;
+				all[best].push_back(bd);
+				if (bt < 0.33f) nearA[best].push_back(bd);
+				if (bt > 0.67f) nearB[best].push_back(bd);
+			}
+			auto quartile = [](std::vector<float> v) { std::sort(v.begin(), v.end()); return v[v.size() / 4]; };
+			for (size_t i = 0; i < segs.size(); i++) {
+				if (all[i].empty()) continue;
+				float whole = quartile(all[i]);   // the leg's thinner side: a lower bound
+				segs[i].ra = nearA[i].size() >= 10 ? quartile(nearA[i]) : whole;
+				segs[i].rb = nearB[i].size() >= 10 ? quartile(nearB[i]) : whole;
+			}
+		}
+		int insideSamples = 0, insideCount = 0;
+		// The same for the coat at hip height alone: vertices mostly on the top two grid rows (R0, R1).
+		std::set<int> upper;
+		if (coat)
+			for (int v : skirt)
+				for (auto& [slot, w] : coatWeights[v]) {
+					std::string n = coat->skinInstance->bones[slot]->m_name;
+					if (w > 0.3f && n.size() > 3 && (n.compare(n.size() - 3, 3, " R0") == 0 || n.compare(n.size() - 3, 3, " R1") == 0)) { upper.insert(v); break; }
+				}
+		int upperSamples = 0, upperInside = 0;
+		float upperWorst = 0;
+		float worstDepth = 0;
 		RE::NiPoint3 hemRest;   // the hem in the pelvis' frame at rest
 		float swingByPhase[4] = {};
 		const char* phaseNames[4] = { "standing", "walking", "turning", "stopped" };
 		float bob = 0;
+		const bool sample = getenv("SYSTEMTEST_SAMPLE") != nullptr;
+		if (sample)
+			sampler::Start();
 		for (int frame = 0; frame < frames; frame++) {
 			float t = frame * dt;
 			// Stand for a second; walk at 150 units/s (thighs +/-28 deg at 1 Hz, calves bending on the back
@@ -402,23 +245,100 @@ int main(int argc, char** argv)
 			// 7 s stop dead.
 			int phaseId = still ? 0 : t < 1.0f ? 0 : t < 4.0f ? 1 : t < 4.5f ? 2 : t < 7.0f ? 1 : 3;
 			float walk = (phaseId == 1 || phaseId == 2) ? 1.0f : 0.0f;
-			float phase = t * 2.0f * 3.14159f;
+			float phase = t * 2.0f * 3.14159f * rate;
 			float turn = (still || t < 4.0f) ? 0.0f : std::min((t - 4.0f) / 0.5f, 1.0f) * 1.5708f;
 			sk.actor->local.rotate = RotZ(turn);
 			float newBob = 2.0f * sinf(phase * 2.0f) * walk;
-			sk.actor->local.translate = sk.actor->local.translate + (sk.actor->local.rotate * RE::NiPoint3(0, 150.0f * dt * walk, newBob - bob));
+			sk.actor->local.translate = sk.actor->local.translate + (sk.actor->local.rotate * RE::NiPoint3(0, speed * dt * walk, newBob - bob));
 			bob = newBob;
-			float swing = 0.49f * sinf(phase) * walk;
+			float swing = stride * sinf(phase) * walk;
 			lThigh->local = lThigh0; rThigh->local = rThigh0; lCalf->local = lCalf0; rCalf->local = rCalf0;
+			// SYSTEMTEST_POSE="spread forward" (degrees): a stance, both thighs out and the right one forward,
+			// as an aiming idle stands; applied on top of the walk.
+			if (const char* pose = getenv("SYSTEMTEST_POSE")) {
+				float spread = 0, fwd = 0;
+				sscanf(pose, "%f %f", &spread, &fwd);
+				lThigh0 = lThigh->parent ? lThigh0 : lThigh0;
+				static bool posed = false;
+				if (!posed) {
+					posed = true;
+					const float d = 3.14159f / 180.0f;
+					lThigh0.rotate = lThigh0.rotate * RotZ(spread * d);
+					rThigh0.rotate = rThigh0.rotate * RotZ(-spread * d) * RotX(-fwd * d);
+				}
+				lThigh->local = lThigh0; rThigh->local = rThigh0;
+			}
 			lThigh->local.rotate = lThigh0.rotate * RotX(swing);
 			rThigh->local.rotate = rThigh0.rotate * RotX(-swing);
 			lCalf->local.rotate = lCalf0.rotate * RotX(std::max(0.0f, -swing) * 1.2f);
 			rCalf->local.rotate = rCalf0.rotate * RotX(std::max(0.0f, swing) * 1.2f);
+			if (crouch > 0) {
+				sk.bip01->local = bip01Rest;
+				sk.bip01->local.translate.z -= crouch * std::min(1.0f, t);
+			}
 			sk.actor->world = sk.actor->local;
 			hdt::updateTransformUpDown(sk.bip01);
 			hdt::updateTransformUpDown(model);
 
+			sampler::gActive = true;
 			world->doUpdate(dt);
+			sampler::gActive = false;
+
+			// SYSTEMTEST_REBUILD: at 2 s, drop the system and build it again without the ground, as the menu's
+			// Ground collision switch does in game.
+			if (getenv("SYSTEMTEST_REBUILD") && frame == 120) {
+				printf("rebuilding without the ground\n");
+				world->removeSkinnedMeshSystem(system.get());
+				system = nullptr;
+				hdt::SkyrimSystemCreator again;
+				again.m_ground = false;
+				system = again.createOrUpdateSystem(sk.actor, model, &file, {}, nullptr);
+				if (!system) { printf("FAIL: no system on the rebuild\n"); return 2; }
+				world->addSkinnedMeshSystem(system.get());
+				hem = nullptr;
+				for (auto& b : system->getBones()) if (b->m_name == RE::BSFixedString("SMP Coat C05 R4")) hem = static_cast<hdt::SkyrimBone*>(b.get());
+				printf("rebuilt: %zu bones, %zu collision bodies\n", system->getBones().size(), system->meshes().size());
+			}
+
+			if (crouch > 0 && coat && frame > 60)
+				for (int v : skirt) lowestCoat = std::min(lowestCoat, SkinVertex(coat, v, coatWeights).z - sk.actor->world.translate.z);
+
+			// Standing still: how far each coat vertex settles from where it was drawn at rest, and
+			// where the worst ones are (pelvis frame) and what they are skinned to.
+			if (still && coat) {
+				static std::vector<RE::NiPoint3> restPts;
+				if (frame == 0)
+					for (int v = 0; v < coat->data->vertexCount; v++) restPts.push_back(SkinVertex(coat, v, coatWeights));
+				// SYSTEMTEST_RENDER=prefix: pictures at rest (frame 0) and settled (last frame), front and side.
+				if (const char* prefix = getenv("SYSTEMTEST_RENDER"); prefix && (frame == 0 || frame == frames - 1)) {
+					std::vector<RE::NiGeometry*> geoms;
+					for (const char* n : { "Upperbody:Coat", "Legs", "Holster", "Upperbody:003" })
+						if (shapes.count(n)) geoms.push_back(shapes[n]);
+					RE::NiTransform view = sk.actor->world;
+					view.translate = pelvis->world.translate;
+					for (int side = 0; side < 2; side++) {
+						char path[512];
+						snprintf(path, sizeof path, "%s_%s_%s.ppm", prefix, frame == 0 ? "rest" : "settled", side ? "side" : "front");
+						Render(path, geoms, view, side);
+					}
+				}
+				if (frame == frames - 1) {
+					std::vector<std::pair<float, int>> moved;
+					for (int v = 0; v < coat->data->vertexCount; v++)
+						moved.push_back({ (SkinVertex(coat, v, coatWeights) - restPts[v]).Length(), v });
+					std::sort(moved.rbegin(), moved.rend());
+					int over2 = 0;
+					for (auto& m : moved) over2 += m.first > 2.0f;
+					printf("coat vertices settled more than 2 units from rest: %d of %d\n", over2, (int)moved.size());
+					for (int k = 0; k < 8 && k < (int)moved.size(); k++) {
+						int v = moved[k].second;
+						RE::NiPoint3 p = pelvis->world.Invert() * restPts[v];
+						printf("  v%-5d moved %5.1f  at pelvis-frame (%6.1f %6.1f %6.1f) ", v, moved[k].first, p.x, p.y, p.z);
+						for (auto& [slot, w] : coatWeights[v]) printf(" %s %.2f", (const char*)coat->skinInstance->bones[slot]->m_name, w);
+						printf("\n");
+					}
+				}
+			}
 
 			for (auto& b : system->getBones()) {
 				auto o = b->m_rig.getWorldTransform().getOrigin();
@@ -444,15 +364,41 @@ int main(int argc, char** argv)
 					float best = 1e9f;
 					for (auto& q : legPts) best = std::min(best, (p - q).Length());
 					minClear = std::min(minClear, best);
+					insideSamples++;
+					float depth = 0;
+					for (auto& g : segs)
+						if (g.ra > 0) depth = std::max(depth, segDepth(g, p));
+					if (depth > 0.5f) {
+						insideCount++;
+						worstDepth = std::max(worstDepth, depth);
+					}
+					if (upper.count(v)) {
+						upperSamples++;
+						if (depth > 0.5f) { upperInside++; upperWorst = std::max(upperWorst, depth); }
+					}
 					sumClear += best;
 					clearSamples++;
 				}
 			}
 		}
+		if (sample)
+			sampler::Report();
 		printf("hem swing from rest, most: standing %.1f, walking %.1f, turning %.1f, after the stop %.1f units\n",
 			swingByPhase[0], swingByPhase[1], swingByPhase[2], swingByPhase[3]);
 		if (clearSamples) printf("skirt to legs: closest %.2f units, average %.2f units\n", minClear, sumClear / clearSamples);
+		if (insideSamples) printf("skirt inside the legs: %.1f%% of samples, deepest %.1f units\n", 100.0f * insideCount / insideSamples, worstDepth);
+		if (upperSamples) printf("  at hip height (top rows): %.1f%% of samples, deepest %.1f units\n", 100.0f * upperInside / upperSamples, upperWorst);
+		if (crouch > 0) printf("crouched %.0f: lowest coat point %.1f units %s the ground\n", crouch, std::fabs(lowestCoat), lowestCoat < 0 ? "below" : "above");
 		printf("step time %.3f ms\n", world->m_averageStepMs);
+#ifdef NVSMP_PROFILE
+		{
+			double sum = 0;
+			for (double t : nvsmp::prof::gTotal) sum += t;
+			printf("per frame (%d frames):\n", frames);
+			for (int s = 0; s < nvsmp::prof::Count; s++)
+				printf("  %-24s %6.3f ms  %4.1f%%\n", nvsmp::prof::kNames[s], nvsmp::prof::gTotal[s] / frames, sum > 0 ? 100.0 * nvsmp::prof::gTotal[s] / sum : 0.0);
+		}
+#endif
 		if (bad) {
 			printf("FAIL: NaN or a bone flew off\n");
 			return 3;

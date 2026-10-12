@@ -16,6 +16,9 @@ namespace hdt
 		virtual void addSkinnedMeshSystem(SkinnedMeshSystem* system);
 		virtual void removeSkinnedMeshSystem(SkinnedMeshSystem* system);
 
+		// NV SMP Physics: off skips collision detection (a debugging switch in the menu).
+		bool m_collisionsEnabled = true;
+
 		void updateConstraintsForBone(SkinnedMeshBone* bone);
 
 		int stepSimulation(btScalar remainingTimeStep, int maxSubSteps = 1,
