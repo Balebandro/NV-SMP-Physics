@@ -4,6 +4,7 @@
 // matches its skin and the anchors the physics hangs the cloth from are gone.
 //
 //   smprepair edited.nif reference.nif out.nif
+//   smprepair --list in.nif skeleton.nif out.nif    (writes a missing list: see listMode)
 //
 // reference.nif: the file before the edit (smpdress or smpify output). Per shape with "SMP Bones":
 //   - every SMP bone of the old list missing from the skin goes back in, unweighted, its node and skin-to-bone taken
@@ -11,8 +12,10 @@
 //   - "SMP Bones" is written again in the skin's slot order, each bone's parent as before.
 // Everything else (weights, geometry, edits) is kept.
 #include "nif.h"
+#include "smplist.h"
 #include <cstdio>
 #include <map>
+#include <set>
 using namespace nif;
 
 static std::string strName(const File& f, int block)
@@ -63,9 +66,34 @@ static void addSmpBones(File& f, AVObject& av, const std::string& list)
 	}
 }
 
+// --list: writes "SMP Bones" on every skinned shape that has none, for an SMP item made outside these tools (a Skyrim
+// body or outfit rigged with extra bones), and keeps those shapes' vertex data: smplist.h (shared with NV SMP Prepare).
+static int listMode(const char* in, const char* skeletonPath, const char* out)
+{
+	File f;
+	f.load(in);
+	auto done = smplist::addLists(f, smplist::skeletonBones(skeletonPath));
+	std::set<std::string> shapes;
+	for (auto& d : done) {
+		shapes.insert(d.shape);
+		std::string own;
+		for (auto& o : d.own) own += (own.empty() ? "" : ", ") + o;
+		printf("%s: SMP Bones written (its own: %s)\n", d.shape.c_str(), own.c_str());
+	}
+	int flags = smplist::keepVertexData(f, shapes);
+	if (done.empty() && !flags && std::string(in) == out) { printf("nothing to add: %s left as it was\n", in); return 0; }
+	f.save(out);
+	printf("wrote %s (%zu shape(s))\n", out, done.size());
+	return 0;
+}
+
 int main(int argc, char** argv)
 {
-	if (argc < 4) { printf("usage: smprepair edited.nif reference.nif out.nif\n"); return 1; }
+	if (argc >= 5 && std::string(argv[1]) == "--list") {
+		try { return listMode(argv[2], argv[3], argv[4]); }
+		catch (const std::exception& e) { printf("error: %s\n", e.what()); return 1; }
+	}
+	if (argc < 4) { printf("usage: smprepair edited.nif reference.nif out.nif\n       smprepair --list in.nif skeleton.nif out.nif\n"); return 1; }
 	try {
 		File f, ref;
 		f.load(argv[1]);

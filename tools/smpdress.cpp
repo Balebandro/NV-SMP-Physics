@@ -29,6 +29,10 @@
 //       --links n           simulated links per strand (default 4)
 //       --keep-top a b      where the strands are tied on stays static: their top a units keep their own weights,
 //                           blending into the links down to b units
+//   --painted "Shape" file.smppaint   chains painted on the shape in the NV SMP Maker: per chain its stroke (links laid
+//                     along it from where it is tied on), the painted vertices and their strength (a soft edge blends
+//                     into the shape's own weights), the bone it hangs from, links, stiffness and weight (each chain
+//                     gets its own templates from those two)
 //   --collide "Shape" a shape of the same NIF everything above collides with (repeatable)
 //   --proxy cell      the colliders collide through low-poly stand-ins hidden in the NIF (vertices merged in cells of
 //                     this many units, about 2-4): far cheaper for the physics to skin and test than the render meshes
@@ -56,6 +60,7 @@
 #include <map>
 #include <numeric>
 #include <set>
+#include <sstream>
 using namespace nif;
 
 static const float PI = 3.14159265f;
@@ -129,8 +134,19 @@ static void addSmpBones(File& f, AVObject& av, const std::string& list)
 
 static int findRoot(std::vector<int>& p, int x) { while (p[x] != x) x = p[x] = p[p[x]]; return x; }
 
+// A chain painted in the NV SMP Maker (--painted): its path (vertex indices in stroke order, from where it is tied on)
+// and the painted vertices with their paint strength (0..1), what it hangs from and how it feels.
+struct PaintChain {
+	std::string anchor = "Bip01 Pelvis";
+	int links = 4;
+	float stiffness = 0.4f, weight = 0.4f;   // 0..1 each
+	std::vector<int> path;
+	std::vector<std::pair<int, float>> paint;
+	int global = 0;                           // its number across the outfit (template names)
+};
+
 struct Job {
-	enum Kind { Cloth, Chains } kind;
+	enum Kind { Cloth, Chains, Painted } kind;
 	std::string shape;
 	std::string anchor = "Bip01 Pelvis";
 	float top = -1e9f;
@@ -147,7 +163,40 @@ struct Job {
 	float collar = 10.0f;      // --collar d: the top row's distance from it (closer vertices keep their weights)
 	bool neckSet = false;      // --neck x y z (default: the centre of the shape's top 4 units)
 	Vec3 neck;
+	std::vector<PaintChain> painted;   // --painted "Shape" file.smppaint: the shape's chains from the file
 };
+
+// Reads the chains of one shape from a .smppaint file (written by the NV SMP Maker):
+//   chain "Shape" / anchor Bone / links n / stiffness s / weight w / path v v v... / paint v:s v:s... / end
+static std::vector<PaintChain> readPaintFile(const std::string& path, const std::string& shape)
+{
+	std::ifstream in(path);
+	if (!in) throw std::runtime_error("cannot read the paint file " + path);
+	std::vector<PaintChain> out;
+	PaintChain cur;
+	bool inChain = false, mine = false;
+	std::string line;
+	while (std::getline(in, line)) {
+		if (!line.empty() && line.back() == '\r') line.pop_back();
+		size_t sp = line.find(' ');
+		std::string key = line.substr(0, sp), rest = sp == std::string::npos ? "" : line.substr(sp + 1);
+		if (key == "chain") { cur = PaintChain(); inChain = true; mine = rest == shape; }
+		else if (!inChain) continue;
+		else if (key == "end") { if (mine) out.push_back(cur); inChain = false; }
+		else if (key == "anchor") cur.anchor = rest;
+		else if (key == "links") cur.links = std::max(1, atoi(rest.c_str()));
+		else if (key == "stiffness") cur.stiffness = std::clamp((float)atof(rest.c_str()), 0.0f, 1.0f);
+		else if (key == "weight") cur.weight = std::clamp((float)atof(rest.c_str()), 0.0f, 1.0f);
+		else if (key == "path") { std::istringstream s(rest); int v; while (s >> v) cur.path.push_back(v); }
+		else if (key == "paint") {
+			std::istringstream s(rest);
+			std::string t;
+			while (s >> t) { size_t c = t.find(':'); if (c != std::string::npos) cur.paint.push_back({ atoi(t.c_str()), (float)atof(t.c_str() + c + 1) }); }
+		}
+	}
+	if (out.empty()) throw std::runtime_error("the paint file has no chains on " + shape);
+	return out;
+}
 
 // A bone the job adds: a node at its bind position (skin space), under its parent.
 struct NewBone {
@@ -165,6 +214,7 @@ struct JobResult {
 	std::vector<std::vector<std::string>> warp;       // chains of bone names, top first (anchor first)
 	std::vector<std::pair<std::string, std::string>> weft;
 	std::vector<std::string> topBones;                // bones whose vertices do not collide (anchors and the first link)
+	std::vector<int> warpPaint;                       // per warp chain: its PaintChain::global, or -1 (cloth, rope)
 };
 
 // The connected pieces of a mesh (vertices at the same position joined: UV seams split them).
@@ -432,7 +482,7 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 	SkinPartition sp;
 	sp.read(f.blocks[si.partition]);
 	size_t nv = gd.vertices.size();
-	printf("\n%s '%s': %zu verts, %zu tris, %zu bones, %zu partitions\n", job.kind == Job::Cloth ? "cloth" : "chains", job.shape.c_str(),
+	printf("\n%s '%s': %zu verts, %zu tris, %zu bones, %zu partitions\n", job.kind == Job::Cloth ? "cloth" : job.kind == Job::Painted ? "painted chains" : "chains", job.shape.c_str(),
 		nv, gd.triangles.size(), si.bones.size(), sp.parts.size());
 	for (auto b : si.bones) if (strName(f, b).rfind("SMP ", 0) == 0) throw std::runtime_error("shape already has SMP bones");
 
@@ -486,7 +536,7 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 	float zMax = -1e9f, zMin = 1e9f;
 	for (auto& p : pos) { zMax = std::max(zMax, p.z); zMin = std::min(zMin, p.z); }
 	std::vector<Weights> neww = orig;
-	std::string tag = job.kind == Job::Cloth ? "Cape" : "Rope";
+	std::string tag = job.kind == Job::Cloth ? "Cape" : job.kind == Job::Painted ? "Paint" : "Rope";
 	// Names stay unique across shapes of the outfit.
 	static int shapeIndex = 0;
 	char prefix[32];
@@ -625,6 +675,92 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 				(t >= 1 ? full : blended)++;
 			}
 			printf("  kept %s's own weights: %d vertices static, %d blended\n", k.bone.c_str(), full, blended);
+		}
+	}
+	else if (job.kind == Job::Painted) {
+		// Each painted chain: links laid along its stroke (from where the painting started, the end that is tied on, to
+		// where it stopped), evenly by length. A painted vertex goes onto the two links it lies between (by where it
+		// projects onto the stroke), blended with its own weights by its paint strength: a soft brush edge is a soft seam.
+		// Near the tie-on the links hand over to the vertex's own weights (link 0 is the anchor), as a rope's do.
+		// A vertex painted by several chains belongs to the one that painted it hardest.
+		std::vector<int> owner(nv, -1);
+		std::vector<float> strength(nv, 0.0f);
+		for (size_t c = 0; c < job.painted.size(); c++)
+			for (auto& [v, s] : job.painted[c].paint)
+				if (v >= 0 && v < (int)nv && s > strength[v]) { strength[v] = s; owner[v] = (int)c; }
+		for (size_t c = 0; c < job.painted.size(); c++) {
+			const PaintChain& pc = job.painted[c];
+			std::vector<Vec3> line;
+			for (int v : pc.path) if (v >= 0 && v < (int)nv && (line.empty() || length(pos[v] - line.back()) > 0.05f)) line.push_back(pos[v]);
+			if (line.size() < 2) throw std::runtime_error("painted chain " + std::to_string(c) + " on " + job.shape + ": its stroke is too short");
+			std::vector<float> at(line.size(), 0.0f);
+			for (size_t i = 1; i < line.size(); i++) at[i] = at[i - 1] + length(line[i] - line[i - 1]);
+			const float total = at.back();
+			auto pointAt = [&](float s) {
+				size_t i = 1;
+				while (i + 1 < line.size() && at[i] < s) i++;
+				float t = std::clamp((s - at[i - 1]) / std::max(at[i] - at[i - 1], 1e-6f), 0.0f, 1.0f);
+				return line[i - 1] + (line[i] - line[i - 1]) * t;
+			};
+			auto project = [&](Vec3 p) {   // the stroke length at the point of the stroke nearest p
+				float best = 1e30f, s = 0;
+				for (size_t i = 1; i < line.size(); i++) {
+					Vec3 d = line[i] - line[i - 1];
+					float dd = std::max(d.x * d.x + d.y * d.y + d.z * d.z, 1e-9f);
+					Vec3 q = p - line[i - 1];
+					float t = std::clamp((q.x * d.x + q.y * d.y + q.z * d.z) / dd, 0.0f, 1.0f);
+					Vec3 r = q - d * t;
+					float e = r.x * r.x + r.y * r.y + r.z * r.z;
+					if (e < best) { best = e; s = at[i - 1] + t * (at[i] - at[i - 1]); }
+				}
+				return s;
+			};
+			const int n = pc.links;
+			const float step = total / n;
+			std::vector<int> slots;
+			std::vector<std::string> names;
+			for (int k = 0; k <= n; k++) {
+				NewBone b;
+				char nm[64];
+				snprintf(nm, sizeof nm, "%s P%zu L%d", prefix, c, k);
+				b.name = nm;
+				b.parent = k == 0 ? pc.anchor : names.back();
+				char role[32];
+				snprintf(role, sizeof role, "paint%d", pc.global);
+				b.role = k == 0 ? "anchor" : role;
+				b.bind = pointAt(k * step);
+				slots.push_back(addBone(b));
+				names.push_back(nm);
+				// The anchor and the first link sit where the chain is tied on: they stay out of collisions.
+				if (k < 2) res.topBones.push_back(nm);
+			}
+			res.warp.push_back(names);
+			res.warpPaint.push_back(pc.global);
+			int moved = 0;
+			for (size_t v = 0; v < nv; v++) {
+				if (owner[v] != (int)c) continue;
+				float u = std::clamp(project(pos[v]) / std::max(step, 1e-6f), 0.0f, (float)n);
+				int k0 = std::min((int)u, n - 1);
+				float fk = u - k0, s = std::clamp(strength[v], 0.0f, 1.0f);
+				Weights out;
+				auto add = [&](int k, float w) {
+					if (w <= 0) return;
+					if (k == 0) { for (auto& i : orig[v]) out.push_back({ i.bone, i.w * w }); }
+					else out.push_back({ slots[k], w });
+				};
+				add(k0, (1 - fk) * s);
+				add(k0 + 1, fk * s);
+				for (auto& i : orig[v]) {
+					bool merged = false;
+					for (auto& m : out) if (m.bone == i.bone) { m.w += i.w * (1 - s); merged = true; }
+					if (!merged && 1 - s > 0) out.push_back({ i.bone, i.w * (1 - s) });
+				}
+				normalizeTop4(out);
+				neww[v] = out;
+				moved++;
+			}
+			printf("  painted chain %zu: hangs from %s, %d links of %.1f units, %d vertices (stiffness %.2f, weight %.2f)\n",
+				c, pc.anchor.c_str(), n, step, moved, pc.stiffness, pc.weight);
 		}
 	}
 	else {
@@ -792,6 +928,7 @@ int main(int argc, char** argv)
 	float clothFriction = 0.9f;            // --cloth-friction
 	float clothMass = 0.02f, clothRestitution = 0.2f;   // --cloth-mass, --cloth-restitution
 	float clothDamping[2] = { 0.6f, 0.8f };  // --cloth-damping linear angular
+	int paintCount = 0;                      // painted chains over every --painted shape
 	auto fmtNum = [](float v) { char b[32]; snprintf(b, sizeof b, "%g", v); return std::string(b); };
 	// The cloth links' angular limits (x, y swing; z twist), scaled by --bend and kept under 1.5 rad (the twist under
 	// 0.5: more lets the top row turn and the cloth slide sideways off the shoulder), and their springs back toward the
@@ -808,6 +945,14 @@ int main(int argc, char** argv)
 		auto need = [&](int n) { if (i + n >= argc) { printf("%s needs %d value(s)\n", a.c_str(), n); exit(1); } };
 		auto cur = [&]() -> Job& { if (jobs.empty()) { printf("%s before --cloth or --chains\n", a.c_str()); exit(1); } return jobs.back(); };
 		if (a == "--cloth" || a == "--chains") { need(1); Job j; j.kind = a == "--cloth" ? Job::Cloth : Job::Chains; j.shape = argv[++i]; jobs.push_back(j); }
+		else if (a == "--painted") {
+			need(2);
+			Job j; j.kind = Job::Painted; j.shape = argv[++i];
+			try { j.painted = readPaintFile(argv[++i], j.shape); }
+			catch (std::exception& e) { printf("error: %s\n", e.what()); return 2; }
+			for (auto& pc : j.painted) pc.global = paintCount++;
+			jobs.push_back(j);
+		}
 		else if (a == "--collide") { need(1); colliders.push_back(argv[++i]); }
 		else if (a == "--collide-skip") { need(1); collideSkip.push_back(argv[++i]); }
 		else if (a == "--proxy") { need(1); proxyCell = (float)atof(argv[++i]); }
@@ -844,7 +989,7 @@ int main(int argc, char** argv)
 	}
 	// Only --proxy and --collide: add the stand-ins to a NIF that already has its physics (its XML is left as it is).
 	const bool proxyOnly = jobs.empty() && proxyCell > 0 && !colliders.empty();
-	if (jobs.empty() && !proxyOnly) { printf("nothing to do: give --cloth and/or --chains (or --proxy with --collide)\n"); return 1; }
+	if (jobs.empty() && !proxyOnly) { printf("nothing to do: give --cloth, --chains and/or --painted (or --proxy with --collide)\n"); return 1; }
 	const std::string physicsPath = argv[3], xmlOut = argv[4];
 	try {
 		File f;
@@ -959,6 +1104,27 @@ int main(int argc, char** argv)
 		line("\t\t<restitution>0.3</restitution>");
 		line("\t\t<wind-factor>0</wind-factor>");
 		line("\t</bone-default>");
+		// Painted chains (the NV SMP Maker): each its own bone template and link template, from its stiffness and weight
+		// (0..1). Stiffness narrows the swing (1.2 rad floppy .. 0.2 stiff, twist 0.3 .. 0.05) and strengthens the
+		// springs back to the modelled shape (0.3 .. 12, squared: most of the range stays soft); weight is the links'
+		// mass (0.02 .. 0.12) and damping (light and lively .. heavy and calm), and how much the wind moves them. At
+		// 0.4 / 0.4 the links sit between smpdress's rope (free) and cloth (held) templates.
+		struct PaintFeel { float stiffness, weight; };
+		std::map<int, PaintFeel> paintFeel;
+		for (auto& j : jobs) for (auto& pc : j.painted) paintFeel[pc.global] = { pc.stiffness, pc.weight };
+		if (!paintFeel.empty()) line("\t<!-- Painted chains (NV SMP Maker): each with its own feel, from its stiffness and weight. -->");
+		for (auto& [g, feel] : paintFeel) {
+			const float w = feel.weight;
+			line("\t<bone-default name=\"paint" + std::to_string(g) + "\">");
+			line("\t\t<mass>" + fmtNum(0.02f + 0.1f * w) + "</mass>");
+			line("\t\t<inertia x=\"1\" y=\"1\" z=\"1\"/>");
+			line("\t\t<linearDamping>" + fmtNum(0.4f + 0.55f * w) + "</linearDamping>");
+			line("\t\t<angularDamping>" + fmtNum(0.6f + 0.37f * w) + "</angularDamping>");
+			line("\t\t<friction>0.5</friction>");
+			line("\t\t<restitution>0.2</restitution>");
+			line("\t\t<wind-factor>" + fmtNum(1.0f - 0.7f * w) + "</wind-factor>");
+			line("\t</bone-default>");
+		}
 		for (auto& r : results) for (auto& b : r.bones) {
 			if (!b.hasBox) { line("\t<bone name=\"" + xmlEscape(b.name) + "\" template=\"" + b.role + "\"/>"); continue; }
 			// The body centred on its rigid pieces (their weight where they are), with a box the size of their body:
@@ -1022,14 +1188,31 @@ int main(int argc, char** argv)
 		line("\t\t<angularStiffness x=\"0.6\" y=\"0.6\" z=\"0.6\"/>");
 		line("\t\t<angularDamping x=\"0.08\" y=\"0.08\" z=\"0.08\"/>");
 		line("\t</generic-constraint-default>");
+		for (auto& [g, feel] : paintFeel) {
+			const float s = feel.stiffness;
+			line("\t<generic-constraint-default name=\"paintLink" + std::to_string(g) + "\">");
+			line("\t\t<frameInB/>");
+			line("\t\t<linearLowerLimit x=\"0\" y=\"0\" z=\"0\"/>");
+			line("\t\t<linearUpperLimit x=\"0\" y=\"0\" z=\"0\"/>");
+			const std::string sw = fmtNum(1.2f - 1.0f * s), tw = fmtNum(0.3f - 0.25f * s);
+			line("\t\t<angularLowerLimit x=\"-" + sw + "\" y=\"-" + sw + "\" z=\"-" + tw + "\"/>");
+			line("\t\t<angularUpperLimit x=\"" + sw + "\" y=\"" + sw + "\" z=\"" + tw + "\"/>");
+			const std::string k = fmtNum(0.3f + 12.0f * s * s);
+			line("\t\t<angularStiffness x=\"" + k + "\" y=\"" + k + "\" z=\"" + k + "\"/>");
+			const std::string d = fmtNum(0.05f + 0.25f * s);
+			line("\t\t<angularDamping x=\"" + d + "\" y=\"" + d + "\" z=\"" + d + "\"/>");
+			line("\t</generic-constraint-default>");
+		}
 		for (size_t ri = 0; ri < results.size(); ri++) {
 			const JobResult& r = results[ri];
 			bool cloth = jobs[ri].kind == Job::Cloth;
-			for (auto& chain : r.warp) {
+			for (size_t ci = 0; ci < r.warp.size(); ci++) {
+				auto& chain = r.warp[ci];
+				int paint = ci < r.warpPaint.size() ? r.warpPaint[ci] : -1;
 				line("\t<constraint-group>");
 				for (size_t k = 1; k < chain.size(); k++)
 					line("\t\t<generic-constraint bodyA=\"" + xmlEscape(chain[k]) + "\" bodyB=\"" + xmlEscape(chain[k - 1]) + "\" template=\"" +
-						(cloth ? (k == 1 ? "warpTop" : "warp") : "link") + "\"/>");
+						(paint >= 0 ? "paintLink" + std::to_string(paint) : cloth ? (k == 1 ? "warpTop" : "warp") : "link") + "\"/>");
 				line("\t</constraint-group>");
 			}
 			if (weft && !r.weft.empty()) {

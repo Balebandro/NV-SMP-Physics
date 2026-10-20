@@ -1,0 +1,1128 @@
+#pragma once
+// The previewer's "Make SMP" window: smpdress, smpify and smprepair with a form instead of a command line. It reads the
+// shapes and bones of the NIF open in the previewer, runs the tool (beside the previewer's exe, no console window) and
+// opens what it made. Included by previewer.cpp after its helpers (Help, PickFile, PickFolder, LoadItem, AddLog, gItem).
+//
+// The output goes into a mod folder laid out as Data: <output folder>\<physics file's folder>\<the NIF's file name> and
+// <output folder>\<physics file>, so the folder can be an MO2 mod. Files it would replace are kept as *.bak. Each build
+// writes its settings as a recipe (<xml>.smprecipe) beside the XML; "Load recipe..." brings them back.
+#include <atomic>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <thread>
+
+#include "backup.h"
+
+namespace maker
+{
+	enum Mode { Outfit, Coat, Repair };
+	enum Role { None, Cloth, Chains, Collider, VirtualLegs };   // Cloth is smpify's coat in Coat mode
+	static const char* kOutfitRoles[] = { "Leave as is", "Cloth", "Chains", "Collider" };
+	static const char* kCoatRoles[] = { "Leave as is", "Coat or skirt", "-", "Collider", "Virtual legs" };
+
+	static std::string Lower(std::string s) { for (auto& c : s) c = (char)tolower((unsigned char)c); return s; }
+	static std::string Num(float v) { char b[32]; snprintf(b, sizeof b, "%g", v); return b; }
+	static void Copy(char* dst, size_t n, const std::string& s) { strncpy_s(dst, n, s.c_str(), _TRUNCATE); }
+	static std::string ToolDir() { char exe[MAX_PATH]; GetModuleFileNameA(nullptr, exe, MAX_PATH); return fs::path(exe).parent_path().string(); }
+	static std::string ToolPath(const char* name) { return (fs::path(ToolDir()) / name).string(); }
+
+	struct KeepRow { std::string bone; float w0 = 0.05f, w1 = 0.2f; };
+
+	struct ShapeRow
+	{
+		std::string name;
+		int verts = 0;
+		float zMin = 0, zMax = 0;
+		std::vector<std::string> skinBones;
+		int role = None;
+		// --cloth
+		std::string anchor = "Bip01 Pelvis";
+		int cols = 9, rows = 5;
+		bool autoTop = true;
+		float top = 0;
+		bool autoAngles = true;
+		float angleLo = -140, angleHi = 140;
+		bool radial = false;
+		float collar = 10;
+		int fixedRows = 1;
+		std::vector<std::pair<std::string, std::string>> detach;
+		std::vector<KeepRow> keep;
+		// --chains
+		int links = 4;
+		bool keepTop = false;
+		float keepTopA = 1, keepTopB = 2;
+	};
+
+	// A chain painted with the brush: on one shape, its stroke (vertex indices from where it is tied on) and the painted
+	// vertices with their strength; built by smpdress --painted.
+	struct PaintChain
+	{
+		std::string shape;
+		std::vector<int> path;
+		std::map<int, float> paint;
+		std::string anchor;
+		int links = 4;
+		float stiffness = 0.4f, weight = 0.4f;
+	};
+
+	struct State
+	{
+		bool open = false;
+		// painting
+		bool paintTab = true, paintOn = true;
+		int tool = 0;                       // 0 new chain, 1 add to the selected one, 2 erase from it
+		float radius = 6, strength = 1;
+		std::vector<PaintChain> chains;
+		int selected = -1;
+		bool stroking = false;
+		bool hit = false;
+		V3 hitPoint, hitNormal;
+		int hitShape = -1;
+		int mode = Outfit;
+		std::string source;                 // the NIF the shapes were read from
+		bool sourceHasPhysics = false;
+		std::vector<ShapeRow> shapes;
+		std::vector<std::string> skeleton;  // anchors to pick from
+		char physics[512] = "";
+		char outDir[512] = "";
+		// collision
+		bool proxy = true;
+		float proxyCell = 3;
+		std::set<std::string> collideSkip;
+		float clothMargin = 1, bodyMargin = 0.5f, penetration = 3;
+		// cloth feel
+		float bend = 1, stiffness = 1, friction = 0.9f, mass = 0.02f, restitution = 0.2f, dampL = 0.6f, dampA = 0.8f;
+		bool weft = true;
+		// smpify
+		int coatCols = 11, coatRows = 5;
+		float coatTop = 66, coatAngle = 140;
+		// smprepair
+		char edited[512] = "", reference[512] = "", repaired[512] = "";
+		char listNif[512] = "", listSkeleton[512] = "";   // the missing SMP Bones list (smprepair --list)
+		// the tool running
+		std::thread worker;
+		std::mutex lock;
+		std::vector<std::string> pending;
+		std::atomic<bool> running{ false }, finished{ false };
+		int exitCode = 0;
+		std::string resultNif, recipeToSave, lastCommand, lastResult;
+		bool buildOnOpen = false;           // --maker-build (testing): build once the window has a source
+	};
+	static State gM;
+
+	static const D3DCOLOR kChainColors[] = { D3DCOLOR_ARGB(255, 255, 120, 40), D3DCOLOR_ARGB(255, 60, 200, 255), D3DCOLOR_ARGB(255, 120, 230, 90),
+		D3DCOLOR_ARGB(255, 240, 80, 200), D3DCOLOR_ARGB(255, 250, 220, 60), D3DCOLOR_ARGB(255, 150, 120, 255), D3DCOLOR_ARGB(255, 80, 240, 200), D3DCOLOR_ARGB(255, 255, 80, 80) };
+	static D3DCOLOR ChainColor(size_t i) { return kChainColors[i % IM_ARRAYSIZE(kChainColors)]; }
+
+	// The paint file smpdress --painted reads (one for every shape; each chain names its shape).
+	static std::string PaintText()
+	{
+		std::ostringstream o;
+		o << "; NV SMP Maker painted chains (smpdress --painted)\n";
+		for (auto& c : gM.chains) {
+			o << "chain " << c.shape << "\nanchor " << c.anchor << "\nlinks " << c.links << "\nstiffness " << Num(c.stiffness) << "\nweight " << Num(c.weight) << "\npath";
+			for (int v : c.path) o << " " << v;
+			o << "\npaint";
+			for (auto& [v, s] : c.paint) o << " " << v << ":" << Num(s);
+			o << "\nend\n";
+		}
+		return o.str();
+	}
+
+	static void ReadPaint(const std::string& path)
+	{
+		gM.chains.clear();
+		gM.selected = -1;
+		std::ifstream in(path);
+		std::string line;
+		PaintChain cur;
+		bool inChain = false;
+		while (std::getline(in, line)) {
+			if (!line.empty() && line.back() == '\r') line.pop_back();
+			size_t sp = line.find(' ');
+			std::string key = line.substr(0, sp), rest = sp == std::string::npos ? "" : line.substr(sp + 1);
+			if (key == "chain") { cur = PaintChain(); cur.shape = rest; inChain = true; }
+			else if (!inChain) continue;
+			else if (key == "end") { gM.chains.push_back(cur); inChain = false; }
+			else if (key == "anchor") cur.anchor = rest;
+			else if (key == "links") cur.links = atoi(rest.c_str());
+			else if (key == "stiffness") cur.stiffness = (float)atof(rest.c_str());
+			else if (key == "weight") cur.weight = (float)atof(rest.c_str());
+			else if (key == "path") { std::istringstream s(rest); int v; while (s >> v) cur.path.push_back(v); }
+			else if (key == "paint") { std::istringstream s(rest); std::string t; while (s >> t) { size_t c = t.find(':'); if (c != std::string::npos) cur.paint[atoi(t.c_str())] = (float)atof(t.c_str() + c + 1); } }
+		}
+		if (!gM.chains.empty()) gM.selected = 0;
+	}
+
+
+	// The physics file's path relative to Data, from where the NIF sits ("...\Meshes\armor\x\coat.nif" ->
+	// "Meshes\armor\x\coat_smp.xml"); a NIF outside a Meshes folder gets "Meshes\<name>_smp.xml".
+	static std::string DefaultPhysicsPath(const std::string& nif)
+	{
+		fs::path p(nif);
+		std::string xml = p.stem().string() + "_smp.xml";
+		std::vector<std::string> parts;
+		for (auto& c : p.parent_path()) parts.push_back(c.string());
+		for (int i = (int)parts.size() - 1; i >= 0; i--) {
+			if (Lower(parts[i]) != "meshes") continue;
+			std::string r = "Meshes";
+			for (size_t j = i + 1; j < parts.size(); j++) r += "\\" + parts[j];
+			return r + "\\" + xml;
+		}
+		return "Meshes\\" + xml;
+	}
+
+	// Where the build writes: the NIF beside the physics file, both under the output folder as under Data.
+	static std::string OutXml() { return (fs::path(gM.outDir) / gM.physics).string(); }
+	static std::string OutNif() { return (fs::path(OutXml()).parent_path() / fs::path(gM.source).filename()).string(); }
+
+	// The shapes and bones of the NIF open in the previewer.
+	static void Capture()
+	{
+		std::vector<ShapeRow> old = std::move(gM.shapes);
+		gM.shapes.clear();
+		if (gItem.nifPath != gM.source) { gM.chains.clear(); gM.selected = -1; }
+		gM.source = gItem.nifPath;
+		gM.sourceHasPhysics = !gItem.scene.physicsFile.empty();
+		for (auto& s : gItem.shapes) {
+			auto* g = s.info.geometry;
+			ShapeRow r;
+			r.name = g->m_name ? g->m_name : "";
+			if (r.name.empty() || Lower(r.name).rfind("smp proxy:", 0) == 0) continue;
+			auto* d = g->data;
+			r.verts = d ? d->vertexCount : 0;
+			r.zMin = 1e9f; r.zMax = -1e9f;
+			for (int v = 0; d && d->vertices && v < d->vertexCount; v++) { r.zMin = std::min(r.zMin, d->vertices[v].z); r.zMax = std::max(r.zMax, d->vertices[v].z); }
+			if (r.zMin > r.zMax) r.zMin = r.zMax = 0;
+			r.top = r.zMin + (r.zMax - r.zMin) * 0.8f;
+			std::set<std::string> bones;
+			if (auto* skin = g->skinInstance)
+				for (uint32_t b = 0; b < skin->boneCount; b++) if (const char* n = SkinBoneName(s, (int)b)) bones.insert(n);
+			r.skinBones.assign(bones.begin(), bones.end());
+			for (auto& o : old) if (o.name == r.name) { auto keepBones = r.skinBones; auto v = r.verts; auto z0 = r.zMin, z1 = r.zMax; r = o; r.skinBones = keepBones; r.verts = v; r.zMin = z0; r.zMax = z1; }
+			gM.shapes.push_back(r);
+		}
+		gM.skeleton.clear();
+		for (auto& [name, node] : gItem.scene.skeleton.bones) gM.skeleton.push_back(name);
+		if (!gM.physics[0] || old.empty()) Copy(gM.physics, sizeof gM.physics, DefaultPhysicsPath(gM.source));
+		if (!gM.outDir[0] || old.empty()) Copy(gM.outDir, sizeof gM.outDir, (fs::path(gM.source).parent_path() / "SMP output").string());
+	}
+
+	// --- recipes -------------------------------------------------------------------------------------------------
+
+	static std::string RecipeText()
+	{
+		std::ostringstream o;
+		o << "; NV SMP Previewer recipe: the Make SMP window's settings. Load it there with \"Load recipe...\".\n[recipe]\n";
+		o << "mode=" << gM.mode << "\nsource=" << gM.source << "\nphysics=" << gM.physics << "\noutdir=" << gM.outDir << "\n";
+		o << "proxy=" << gM.proxy << "\nproxycell=" << Num(gM.proxyCell) << "\n";
+		for (auto& b : gM.collideSkip) o << "collideskip=" << b << "\n";
+		o << "clothmargin=" << Num(gM.clothMargin) << "\nbodymargin=" << Num(gM.bodyMargin) << "\npenetration=" << Num(gM.penetration) << "\n";
+		o << "bend=" << Num(gM.bend) << "\nstiffness=" << Num(gM.stiffness) << "\nweft=" << gM.weft << "\nfriction=" << Num(gM.friction) << "\n";
+		o << "mass=" << Num(gM.mass) << "\nrestitution=" << Num(gM.restitution) << "\ndamping=" << Num(gM.dampL) << " " << Num(gM.dampA) << "\n";
+		o << "coatgrid=" << gM.coatCols << " " << gM.coatRows << "\ncoattop=" << Num(gM.coatTop) << "\ncoatangle=" << Num(gM.coatAngle) << "\n";
+		if (!gM.chains.empty()) o << "paint=" << OutXml() << ".smppaint\n";
+		for (auto& s : gM.shapes) {
+			if (s.role == None) continue;
+			o << "\n[shape]\nname=" << s.name << "\nrole=" << s.role << "\nanchor=" << s.anchor << "\ngrid=" << s.cols << " " << s.rows << "\n";
+			o << "top=" << (s.autoTop ? "auto" : Num(s.top)) << "\nangles=" << (s.autoAngles ? "auto" : Num(s.angleLo) + " " + Num(s.angleHi)) << "\n";
+			o << "radial=" << s.radial << "\ncollar=" << Num(s.collar) << "\nfixedrows=" << s.fixedRows << "\n";
+			for (auto& [b, t] : s.detach) o << "detach=" << b << "=" << t << "\n";
+			for (auto& k : s.keep) o << "keep=" << k.bone << "|" << Num(k.w0) << "|" << Num(k.w1) << "\n";
+			o << "links=" << s.links << "\nkeeptop=" << (s.keepTop ? Num(s.keepTopA) + " " + Num(s.keepTopB) : std::string("off")) << "\n";
+		}
+		return o.str();
+	}
+
+	// Loads a recipe: opens its source NIF in the previewer and puts the settings back on the shapes of the same names.
+	static bool LoadRecipe(const std::string& path)
+	{
+		std::ifstream in(path);
+		if (!in) { AddLog(4, "cannot read the recipe " + path); return false; }
+		std::vector<std::pair<std::string, std::string>> top;
+		std::vector<std::vector<std::pair<std::string, std::string>>> shapes;
+		std::string line;
+		bool inShape = false;
+		while (std::getline(in, line)) {
+			if (!line.empty() && line.back() == '\r') line.pop_back();
+			if (line.empty() || line[0] == ';') continue;
+			if (line == "[shape]") { shapes.emplace_back(); inShape = true; continue; }
+			if (line[0] == '[') continue;
+			size_t eq = line.find('=');
+			if (eq == std::string::npos) continue;
+			auto kv = std::make_pair(line.substr(0, eq), line.substr(eq + 1));
+			(inShape ? shapes.back() : top).push_back(kv);
+		}
+		std::string source;
+		for (auto& [k, v] : top) if (k == "source") source = v;
+		if (source.empty() || !fs::exists(source)) { AddLog(4, "the recipe's source NIF is missing: " + source); return false; }
+		LoadItem(source);
+		gM.shapes.clear();
+		gM.physics[0] = gM.outDir[0] = 0;
+		Capture();
+		gM.collideSkip.clear();
+		for (auto& [k, v] : top) {
+			float a = 0, b = 0;
+			if (k == "mode") gM.mode = atoi(v.c_str());
+			else if (k == "physics") Copy(gM.physics, sizeof gM.physics, v);
+			else if (k == "outdir") Copy(gM.outDir, sizeof gM.outDir, v);
+			else if (k == "proxy") gM.proxy = v == "1";
+			else if (k == "proxycell") gM.proxyCell = (float)atof(v.c_str());
+			else if (k == "collideskip") gM.collideSkip.insert(v);
+			else if (k == "clothmargin") gM.clothMargin = (float)atof(v.c_str());
+			else if (k == "bodymargin") gM.bodyMargin = (float)atof(v.c_str());
+			else if (k == "penetration") gM.penetration = (float)atof(v.c_str());
+			else if (k == "bend") gM.bend = (float)atof(v.c_str());
+			else if (k == "stiffness") gM.stiffness = (float)atof(v.c_str());
+			else if (k == "weft") gM.weft = v == "1";
+			else if (k == "friction") gM.friction = (float)atof(v.c_str());
+			else if (k == "mass") gM.mass = (float)atof(v.c_str());
+			else if (k == "restitution") gM.restitution = (float)atof(v.c_str());
+			else if (k == "damping" && sscanf_s(v.c_str(), "%f %f", &a, &b) == 2) { gM.dampL = a; gM.dampA = b; }
+			else if (k == "coatgrid") sscanf_s(v.c_str(), "%d %d", &gM.coatCols, &gM.coatRows);
+			else if (k == "coattop") gM.coatTop = (float)atof(v.c_str());
+			else if (k == "coatangle") gM.coatAngle = (float)atof(v.c_str());
+		}
+		gM.chains.clear();
+		gM.selected = -1;
+		for (auto& [k, v] : top) if (k == "paint") ReadPaint(v);
+		for (auto& kvs : shapes) {
+			std::string name;
+			for (auto& [k, v] : kvs) if (k == "name") name = v;
+			ShapeRow* r = nullptr;
+			for (auto& s : gM.shapes) if (s.name == name) r = &s;
+			if (!r) { AddLog(3, "recipe: the NIF has no shape " + name); continue; }
+			r->detach.clear(); r->keep.clear();
+			for (auto& [k, v] : kvs) {
+				float a = 0, b = 0;
+				if (k == "role") r->role = atoi(v.c_str());
+				else if (k == "anchor") r->anchor = v;
+				else if (k == "grid") sscanf_s(v.c_str(), "%d %d", &r->cols, &r->rows);
+				else if (k == "top") { r->autoTop = v == "auto"; if (!r->autoTop) r->top = (float)atof(v.c_str()); }
+				else if (k == "angles") { r->autoAngles = v == "auto"; if (!r->autoAngles && sscanf_s(v.c_str(), "%f %f", &a, &b) == 2) { r->angleLo = a; r->angleHi = b; } }
+				else if (k == "radial") r->radial = v == "1";
+				else if (k == "collar") r->collar = (float)atof(v.c_str());
+				else if (k == "fixedrows") r->fixedRows = atoi(v.c_str());
+				else if (k == "detach") { size_t e = v.find('='); if (e != std::string::npos) r->detach.push_back({ v.substr(0, e), v.substr(e + 1) }); }
+				else if (k == "keep") { size_t p1 = v.find('|'), p2 = v.rfind('|'); if (p1 != std::string::npos && p2 > p1) r->keep.push_back({ v.substr(0, p1), (float)atof(v.substr(p1 + 1).c_str()), (float)atof(v.substr(p2 + 1).c_str()) }); }
+				else if (k == "links") r->links = atoi(v.c_str());
+				else if (k == "keeptop") { r->keepTop = v != "off"; if (r->keepTop && sscanf_s(v.c_str(), "%f %f", &a, &b) == 2) { r->keepTopA = a; r->keepTopB = b; } }
+			}
+		}
+		AddLog(2, "recipe loaded: " + path);
+		return true;
+	}
+
+	// --- running a tool --------------------------------------------------------------------------------------------
+
+	// One command-line argument, quoted as the C runtime reads it back (backslashes before a quote doubled).
+	static std::string Quote(const std::string& a)
+	{
+		std::string o = "\"";
+		size_t slashes = 0;
+		for (char c : a) {
+			if (c == '\\') { slashes++; continue; }
+			if (c == '"') o.append(slashes * 2 + 1, '\\');
+			else o.append(slashes, '\\');
+			slashes = 0;
+			o += c;
+		}
+		o.append(slashes * 2, '\\');
+		return o + "\"";
+	}
+
+	// A file about to be replaced is kept as <file>.bak (the previous .bak goes).
+	static void Backup(const std::string& path)
+	{
+		std::string err;
+		std::string kept = backup::keep(path, &err);
+		if (!err.empty()) AddLog(3, "could not back up " + path + ": " + err);
+		else if (!kept.empty()) AddLog(2, "kept the previous " + fs::path(path).filename().string() + " as " + fs::path(kept).filename().string());
+	}
+
+	static void Run(const char* tool, const std::vector<std::string>& args, const std::string& resultNif, const std::string& recipePath)
+	{
+		std::string exe = ToolPath(tool);
+		if (!fs::exists(exe)) { AddLog(4, std::string(tool) + " not found beside the previewer: " + exe); return; }
+		std::string cmd = Quote(exe);
+		for (auto& a : args) cmd += " " + Quote(a);
+		gM.lastCommand = cmd;
+		gM.resultNif = resultNif;
+		gM.recipeToSave = recipePath;
+		gM.running = true;
+		gM.finished = false;
+		gM.lastResult.clear();
+		AddLog(2, std::string("running ") + tool);
+		gM.worker = std::thread([cmd]() {
+			int code = -1;
+			SECURITY_ATTRIBUTES sa{ sizeof sa, nullptr, TRUE };
+			HANDLE rd = nullptr, wr = nullptr;
+			if (CreatePipe(&rd, &wr, &sa, 0)) {
+				SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+				STARTUPINFOA si{ sizeof si };
+				si.dwFlags = STARTF_USESTDHANDLES;
+				si.hStdOutput = si.hStdError = wr;
+				PROCESS_INFORMATION pi{};
+				std::vector<char> line(cmd.begin(), cmd.end());
+				line.push_back(0);
+				std::string dir = ToolDir();
+				BOOL ok = CreateProcessA(nullptr, line.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi);
+				CloseHandle(wr);
+				if (ok) {
+					std::string text;
+					char buf[4096];
+					DWORD n = 0;
+					auto flush = [&](bool all) {
+						size_t nl;
+						while ((nl = text.find('\n')) != std::string::npos || (all && !text.empty())) {
+							std::string l = nl == std::string::npos ? text : text.substr(0, nl);
+							text.erase(0, nl == std::string::npos ? text.size() : nl + 1);
+							if (!l.empty() && l.back() == '\r') l.pop_back();
+							if (l.empty()) continue;
+							std::lock_guard<std::mutex> g(gM.lock);
+							gM.pending.push_back(l);
+						}
+					};
+					while (ReadFile(rd, buf, sizeof buf, &n, nullptr) && n) { text.append(buf, n); flush(false); }
+					flush(true);
+					WaitForSingleObject(pi.hProcess, INFINITE);
+					DWORD c = 0;
+					GetExitCodeProcess(pi.hProcess, &c);
+					code = (int)c;
+					CloseHandle(pi.hProcess);
+					CloseHandle(pi.hThread);
+				} else {
+					std::lock_guard<std::mutex> g(gM.lock);
+					gM.pending.push_back("error: could not start the tool (error " + std::to_string(GetLastError()) + ")");
+				}
+				CloseHandle(rd);
+			}
+			gM.exitCode = code;
+			gM.finished = true;
+		});
+	}
+
+	// Each frame: the tool's output into the log; when it is done, the result opened.
+	static void Pump()
+	{
+		{
+			std::lock_guard<std::mutex> g(gM.lock);
+			for (auto& l : gM.pending) AddLog(l.rfind("error", 0) == 0 ? 4 : 2, "  " + l);
+			if (!gM.pending.empty()) gLogScroll = true;
+			gM.pending.clear();
+		}
+		if (!gM.finished || !gM.worker.joinable()) return;
+		gM.worker.join();
+		gM.running = false;
+		gM.finished = false;
+		if (gM.exitCode != 0) {
+			gM.lastResult = "failed (see the log)";
+			AddLog(4, "the build failed: nothing was opened");
+			return;
+		}
+		if (!gM.recipeToSave.empty()) {
+			std::ofstream(gM.recipeToSave) << RecipeText();
+			AddLog(2, "recipe saved: " + gM.recipeToSave);
+		}
+		gM.lastResult = "done: " + gM.resultNif;
+		LoadItem(gM.resultNif);
+	}
+
+	static void BuildOutfit()
+	{
+		std::string nif = OutNif(), xml = OutXml();
+		if (Lower(fs::path(nif).lexically_normal().string()) == Lower(fs::path(gM.source).lexically_normal().string())) { AddLog(4, "the output would replace the source NIF: pick another output folder"); return; }
+		std::vector<std::string> a = { gM.source, nif, gM.physics, xml };
+		std::vector<std::string> colliders;
+		bool jobs = false;
+		if (gM.mode == Coat) {
+			const ShapeRow* coat = nullptr;
+			std::string legs;
+			for (auto& s : gM.shapes) {
+				if (s.role == Cloth && !coat) coat = &s;
+				else if (s.role == Collider) colliders.push_back(s.name);
+				else if (s.role == VirtualLegs && legs.empty()) legs = s.name;
+			}
+			if (!coat) { AddLog(4, "pick the coat or skirt shape (role Coat)"); return; }
+			a = { gM.source, nif, coat->name, gM.physics, xml };
+			for (auto& c : colliders) { a.push_back("--collide"); a.push_back(c); }
+			if (!legs.empty()) { a.push_back("--virtual-legs"); a.push_back(legs); }
+			a.insert(a.end(), { "--grid", std::to_string(gM.coatCols), std::to_string(gM.coatRows), "--top", Num(gM.coatTop), "--angle", Num(gM.coatAngle) });
+		} else {
+			// Painted chains: one --painted per shape, all reading the one paint file beside the XML.
+			std::set<std::string> paintedShapes;
+			for (auto& c : gM.chains) if (!c.paint.empty() && c.path.size() >= 2) paintedShapes.insert(c.shape);
+			for (auto& s : gM.shapes)
+				if (paintedShapes.count(s.name) && (s.role == Cloth || s.role == Chains || s.role == Collider)) {
+					AddLog(4, s.name + " has painted chains and the role " + kOutfitRoles[s.role] + ": a shape is one or the other (set it to Leave as is, or delete its chains)");
+					return;
+				}
+			if (!paintedShapes.empty()) {
+				std::string paintFile = xml + ".smppaint";
+				std::error_code ec;
+				fs::create_directories(fs::path(paintFile).parent_path(), ec);
+				std::ofstream(paintFile) << PaintText();
+				for (auto& s : paintedShapes) a.insert(a.end(), { "--painted", s, paintFile });
+				jobs = true;
+			}
+			for (auto& s : gM.shapes) {
+				if (s.role == Collider) colliders.push_back(s.name);
+				if (s.role != Cloth && s.role != Chains) continue;
+				jobs = true;
+				if (s.role == Cloth) {
+					a.insert(a.end(), { "--cloth", s.name, "--anchor", s.anchor, "--grid", std::to_string(s.cols), std::to_string(s.rows) });
+					if (s.radial) a.insert(a.end(), { "--radial", "--collar", Num(s.collar) });
+					else if (!s.autoTop) a.insert(a.end(), { "--top", Num(s.top) });
+					if (!s.autoAngles) a.insert(a.end(), { "--angles", Num(s.angleLo), Num(s.angleHi) });
+					a.insert(a.end(), { "--fixed-rows", std::to_string(s.fixedRows) });
+					for (auto& [b, t] : s.detach) if (!b.empty() && !t.empty()) a.insert(a.end(), { "--detach", b + "=" + t });
+					for (auto& k : s.keep) if (!k.bone.empty()) a.insert(a.end(), { "--keep", k.bone, Num(k.w0), Num(k.w1) });
+				} else {
+					a.insert(a.end(), { "--chains", s.name, "--anchor", s.anchor, "--links", std::to_string(s.links) });
+					if (s.keepTop) a.insert(a.end(), { "--keep-top", Num(s.keepTopA), Num(s.keepTopB) });
+				}
+			}
+			for (auto& c : colliders) { a.push_back("--collide"); a.push_back(c); }
+			for (auto& b : gM.collideSkip) { a.push_back("--collide-skip"); a.push_back(b); }
+			if (gM.proxy && !colliders.empty()) { a.push_back("--proxy"); a.push_back(Num(gM.proxyCell)); }
+			if (!jobs && !(gM.proxy && !colliders.empty())) { AddLog(4, "nothing to do: paint a chain, or give a shape the role Cloth or Chains (or colliders with proxies on)"); return; }
+			if (jobs) {
+				a.insert(a.end(), { "--cloth-margin", Num(gM.clothMargin), "--body-margin", Num(gM.bodyMargin), "--penetration", Num(gM.penetration),
+					"--bend", Num(gM.bend), "--stiffness", Num(gM.stiffness), "--cloth-friction", Num(gM.friction), "--cloth-mass", Num(gM.mass),
+					"--cloth-restitution", Num(gM.restitution), "--cloth-damping", Num(gM.dampL), Num(gM.dampA) });
+				if (!gM.weft) a.push_back("--no-weft");
+			}
+		}
+		std::error_code ec;
+		fs::create_directories(fs::path(nif).parent_path(), ec);
+		fs::create_directories(fs::path(xml).parent_path(), ec);
+		Backup(nif);
+		if (gM.mode == Coat || jobs) Backup(xml);
+		Run(gM.mode == Coat ? "smpify.exe" : "smpdress.exe", a, nif, (gM.mode == Coat || jobs) ? xml + ".smprecipe" : std::string());
+	}
+
+	// Writes the missing "SMP Bones" lists into the NIF (smprepair --list, the game's skeleton deciding which bones are
+	// the item's own), keeping the old file (backup.h), and opens the result.
+	static void AddBoneLists(const std::string& nif, const std::string& skeleton)
+	{
+		if (nif.empty() || skeleton.empty()) { AddLog(4, "the NIF and the game's skeleton.nif are both needed"); return; }
+		Backup(nif);
+		Run("smprepair.exe", { "--list", nif, skeleton, nif }, nif, {});
+	}
+
+	static void BuildRepair()
+	{
+		if (!gM.edited[0] || !gM.reference[0] || !gM.repaired[0]) { AddLog(4, "pick the edited NIF, the one before the edit, and where the repaired one goes"); return; }
+		Backup(gM.repaired);
+		Run("smprepair.exe", { gM.edited, gM.reference, gM.repaired }, gM.repaired, {});
+	}
+
+	static bool BoneCombo(const char* label, std::string& bone, const std::vector<std::string>& bones);
+	static void OutputRows();
+	static void BuildButtons(bool repair);
+
+	// --- painting -------------------------------------------------------------------------------------------------
+
+	// The source is in the view and the paint tab is up: the body holds still and the left mouse paints.
+	static bool Painting() { return gM.open && gM.paintTab && gM.paintOn && gItem.loaded && !gM.source.empty() && gItem.nifPath == gM.source; }
+
+	static int ShapeIndex(const std::string& name)
+	{
+		for (size_t i = 0; i < gItem.shapes.size(); i++) {
+			auto* g = gItem.shapes[i].info.geometry;
+			if (g->m_name && name == g->m_name) return (int)i;
+		}
+		return -1;
+	}
+
+	static V3 VertexAt(const ShapeDraw& s, int v) { auto& m = s.verts[v]; return V3(m.px, m.py, m.pz); }
+
+	// The nearest triangle under the ray, over the visible shapes (or only shape `only`): its shape and the point.
+	static bool Raycast(V3 o, V3 d, int only, int& shape, V3& point, V3& normal, int& nearVertex)
+	{
+		float best = 1e30f;
+		shape = -1;
+		for (size_t si = 0; si < gItem.shapes.size(); si++) {
+			auto& s = gItem.shapes[si];
+			if (!s.visible || s.indices.empty() || (only >= 0 && (int)si != only)) continue;
+			for (size_t t = 0; t + 2 < s.indices.size(); t += 3) {
+				V3 a = VertexAt(s, s.indices[t]), b = VertexAt(s, s.indices[t + 1]), c = VertexAt(s, s.indices[t + 2]);
+				V3 e1 = b - a, e2 = c - a, p = Cross(d, e2);
+				float det = Dot(e1, p);
+				if (std::fabs(det) < 1e-9f) continue;
+				float inv = 1.0f / det;
+				V3 q = o - a;
+				float u = Dot(q, p) * inv;
+				if (u < 0 || u > 1) continue;
+				V3 r = Cross(q, e1);
+				float w = Dot(d, r) * inv;
+				if (w < 0 || u + w > 1) continue;
+				float dist = Dot(e2, r) * inv;
+				if (dist <= 0 || dist >= best) continue;
+				best = dist;
+				shape = (int)si;
+				point = o + d * dist;
+				normal = Norm(Cross(e1, e2));
+				float wa = 1 - u - w;
+				nearVertex = wa >= u && wa >= w ? s.indices[t] : u >= w ? s.indices[t + 1] : s.indices[t + 2];
+			}
+		}
+		return shape >= 0;
+	}
+
+	// The anchor a new chain hangs from: the bone its first stretch was weighted to most (not one of the SMP bones).
+	static std::string GuessAnchor(const ShapeDraw& s, const std::vector<int>& path)
+	{
+		std::map<std::string, float> sum;
+		size_t n = std::max<size_t>(1, std::min<size_t>(3, path.size()));
+		for (size_t i = 0; i < n && i < path.size(); i++)
+			for (auto& [slot, w] : s.weights[path[i]])
+				if (const char* name = SkinBoneName(s, slot)) if (_strnicmp(name, "SMP", 3) != 0) sum[name] += w;
+		std::string best = "Bip01 Pelvis";
+		float bw = 0;
+		for (auto& [name, w] : sum) if (w > bw) { bw = w; best = name; }
+		return best;
+	}
+
+	static float PathLength(const ShapeDraw& s, const std::vector<int>& path)
+	{
+		float l = 0;
+		for (size_t i = 1; i < path.size(); i++) { V3 d = VertexAt(s, path[i]) - VertexAt(s, path[i - 1]); l += std::sqrt(Dot(d, d)); }
+		return l;
+	}
+
+	// The chain's bones as they will be built: links + 1 points evenly along its stroke.
+	static std::vector<V3> PlannedBones(const ShapeDraw& s, const PaintChain& c)
+	{
+		std::vector<V3> line;
+		for (int v : c.path) line.push_back(VertexAt(s, v));
+		std::vector<V3> out;
+		if (line.size() < 2) return out;
+		std::vector<float> at(line.size(), 0.0f);
+		for (size_t i = 1; i < line.size(); i++) { V3 d = line[i] - line[i - 1]; at[i] = at[i - 1] + std::sqrt(Dot(d, d)); }
+		for (int k = 0; k <= c.links; k++) {
+			float target = at.back() * k / c.links;
+			size_t i = 1;
+			while (i + 1 < line.size() && at[i] < target) i++;
+			float t = std::clamp((target - at[i - 1]) / std::max(at[i] - at[i - 1], 1e-6f), 0.0f, 1.0f);
+			out.push_back(line[i - 1] + (line[i] - line[i - 1]) * t);
+		}
+		return out;
+	}
+
+	static void Brush(PaintChain& c, const ShapeDraw& s, V3 at, bool erase)
+	{
+		float r2 = gM.radius * gM.radius;
+		for (int v = 0; v < (int)s.verts.size(); v++) {
+			V3 d = VertexAt(s, v) - at;
+			float dd = Dot(d, d);
+			if (dd > r2) continue;
+			float f = 1 - dd / r2;
+			f = f * f * (3 - 2 * f) * gM.strength;
+			if (erase) {
+				auto it = c.paint.find(v);
+				if (it == c.paint.end()) continue;
+				it->second *= 1 - f;
+				if (it->second < 0.03f) c.paint.erase(it);
+			} else {
+				float& p = c.paint[v];
+				p = std::max(p, f);
+			}
+		}
+	}
+
+	// Each frame, with the camera's eye and the ray under the mouse: the brush.
+	// forced: -1 the real mouse; 0 or 1 a simulated button (--paint-stroke, for testing), pressed on the first 1.
+	static void Mouse(V3 eye, V3 dir, int forced = -1)
+	{
+		gM.hit = false;
+		if (!Painting()) { gM.stroking = false; return; }
+		ImGuiIO& io = ImGui::GetIO();
+		bool overUi = io.WantCaptureMouse && !gM.stroking && forced < 0;
+		int only = -1;
+		if (gM.stroking && gM.selected >= 0) only = ShapeIndex(gM.chains[gM.selected].shape);
+		int shape, nearV;
+		V3 p, n;
+		if (!overUi && Raycast(eye, dir, only, shape, p, n, nearV)) { gM.hit = true; gM.hitPoint = p; gM.hitNormal = n; gM.hitShape = shape; }
+		bool down = forced >= 0 ? forced == 1 : ImGui::IsMouseDown(ImGuiMouseButton_Left) && !io.KeyCtrl;
+		bool clicked = forced >= 0 ? forced == 1 : ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+		if (!gM.stroking) {
+			if (!down || !clicked || !gM.hit) return;
+			std::string name = gItem.shapes[shape].info.geometry->m_name ? gItem.shapes[shape].info.geometry->m_name : "";
+			if (gM.tool == 0) {
+				PaintChain c;
+				c.shape = name;
+				gM.chains.push_back(c);
+				gM.selected = (int)gM.chains.size() - 1;
+			} else if (gM.selected < 0 || gM.chains[gM.selected].shape != name) {
+				AddLog(3, gM.selected < 0 ? "select a chain to add to or erase from" : "the selected chain is on " + gM.chains[gM.selected].shape + ": paint on that shape");
+				return;
+			}
+			gM.stroking = true;
+		}
+		PaintChain& c = gM.chains[gM.selected];
+		int si = ShapeIndex(c.shape);
+		if (si < 0) { gM.stroking = false; return; }
+		const ShapeDraw& s = gItem.shapes[si];
+		if (gM.hit) {
+			Brush(c, s, gM.hitPoint, gM.tool == 2);
+			// The stroke: a vertex every quarter brush, in the order painted.
+			if (gM.tool == 0) {
+				if (c.path.empty()) c.path.push_back(nearV);
+				else {
+					V3 d = VertexAt(s, nearV) - VertexAt(s, c.path.back());
+					if (nearV != c.path.back() && Dot(d, d) > gM.radius * gM.radius * 0.0625f) c.path.push_back(nearV);
+				}
+			}
+		}
+		if (!down) {
+			gM.stroking = false;
+			if (gM.tool == 0) {
+				if (c.path.size() < 2 || c.paint.empty()) {
+					gM.chains.erase(gM.chains.begin() + gM.selected);
+					gM.selected = gM.chains.empty() ? -1 : (int)gM.chains.size() - 1;
+					AddLog(3, "the stroke was too short for a chain: drag along it, from where it is tied on to its end");
+					return;
+				}
+				c.anchor = GuessAnchor(s, c.path);
+				c.links = std::clamp((int)std::lround(PathLength(s, c.path) / 8.0f), 2, 8);
+				AddLog(2, "chain " + std::to_string(gM.selected + 1) + " on " + c.shape + ": " + std::to_string(c.paint.size()) + " vertices, " +
+					std::to_string(c.links) + " links, hangs from " + c.anchor);
+			}
+		}
+	}
+
+	// Draws a shape with per-vertex colours: the painted chains over a grey surface, the hovered shape in white.
+	static bool DrawOverlay(const ShapeDraw& s)
+	{
+		if (!gM.open || gM.source.empty() || gItem.nifPath != gM.source) return false;
+		std::string name = s.info.geometry->m_name ? s.info.geometry->m_name : "";
+		bool hovered = !gHighlightShape.empty() && gHighlightShape == name;
+		bool any = hovered;
+		for (auto& c : gM.chains) if (c.shape == name) any = true;
+		if (!any && !(gM.paintTab && gM.paintOn)) return false;
+		std::vector<float> r(s.verts.size(), 0.62f), g(s.verts.size(), 0.62f), b(s.verts.size(), 0.64f);
+		if (hovered) std::fill(r.begin(), r.end(), 0.95f), std::fill(g.begin(), g.end(), 0.95f), std::fill(b.begin(), b.end(), 0.95f);
+		for (size_t ci = 0; ci < gM.chains.size(); ci++) {
+			auto& c = gM.chains[ci];
+			if (c.shape != name) continue;
+			D3DCOLOR col = ChainColor(ci);
+			float cr = ((col >> 16) & 255) / 255.0f, cg = ((col >> 8) & 255) / 255.0f, cb = (col & 255) / 255.0f;
+			float boost = (int)ci == gM.selected ? 1.0f : 0.8f;
+			for (auto& [v, st] : c.paint) {
+				if (v >= (int)s.verts.size()) continue;
+				float t = std::clamp(st, 0.0f, 1.0f) * boost;
+				r[v] += (cr - r[v]) * t; g[v] += (cg - g[v]) * t; b[v] += (cb - b[v]) * t;
+			}
+		}
+		V3 key = Norm(V3(0.35f, 0.6f, 0.7f));
+		std::vector<LineVertex> lv(s.verts.size());
+		for (size_t i = 0; i < s.verts.size(); i++) {
+			auto& m = s.verts[i];
+			V3 nn(m.nx, m.ny, m.nz);
+			float l = std::sqrt(Dot(nn, nn));
+			float shade = l > 1e-6f ? 0.5f + 0.5f * std::fabs(Dot(nn, key) / l) : 1.0f;
+			auto c8 = [&](float x) { return (int)std::clamp(x * shade * 255.0f, 0.0f, 255.0f); };
+			lv[i] = { m.px, m.py, m.pz, D3DCOLOR_ARGB(255, c8(r[i]), c8(g[i]), c8(b[i])) };
+		}
+		gDev->SetVertexShader(nullptr);
+		gDev->SetPixelShader(nullptr);
+		gDev->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE);
+		gDev->SetTexture(0, nullptr);
+		gDev->SetRenderState(D3DRS_LIGHTING, FALSE);
+		gDev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, (UINT)lv.size(), (UINT)s.indices.size() / 3, s.indices.data(), D3DFMT_INDEX16, lv.data(), sizeof(LineVertex));
+		gDev->SetVertexShader(gVS);
+		gDev->SetPixelShader(gPS);
+		gDev->SetVertexDeclaration(gDecl);
+		return true;
+	}
+
+	// On top: every chain's stroke and planned bones, and the brush ring under the mouse.
+	static void DrawPaths(V3 eye)
+	{
+		if (!gM.open || gM.source.empty() || gItem.nifPath != gM.source) return;
+		std::vector<LineVertex> lines, points;
+		for (size_t ci = 0; ci < gM.chains.size(); ci++) {
+			auto& c = gM.chains[ci];
+			int si = ShapeIndex(c.shape);
+			if (si < 0) continue;
+			const ShapeDraw& s = gItem.shapes[si];
+			D3DCOLOR col = (int)ci == gM.selected ? D3DCOLOR_ARGB(255, 255, 255, 255) : ChainColor(ci);
+			auto bones = PlannedBones(s, c);
+			for (size_t k = 0; k < bones.size(); k++) {
+				points.push_back({ bones[k].x, bones[k].y, bones[k].z, k == 0 ? D3DCOLOR_ARGB(255, 150, 160, 180) : col });
+				if (k) { lines.push_back({ bones[k - 1].x, bones[k - 1].y, bones[k - 1].z, col }); lines.push_back({ bones[k].x, bones[k].y, bones[k].z, col }); }
+			}
+		}
+		if (gM.hit && Painting()) {
+			V3 n = gM.hitNormal, view = Norm(eye - gM.hitPoint);
+			if (Dot(n, view) < 0) n = n * -1.0f;
+			V3 u = Norm(Cross(n, std::fabs(n.z) < 0.9f ? V3(0, 0, 1) : V3(1, 0, 0))), w = Cross(n, u);
+			D3DCOLOR ring = gM.tool == 2 ? D3DCOLOR_ARGB(255, 255, 90, 90) : D3DCOLOR_ARGB(255, 255, 255, 255);
+			const int seg = 32;
+			for (int i = 0; i < seg; i++) {
+				float a0 = 6.2831853f * i / seg, a1 = 6.2831853f * (i + 1) / seg;
+				V3 p0 = gM.hitPoint + (u * std::cos(a0) + w * std::sin(a0)) * gM.radius, p1 = gM.hitPoint + (u * std::cos(a1) + w * std::sin(a1)) * gM.radius;
+				lines.push_back({ p0.x, p0.y, p0.z, ring });
+				lines.push_back({ p1.x, p1.y, p1.z, ring });
+			}
+		}
+		DrawLines(lines, D3DPT_LINELIST, true);
+		DrawLines(points, D3DPT_POINTLIST, true);
+	}
+
+	static void PaintTab()
+	{
+		ImGui::TextWrapped("Paint where something should hang and swing: start the stroke where it is tied on and drag to its end. Each stroke becomes a chain of bones along it; what you paint moves with it, soft brush edges blending into the mesh's own weights.");
+		if (gM.source.empty()) return;
+		if (gItem.nifPath != gM.source) {
+			ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "The view shows another NIF.");
+			if (ImGui::Button("Back to the source to paint")) LoadItem(gM.source);
+			return;
+		}
+		ImGui::Checkbox("Paint (the body holds still)", &gM.paintOn);
+		Help("Left drag on the mesh paints. Right drag orbits, middle drag pans, the wheel zooms, as always.");
+		ImGui::RadioButton("New chain", &gM.tool, 0); ImGui::SameLine();
+		ImGui::RadioButton("Add to selected", &gM.tool, 1); ImGui::SameLine();
+		ImGui::RadioButton("Erase", &gM.tool, 2);
+		Help("New chain: each stroke is a new chain, laid along the stroke. Add: paints more of the mesh onto the selected chain (its bones stay). Erase: takes paint off the selected chain.");
+		ImGui::SliderFloat("Brush size", &gM.radius, 0.5f, 30, "%.1f units");
+		ImGui::SliderFloat("Brush strength", &gM.strength, 0.05f, 1, "%.2f");
+		Help("Below 1 the paint only partly follows the chain: a softer blend into the mesh's own weights.");
+
+		ImGui::SeparatorText("Chains");
+		if (gM.chains.empty()) ImGui::TextDisabled("None yet: paint a stroke on the mesh.");
+		for (size_t i = 0; i < gM.chains.size(); i++) {
+			auto& c = gM.chains[i];
+			ImGui::PushID((int)i);
+			D3DCOLOR col = ChainColor(i);
+			ImGui::ColorButton("##c", ImVec4(((col >> 16) & 255) / 255.0f, ((col >> 8) & 255) / 255.0f, (col & 255) / 255.0f, 1), ImGuiColorEditFlags_NoTooltip, ImVec2(14, 14));
+			ImGui::SameLine();
+			char label[160];
+			snprintf(label, sizeof label, "Chain %zu on %s (%zu vertices)", i + 1, c.shape.c_str(), c.paint.size());
+			if (ImGui::Selectable(label, gM.selected == (int)i)) gM.selected = (int)i;
+			if (gM.selected == (int)i) {
+				ImGui::Indent();
+				int si = ShapeIndex(c.shape);
+				std::vector<std::string> anchors = gM.skeleton;
+				BoneCombo("Hangs from", c.anchor, anchors);
+				Help("The bone the chain is tied to. Picked from what the start of the stroke was weighted to; change it if the chain should follow another part of the body.");
+				ImGui::SliderInt("Links", &c.links, 1, 12);
+				if (si >= 0) { ImGui::SameLine(); ImGui::TextDisabled("%.1f units each", PathLength(gItem.shapes[si], c.path) / std::max(1, c.links)); }
+				Help("Bones along the stroke. More bends more smoothly; about one per 6-10 units.");
+				ImGui::SliderFloat("Stiffness", &c.stiffness, 0, 1, "%.2f");
+				Help("0 swings freely like a rope or a tassel; 0.4 a strap or a flap; 0.8 and up holds its modelled shape and only bounces (a stiff collar, a holster flap).");
+				ImGui::SliderFloat("Weight", &c.weight, 0, 1, "%.2f");
+				Help("0 light and lively (ribbons, hair; the wind moves it); 1 heavy and calm (leather, chain, a weighted end).");
+				if (ImGui::Button("Delete chain")) { gM.chains.erase(gM.chains.begin() + i); gM.selected = -1; ImGui::Unindent(); ImGui::PopID(); break; }
+				ImGui::Unindent();
+			}
+			ImGui::PopID();
+		}
+		if (!gM.chains.empty() && ImGui::SmallButton("Delete all chains")) { gM.chains.clear(); gM.selected = -1; }
+
+		ImGui::SeparatorText("Collides with");
+		std::set<std::string> painted;
+		for (auto& c : gM.chains) painted.insert(c.shape);
+		for (auto& s : gM.shapes) {
+			if (painted.count(s.name)) continue;
+			bool on = s.role == Collider;
+			if (ImGui::Checkbox(s.name.c_str(), &on)) s.role = on ? Collider : None;
+			if (ImGui::IsItemHovered()) gHighlightShape = s.name;
+		}
+		ImGui::Checkbox("Low-poly collision proxies", &gM.proxy);
+		Help("The colliders collide through simplified copies hidden in the NIF: far cheaper in game. More collision options: the Outfit tab.");
+		OutputRows();
+		BuildButtons(false);
+	}
+
+	// --- the window ------------------------------------------------------------------------------------------------
+
+	// A bone picked from a list (with a filter box).
+	static bool BoneCombo(const char* label, std::string& bone, const std::vector<std::string>& bones)
+	{
+		bool changed = false;
+		if (ImGui::BeginCombo(label, bone.empty() ? "(pick a bone)" : bone.c_str(), ImGuiComboFlags_HeightLarge)) {
+			static char filter[64] = "";
+			if (ImGui::IsWindowAppearing()) { filter[0] = 0; ImGui::SetKeyboardFocusHere(); }
+			ImGui::InputTextWithHint("##filter", "filter", filter, sizeof filter);
+			std::string f = Lower(filter);
+			for (auto& b : bones) {
+				if (!f.empty() && Lower(b).find(f) == std::string::npos) continue;
+				if (ImGui::Selectable(b.c_str(), b == bone)) { bone = b; changed = true; }
+			}
+			ImGui::EndCombo();
+		}
+		return changed;
+	}
+
+	static void PathRow(const char* label, char* buf, size_t n, bool folder, const char* help)
+	{
+		ImGui::PushID(label);
+		ImGui::SetNextItemWidth(-70);
+		ImGui::InputText(label, buf, n);
+		ImGui::SameLine();
+		if (ImGui::Button("Pick...")) {
+			std::string p = folder ? PickFolder() : PickFile("NIF meshes (*.nif)\0*.nif\0", buf[0] ? fs::path(buf).parent_path().string() : std::string());
+			if (!p.empty()) Copy(buf, n, p);
+		}
+		if (help) Help(help);
+		ImGui::PopID();
+	}
+
+	static void ClothOptions(ShapeRow& s)
+	{
+		BoneCombo("Hangs from", s.anchor, gM.skeleton);
+		Help("The bone the cloth's top row is anchored on: Bip01 Pelvis for a skirt or coat tail, Bip01 Spine2 for a cape or poncho.");
+		ImGui::DragInt2("Columns, rows", &s.cols, 0.1f, 2, 40);
+		Help("The cloth bone grid: columns around the body, rows down to the hem. More is smoother and costs more.");
+		ImGui::Checkbox("Rows by distance from the neck", &s.radial);
+		Help("For a cape draped over the shoulders: rows follow its surface from the collar down, instead of by height.");
+		if (s.radial) {
+			ImGui::SliderFloat("Collar", &s.collar, 0, 40, "%.1f");
+			Help("The top row's distance from the neck; vertices closer than this keep their weights (they sit on the shoulders).");
+		} else {
+			ImGui::Checkbox("Top row height: automatic", &s.autoTop);
+			Help("Automatic: 80% up the shape. Above the top row the vertices keep their weights.");
+			if (!s.autoTop) {
+				ImGui::SliderFloat("Top row height", &s.top, s.zMin, s.zMax, "%.1f");
+				Help("Height of the top row (the anchors), in the shape's own units.");
+			}
+		}
+		ImGui::Checkbox("Spread around the body: automatic", &s.autoAngles);
+		Help("Automatic: as far around as the shape goes.");
+		if (!s.autoAngles) {
+			ImGui::DragFloat2("From, to (degrees)", &s.angleLo, 1.0f, -360, 360, "%.0f");
+			Help("0 = the back, 90 = the body's right side, -90 the left; may wrap past 180 for a poncho.");
+		}
+		ImGui::SliderInt("Rows that don't collide", &s.fixedRows, 0, 4);
+		Help("The top rows sit on the body; colliding them would push them off it. 1 = only the anchors.");
+		if (ImGui::TreeNode("Arm under the cloth", "Arm under the cloth (%zu)", s.detach.size())) {
+			ImGui::TextWrapped("Hand an arm bone's weights to another bone first (e.g. the upper arm onto the clavicle), so the arm moves under the cloth instead of dragging it.");
+			for (size_t i = 0; i < s.detach.size(); i++) {
+				ImGui::PushID((int)i);
+				ImGui::SetNextItemWidth(150); BoneCombo("##from", s.detach[i].first, s.skinBones);
+				ImGui::SameLine(); ImGui::TextUnformatted("->"); ImGui::SameLine();
+				ImGui::SetNextItemWidth(150); BoneCombo("##to", s.detach[i].second, s.skinBones);
+				ImGui::SameLine();
+				bool del = ImGui::SmallButton("x");
+				ImGui::PopID();
+				if (del) { s.detach.erase(s.detach.begin() + i); break; }
+			}
+			if (ImGui::SmallButton("+ add")) s.detach.push_back({});
+			ImGui::TreePop();
+		}
+		if (ImGui::TreeNode("Pinned under armour", "Pinned under armour (%zu)", s.keep.size())) {
+			ImGui::TextWrapped("Cloth under a bone's armour (a shoulder guard) stays still: vertices weighted to the bone keep their weights from the second weight up, blending into the cloth from the first.");
+			for (size_t i = 0; i < s.keep.size(); i++) {
+				ImGui::PushID((int)i);
+				ImGui::SetNextItemWidth(150); BoneCombo("##bone", s.keep[i].bone, s.skinBones);
+				ImGui::SameLine(); ImGui::SetNextItemWidth(110); ImGui::DragFloat2("##w", &s.keep[i].w0, 0.005f, 0, 1, "%.2f");
+				ImGui::SameLine();
+				bool del = ImGui::SmallButton("x");
+				ImGui::PopID();
+				if (del) { s.keep.erase(s.keep.begin() + i); break; }
+			}
+			if (ImGui::SmallButton("+ add")) s.keep.push_back({});
+			ImGui::TreePop();
+		}
+	}
+
+	static void ChainOptions(ShapeRow& s)
+	{
+		BoneCombo("Hangs from", s.anchor, gM.skeleton);
+		Help("The bone the strands are tied on.");
+		ImGui::SliderInt("Links per strand", &s.links, 1, 10);
+		Help("Every piece of the mesh reaching the top and longer than 4 units is a strand: a chain of this many bones. Other pieces (bottles, charms, tags) hang rigid on the nearest strand's end.");
+		ImGui::Checkbox("Knot stays still", &s.keepTop);
+		Help("The strands' top keeps its own weights (where they are tied on), blending into the links below.");
+		if (s.keepTop) { ImGui::DragFloat2("Still, blend to (units)", &s.keepTopA, 0.05f, 0, 20, "%.2f"); }
+	}
+
+	static void ShapesTable()
+	{
+		if (gM.shapes.empty()) { ImGui::TextDisabled("No shapes."); return; }
+		ImGui::TextDisabled("Hover a shape to see it in white.");
+		for (auto& s : gM.shapes) {
+			ImGui::PushID(s.name.c_str());
+			ImGui::SetNextItemWidth(130);
+			if (gM.mode == Coat) {
+				if (s.role == Chains) s.role = None;
+				if (ImGui::BeginCombo("##role", kCoatRoles[s.role])) {
+					for (int r : { (int)None, (int)Cloth, (int)Collider, (int)VirtualLegs })
+						if (ImGui::Selectable(kCoatRoles[r], s.role == r)) {
+							if (r == Cloth || r == VirtualLegs) for (auto& o : gM.shapes) if (o.role == r) o.role = None;   // one of each
+							s.role = r;
+						}
+					ImGui::EndCombo();
+				}
+			} else {
+				if (s.role == VirtualLegs) s.role = Collider;
+				ImGui::Combo("##role", &s.role, kOutfitRoles, IM_ARRAYSIZE(kOutfitRoles));
+			}
+			ImGui::SameLine();
+			ImGui::Text("%s", s.name.c_str());
+			if (ImGui::IsItemHovered()) { gHighlightShape = s.name; ImGui::SetTooltip("%d vertices, height %.1f to %.1f, %zu skin bones", s.verts, s.zMin, s.zMax, s.skinBones.size()); }
+			ImGui::SameLine();
+			ImGui::TextDisabled("%d verts", s.verts);
+			if (gM.mode == Outfit && (s.role == Cloth || s.role == Chains)) {
+				ImGui::Indent();
+				if (s.role == Cloth) ClothOptions(s); else ChainOptions(s);
+				ImGui::Unindent();
+				ImGui::Separator();
+			}
+			ImGui::PopID();
+		}
+	}
+
+	static void OutputRows()
+	{
+		ImGui::SeparatorText("Output");
+		ImGui::SetNextItemWidth(-70);
+		ImGui::InputText("Physics file", gM.physics, sizeof gM.physics);
+		Help("Where the physics XML will be in the game, relative to Data (e.g. Meshes\\Armor\\MyOutfit\\outfit_smp.xml). The NIF names it, so it must match where you install it, or the game logs \"physics file not found\".");
+		PathRow("Output folder", gM.outDir, sizeof gM.outDir, true, "A folder laid out as Data: the NIF and XML go in its Meshes\\... folder. Pick an empty mod folder in MO2's mods to install it straight away.");
+		ImGui::TextDisabled("NIF: %s", OutNif().c_str());
+		if (gM.mode == Coat || !gM.chains.empty() || std::any_of(gM.shapes.begin(), gM.shapes.end(), [](const ShapeRow& s) { return s.role == Cloth || s.role == Chains; }))
+			ImGui::TextDisabled("XML: %s", OutXml().c_str());
+		if (fs::exists(OutXml())) ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "The XML exists: building replaces it (the old one is kept as .bak),\nincluding values tuned in Bone values.");
+	}
+
+	static void BuildButtons(bool repair)
+	{
+		ImGui::Spacing();
+		ImGui::BeginDisabled(gM.running);
+		if (ImGui::Button(gM.running ? "Building..." : "Build and preview", ImVec2(180, 0))) { if (repair) BuildRepair(); else BuildOutfit(); }
+		ImGui::EndDisabled();
+		ImGui::SameLine();
+		ImGui::BeginDisabled(gM.lastCommand.empty());
+		if (ImGui::Button("Copy command")) ImGui::SetClipboardText(gM.lastCommand.c_str());
+		ImGui::EndDisabled();
+		Help("The last build's command line, for running the tool yourself.");
+		if (!gM.lastResult.empty()) ImGui::TextWrapped("Last build: %s", gM.lastResult.c_str());
+	}
+
+	static void Window()
+	{
+		Pump();
+		if (gM.buildOnOpen && !gM.running && !gM.source.empty()) { gM.buildOnOpen = false; if (gM.mode == Repair) BuildRepair(); else BuildOutfit(); }
+		if (!gM.open) return;
+		// A plain NIF opened in the view becomes the source (unless chains are painted on the current one).
+		if (gItem.loaded && gItem.nifPath != gM.source && !gM.running && (gM.source.empty() || (gM.chains.empty() && gItem.scene.physicsFile.empty()))) Capture();
+		ImGuiIO& io = ImGui::GetIO();
+		ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 488, 8), ImGuiCond_FirstUseEver);
+		ImGui::SetNextWindowSize(ImVec2(480, io.DisplaySize.y - 190), ImGuiCond_FirstUseEver);
+		if (!ImGui::Begin("Make SMP", &gM.open)) { ImGui::End(); return; }
+
+		if (ImGui::Button("Use the open NIF")) { if (gItem.loaded) Capture(); }
+		Help("Reads the shapes and bones of the NIF open in the previewer (open the plain, non-SMP armour first).");
+		ImGui::SameLine();
+		if (ImGui::Button("Load recipe...")) {
+			std::string p = PickFile("Recipes (*.smprecipe)\0*.smprecipe\0", gM.outDir);
+			if (!p.empty()) LoadRecipe(p);
+		}
+		Help("Every build saves its settings beside the XML (<name>_smp.xml.smprecipe). Load one to rebuild or change it.");
+		if (gM.source.empty()) ImGui::TextWrapped("Open the armour in the previewer (Open NIF...), then click Use the open NIF.");
+		else {
+			ImGui::TextWrapped("Source: %s", gM.source.c_str());
+			if (gM.sourceHasPhysics) ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "This NIF already has SMP physics. Build from the original armour;\nhere, only collision proxies can be added (Outfit, colliders only).");
+		}
+
+		if (ImGui::BeginTabBar("modes")) {
+			gM.paintTab = false;
+			if (ImGui::BeginTabItem("Paint chains")) {
+				gM.mode = Outfit;
+				gM.paintTab = true;
+				PaintTab();
+				ImGui::EndTabItem();
+			}
+			if (ImGui::BeginTabItem("Outfit")) {
+				gM.mode = Outfit;
+				ImGui::TextWrapped("Capes, ponchos, skirts (Cloth), ropes and straps with things hanging on them (Chains), and what they collide with (Collider). smpdress.");
+				if (!gM.source.empty()) {
+					ImGui::SeparatorText("Shapes");
+					ShapesTable();
+					ImGui::SeparatorText("Collision");
+					ImGui::Checkbox("Low-poly collision proxies", &gM.proxy);
+					Help("The colliders collide through simplified copies hidden in the NIF: far cheaper in game, about the same result.");
+					if (gM.proxy) { ImGui::SameLine(); ImGui::SetNextItemWidth(120); ImGui::SliderFloat("cell", &gM.proxyCell, 1, 8, "%.1f"); Help("How coarse the proxies are (units): 2-4 is usual."); }
+					std::set<std::string> colliderBones;
+					for (auto& s : gM.shapes) if (s.role == Collider) colliderBones.insert(s.skinBones.begin(), s.skinBones.end());
+					if (ImGui::TreeNode("Skip", "Parts the cloth never reaches (%zu skipped)", gM.collideSkip.size())) {
+						ImGui::TextWrapped("Triangles weighted only to these bones are left out of the colliders: lower legs, forearms and hands cost time and are rarely touched.");
+						if (ImGui::SmallButton("Suggest")) {
+							for (auto& b : colliderBones) {
+								std::string l = Lower(b);
+								for (const char* k : { "calf", "foot", "toe", "forearm", "foretwist", "hand", "finger", "thumb" }) if (l.find(k) != std::string::npos) gM.collideSkip.insert(b);
+							}
+						}
+						ImGui::SameLine();
+						if (ImGui::SmallButton("None")) gM.collideSkip.clear();
+						for (auto& b : colliderBones) {
+							bool on = gM.collideSkip.count(b) > 0;
+							if (ImGui::Checkbox(b.c_str(), &on)) { if (on) gM.collideSkip.insert(b); else gM.collideSkip.erase(b); }
+						}
+						if (colliderBones.empty()) ImGui::TextDisabled("Give a shape the role Collider first.");
+						ImGui::TreePop();
+					}
+					ImGui::SliderFloat("Cloth margin", &gM.clothMargin, 0, 3, "%.2f");
+					ImGui::SliderFloat("Body margin", &gM.bodyMargin, 0, 3, "%.2f");
+					ImGui::SliderFloat("Penetration", &gM.penetration, 0.05f, 6, "%.2f");
+					Help("How deep a contact may go before it pushes. Against thin armour shells keep it below the shell's thickness (e.g. 0.3), or the inner face grabs cloth resting on the outer one.");
+					ImGui::SeparatorText("Cloth feel");
+					ImGui::SliderFloat("Bend", &gM.bend, 0.2f, 4, "%.2f"); Help("How far the cloth links may swing (x the defaults). A cape modelled in a T pose needs room to drape down.");
+					ImGui::SliderFloat("Stiffness", &gM.stiffness, 0, 3, "%.2f"); Help("The springs back to the modelled shape (x the defaults).");
+					ImGui::SliderFloat("Friction", &gM.friction, 0, 1, "%.2f"); Help("Low lets a flap slide off the shoulder and drape.");
+					ImGui::SliderFloat("Mass", &gM.mass, 0.005f, 0.2f, "%.3f");
+					ImGui::SliderFloat("Bounce", &gM.restitution, 0, 1, "%.2f");
+					ImGui::DragFloat2("Damping (move, turn)", &gM.dampL, 0.005f, 0, 0.999f, "%.3f"); Help("Higher is heavier cloth that sways less (0.95 0.97 for a heavy poncho).");
+					ImGui::Checkbox("Links across columns", &gM.weft); Help("Off: neighbouring columns move freely, so a flap modelled spread out doesn't stand out like a shelf.");
+					ImGui::TextDisabled("Fine tuning after the build: Bone values in the main window.");
+					OutputRows();
+					BuildButtons(false);
+				}
+				ImGui::EndTabItem();
+			}
+			if (ImGui::BeginTabItem("Coat or skirt")) {
+				gM.mode = Coat;
+				ImGui::TextWrapped("One coat tail or skirt on the pelvis, the quick way. smpify.");
+				if (!gM.source.empty()) {
+					ImGui::SeparatorText("Shapes");
+					ShapesTable();
+					ImGui::SeparatorText("Cloth");
+					ImGui::DragInt2("Columns, rows", &gM.coatCols, 0.1f, 2, 40);
+					ImGui::SliderFloat("Waist height", &gM.coatTop, 0, 140, "%.1f"); Help("Height of the waist row (the anchors on the pelvis); the coat above it keeps its weights.");
+					ImGui::SliderFloat("Spread (degrees)", &gM.coatAngle, 30, 180, "%.0f"); Help("The grid spans -this..+this around the body from the back: 140 leaves the front open, 180 goes all round.");
+					ImGui::TextDisabled("Virtual legs: smooth leg capsules fitted to that shape instead of its mesh (better at the hips).");
+					OutputRows();
+					BuildButtons(false);
+				}
+				ImGui::EndTabItem();
+			}
+			if (ImGui::BeginTabItem("Fix after Outfit Studio")) {
+				gM.mode = Repair;
+				ImGui::TextWrapped("Outfit Studio drops the SMP bones no vertex is weighted to (the cloth's anchors, a rope's top) when it saves. This puts them back from the NIF as it was before the edit. smprepair.");
+				PathRow("Edited NIF", gM.edited, sizeof gM.edited, false, "The NIF as Outfit Studio saved it.");
+				PathRow("Before the edit", gM.reference, sizeof gM.reference, false, "The same NIF before the edit (the build's output, or its .bak).");
+				if (gM.edited[0] && !gM.repaired[0]) { fs::path e(gM.edited); Copy(gM.repaired, sizeof gM.repaired, (e.parent_path() / (e.stem().string() + ".repaired.nif")).string()); }
+				ImGui::SetNextItemWidth(-70);
+				ImGui::InputText("Repaired NIF", gM.repaired, sizeof gM.repaired);
+				Help("Where the repaired NIF goes (it may be the edited file itself: that is kept as .bak).");
+				BuildButtons(true);
+
+				ImGui::SeparatorText("Missing SMP Bones list");
+				ImGui::TextWrapped("For an SMP NIF made elsewhere (a Skyrim body or outfit): New Vegas drops the bones its skeleton lacks, unless each shape lists them in \"SMP Bones\". This writes the list into the NIF: bones the skeleton has are the body's, the others are rebuilt on their parent (or, on the NIF's root, the body bone they share most weight with).");
+				PathRow("NIF", gM.listNif, sizeof gM.listNif, false, "The SMP NIF (it is rewritten; the old one is kept as .bak).");
+				if (!gM.listSkeleton[0] && !gAnim.skeletonPath.empty()) Copy(gM.listSkeleton, sizeof gM.listSkeleton, gAnim.skeletonPath);
+				PathRow("Skeleton", gM.listSkeleton, sizeof gM.listSkeleton, false, "The game's skeleton.nif the body is used with (found in your Data folders when the previewer finds one).");
+				ImGui::BeginDisabled(gM.running);
+				if (ImGui::Button("Add SMP Bones list", ImVec2(180, 0))) AddBoneLists(gM.listNif, gM.listSkeleton);
+				ImGui::EndDisabled();
+				ImGui::EndTabItem();
+			}
+			ImGui::EndTabBar();
+		}
+		ImGui::End();
+	}
+}

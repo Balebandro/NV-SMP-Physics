@@ -852,6 +852,50 @@ static void OpenAnimationDialog()
 
 
 
+// Skinned shapes with bones the game's skeleton lacks but no "SMP Bones" list (an SMP NIF made outside these tools,
+// a Skyrim body): New Vegas drops those bones on attach, so the plugin cannot build them. "Shape: bone, bone".
+static std::vector<std::string> MissingBoneLists(const std::string& path, const scene::Skeleton& skeleton)
+{
+	std::vector<std::string> out;
+	try {
+		nif::File f;
+		f.load(path);
+		auto name = [&](int block) {
+			if (block < 0 || block >= (int)f.blocks.size()) return std::string();
+			nif::Reader r(f.blocks[block].data(), f.blocks[block].size());
+			uint32_t s = r.u32();
+			return s < f.strings.size() ? f.strings[s] : std::string();
+		};
+		for (size_t si = 0; si < f.blocks.size(); si++) {
+			const std::string& type = f.typeOf(si);
+			if (type != "NiTriShape" && type != "NiTriStrips") continue;
+			nif::Geometry g;
+			g.read(f.blocks[si]);
+			if (g.skin < 0) continue;
+			bool hasList = false;
+			for (int e : g.av.extraData) {
+				if (f.typeOf(e) != "NiStringExtraData") continue;
+				nif::Reader r(f.blocks[e].data(), f.blocks[e].size());
+				uint32_t k = r.u32();
+				if (k < f.strings.size() && f.strings[k].rfind("SMP Bones", 0) == 0) hasList = true;
+			}
+			if (hasList) continue;
+			nif::SkinInstance skin;
+			skin.read(f.blocks[g.skin], f.typeOf(g.skin) == "BSDismemberSkinInstance");
+			std::string missing;
+			for (int b : skin.bones) {
+				std::string n = name(b);
+				bool known = false;
+				for (auto& [k, node] : skeleton.bones) if (_stricmp(k.c_str(), n.c_str()) == 0) { known = true; break; }
+				if (!known) missing += (missing.empty() ? "" : ", ") + n;
+			}
+			if (!missing.empty()) out.push_back(name((int)si) + ": " + missing);
+		}
+	} catch (...) {}
+	return out;
+}
+static std::vector<std::string> gMissingBoneLists;
+
 static void LoadItem(const std::string& path)
 {
 	auto* world = hdt::SkyrimPhysicsWorld::get();
@@ -882,6 +926,12 @@ static void LoadItem(const std::string& path)
 		return;
 	}
 	IniSet("LastFile", path);
+	// Only against the game's skeleton (without it the item's own bones make up the skeleton) and for an SMP item.
+	gMissingBoneLists.clear();
+	if (!gAnim.skeletonPath.empty() && !gItem.scene.physicsFile.empty()) {
+		gMissingBoneLists = MissingBoneLists(path, gItem.scene.skeleton);
+		for (auto& m : gMissingBoneLists) AddLog(3, "no SMP Bones list, so the game drops these bones: " + m);
+	}
 	gMotion = Motion();
 	gAnim.current = gAnim.previous = ClipPlay();
 	gAnim.wasAnimating = false;
@@ -1194,6 +1244,10 @@ static void DrawHeat(const ShapeDraw& s)
 	gDev->SetVertexDeclaration(gDecl);
 }
 
+// The Make SMP window (maker.h, included before the panels): the shape hovered in its lists, its paint overlay.
+static std::string gHighlightShape;
+namespace maker { static bool DrawOverlay(const ShapeDraw& s); static void DrawPaths(V3 eye); }
+
 static void DrawScene(const M4& viewProj, const M4& view, const M4& proj)
 {
 	gDev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
@@ -1237,6 +1291,7 @@ static void DrawScene(const M4& viewProj, const M4& view, const M4& proj)
 		auto& s = gItem.shapes[i];
 		if (!s.visible || s.indices.empty()) continue;
 		SkinShape(s);
+		if (maker::DrawOverlay(s)) continue;
 		if (!gS.heatBone.empty() || !gHighlightBones.empty()) { DrawHeat(s); continue; }
 		bool tex = gS.textures && s.texture && !s.info.uvs.empty();
 		const float white[4] = { 1, 1, 1, 1 };
@@ -1313,6 +1368,7 @@ static void DrawScene(const M4& viewProj, const M4& view, const M4& proj)
 		DrawLines(lines, D3DPT_LINELIST, true);
 		DrawLines(points, D3DPT_POINTLIST, true);
 	}
+	maker::DrawPaths(CameraEye());
 }
 
 // --- the panels -------------------------------------------------------------------------------------------
@@ -1358,10 +1414,13 @@ static bool Undo(const char* id, T& v, const T& was)
 	return true;
 }
 
+#include "maker.h"
+
 static void Panels(float fps)
 {
 	gHighlightBones.clear();   // set again below while a chain is hovered, dragged or pinned
 	gHighlightLinks.clear();
+	gHighlightShape.clear();
 	auto* world = hdt::SkyrimPhysicsWorld::get();
 	ImGuiIO& io = ImGui::GetIO();
 	ImGui::SetNextWindowPos(ImVec2(8, 8), ImGuiCond_FirstUseEver);
@@ -1379,11 +1438,22 @@ static void Panels(float fps)
 	ImGui::EndDisabled();
 	ImGui::SameLine();
 	if (ImGui::Button("Screenshot")) gShotPending = true;
+	ImGui::SameLine();
+	if (ImGui::Button("Make SMP...")) maker::gM.open = true;
+	Help("Paint chains on a plain armour, or set up cloth and collisions, and build it with smpdress, smpify or smprepair without the command line.");
 	ImGui::Checkbox("Reload when the files change", &gS.autoReload);
 	if (gItem.loaded) {
 		ImGui::TextWrapped("NIF: %s", gItem.nifPath.c_str());
 		if (gItem.xmlPath.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "XML: %s (not found)", gItem.xmlNamed.empty() ? "none named" : gItem.xmlNamed.c_str());
 		else ImGui::TextWrapped("XML: %s", gItem.xmlPath.c_str());
+		if (!gMissingBoneLists.empty()) {
+			ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "%zu shape(s) have bones the game drops (no SMP Bones list):", gMissingBoneLists.size());
+			for (auto& m : gMissingBoneLists) ImGui::TextDisabled("  %s", m.c_str());
+			ImGui::BeginDisabled(maker::gM.running);
+			if (ImGui::Button("Add SMP Bones list")) maker::AddBoneLists(gItem.nifPath, gAnim.skeletonPath);
+			ImGui::EndDisabled();
+			Help("Writes the list into this NIF (the old one is kept as .bak) with smprepair --list, against the game's skeleton found in your Data folders, and reloads it.");
+		}
 		if (gItem.system)
 			ImGui::Text("%zu bones (%d simulated), %d constraints, %zu bodies", gItem.system->getBones().size(), gItem.simulatedBones, gItem.constraintCount, gItem.system->meshes().size());
 		ImGui::Text("physics %.2f ms/step   %.0f fps", world->m_averageStepMs, fps);
@@ -1886,6 +1956,8 @@ static void Panels(float fps)
 	if (gLogScroll) { ImGui::SetScrollHereY(1.0f); gLogScroll = false; }
 	ImGui::EndChild();
 	ImGui::End();
+
+	maker::Window();
 }
 
 // --- the window -----------------------------------------------------------------------------------------
@@ -1917,11 +1989,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 {
 	char exe[MAX_PATH];
 	GetModuleFileNameA(nullptr, exe, MAX_PATH);
+#ifdef NVSMP_MAKER
+	// NV SMP Maker: the same program, opening on the Make SMP window (its own settings file).
+	gIniPath = (fs::path(exe).parent_path() / "NVSMPMaker.ini").string();
+	const wchar_t* kTitle = L"NV SMP Maker";
+	maker::gM.open = true;
+	gS.preset = 0;   // Stand: the body holds an upright pose to paint on
+#else
 	gIniPath = (fs::path(exe).parent_path() / "NVSMPPreviewer.ini").string();
+	const wchar_t* kTitle = L"NV SMP Previewer";
+#endif
 
 	WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, inst, LoadIcon(nullptr, IDI_APPLICATION), LoadCursor(nullptr, IDC_ARROW), nullptr, nullptr, L"NVSMPPreviewer", nullptr };
 	RegisterClassExW(&wc);
-	gWnd = CreateWindowW(wc.lpszClassName, L"NV SMP Previewer", WS_OVERLAPPEDWINDOW, 100, 60, 1600, 960, nullptr, nullptr, inst, nullptr);
+	gWnd = CreateWindowW(wc.lpszClassName, kTitle, WS_OVERLAPPEDWINDOW, 100, 60, 1600, 960, nullptr, nullptr, inst, nullptr);
 	if (!CreateDevice()) {
 		MessageBoxA(nullptr, "Could not create a Direct3D 9 device.", "NV SMP Previewer", MB_ICONERROR);
 		return 1;
@@ -1958,6 +2039,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	LocalFree(argv);
 	std::string start, shots, jitterOut, clipOut;   // --jitter / --clip file: how much the cloth shakes / clips (see below)
 	std::string clipMeshOut;   // --clipmesh file: how much the cloth shapes sink into the body collision shapes (see below)
+	std::string recipe;   // --recipe file: the Make SMP window loads it (with --maker-build: and builds it, for testing)
+	bool addBoneLists = false;
+	float stroke[4] = { -1, 0, 0, 0 };   // --paint-stroke x0 y0 x1 y1 (window fractions): a simulated brush drag from frame 60 to 120, for testing
+	bool buildAfterStroke = false;
 	int shotEvery = 20, shotCount = 0;
 	bool noUi = false, exitAfter = false;
 	for (size_t i = 0; i < args.size(); i++) {
@@ -1992,6 +2077,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--stance") gAnim.stance = std::clamp(atoi(next().c_str()), 0, IM_ARRAYSIZE(kStances) - 1);
 		else if (a == "--kf") { gAnim.customPath = next(); gS.preset = kCustom; }
 		else if (a == "--exit") exitAfter = true;
+		else if (a == "--maker") maker::gM.open = true;
+		else if (a == "--recipe") recipe = next();
+		else if (a == "--maker-build") maker::gM.buildOnOpen = true;
+		else if (a == "--add-bone-lists") addBoneLists = true;   // testing: the Add SMP Bones list button, pressed once
+		else if (a == "--paint-stroke") for (int k = 0; k < 4; k++) stroke[k] = (float)atof(next().c_str());
 		else if (a == "--show") {
 			std::string s = next();
 			gS.showBones = s.find("bones") != std::string::npos;
@@ -2003,6 +2093,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	ApplyWorldSettings();   // again: the command line may have changed them
 	if (start.empty()) start = IniGet("LastFile");
 	if (!start.empty() && fs::exists(start)) LoadItem(start);
+	if (!recipe.empty()) { maker::gM.open = true; maker::LoadRecipe(recipe); }
+	if (addBoneLists && !gMissingBoneLists.empty()) maker::AddBoneLists(gItem.nifPath, gAnim.skeletonPath);
+	if (stroke[0] >= 0) { maker::gM.open = true; buildAfterStroke = maker::gM.buildOnOpen; maker::gM.buildOnOpen = false; }
 	int frameNo = 0, shotsTaken = 0;
 
 	LARGE_INTEGER freq, last, now;
@@ -2044,9 +2137,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 
 		if (gItem.loaded) {
 			float simDt = (jitterOut.empty() && clipOut.empty() && clipMeshOut.empty()) || gRealtime ? dt * gS.timeScale : gMeasureStep;   // measuring: a fixed step, comparable runs (--realtime: the real one)
-			UpdateMotion(simDt);
+			const bool painting = maker::Painting();   // the body holds still under the brush
+			UpdateMotion(painting ? 0.0f : simDt);
 			UpdateWind(wallTime);
-			if (gS.physics && gItem.system) hdt::SkyrimPhysicsWorld::get()->doUpdate(simDt);
+			if (gS.physics && gItem.system && !painting) hdt::SkyrimPhysicsWorld::get()->doUpdate(simDt);
 
 			// --jitter: the simulated bones' frame-to-frame shake in the actor's frame, as the second difference
 			// of their positions (smooth swinging leaves it near 0; fighting contacts make it large), over 4 s
@@ -2340,13 +2434,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 					auto* bone = static_cast<hdt::SkyrimBone*>(b.get());
 					track[bone->m_name.c_str()].push_back(toActor * bone->m_node->world.translate);
 					if (strstr(bone->m_name.c_str(), "Cape")) track[std::string("~spine ") + bone->m_name.c_str()].push_back(toSpine * bone->m_node->world.translate);
+					track[std::string("~chest ") + bone->m_name.c_str()].push_back(toSpine * bone->m_node->world.translate);
 				}
 				if (++measured == 480) {
 					std::vector<std::pair<double, std::string>> perBone;
 					double total = 0;
 					int count = 0;
 					for (auto& [name, pts] : track) {
-						if (name.rfind("~spine ", 0) == 0) continue;
+						if (name[0] == '~') continue;
 						double sum = 0;
 						for (size_t i = 2; i < pts.size(); i++) sum += (pts[i] - pts[i - 1] * 2.0f + pts[i - 2]).Length();
 						double avg = sum / std::max<size_t>(1, pts.size() - 2);
@@ -2377,6 +2472,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 								sway += s / pts.size(); n++;
 							}
 							fprintf(f, "  cape sway: %.3f units from the mean place on average\n", n ? sway / n : 0.0);
+						}
+						// Movement against the chest (Spine2), every simulated bone: on average and at most from its mean place.
+						for (auto& [name, pts] : track) {
+							if (name.rfind("~chest ", 0) != 0 || pts.empty()) continue;
+							RE::NiPoint3 m(0, 0, 0);
+							for (auto& q : pts) m = m + q;
+							m = m * (1.0f / pts.size());
+							double s = 0, most = 0;
+							for (auto& q : pts) { double d = (q - m).Length(); s += d; most = std::max(most, d); }
+							fprintf(f, "  vs chest %-18s %.3f on average, %.3f at most\n", name.c_str() + 7, s / pts.size(), most);
 						}
 						// Per chain (the bones' names without the last word: "SMP Cape0 C06"): shake and sway.
 						{
@@ -2456,6 +2561,24 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		M4 proj = PerspectiveRH(0.75f, aspect, 2.0f, 20000.0f);
 		M4 viewProj = Mul(view, proj);
 
+		// The Make SMP brush: the ray under the mouse (the camera's frame, as LookAtRH builds it; fov 0.75 rad).
+		{
+			ImGuiIO& io = ImGui::GetIO();
+			V3 eye = CameraEye(), at = gCam.target + gCam.pan;
+			V3 z = Norm(eye - at), x = Norm(Cross(V3(0, 0, 1), z)), y = Cross(z, x);
+			float th = std::tan(0.75f / 2);
+			float mx = io.MousePos.x / std::max(1L, rc.right), my = io.MousePos.y / std::max(1L, rc.bottom);
+			int forced = -1;
+			if (stroke[0] >= 0 && frameNo >= 60 && frameNo <= 121) {
+				float t = std::min(1.0f, (frameNo - 60) / 60.0f);
+				mx = stroke[0] + (stroke[2] - stroke[0]) * t; my = stroke[1] + (stroke[3] - stroke[1]) * t;
+				forced = frameNo <= 120 ? 1 : 0;
+				if (frameNo == 121 && buildAfterStroke) maker::gM.buildOnOpen = true;
+			}
+			float nx = mx * 2 - 1, ny = 1 - my * 2;
+			maker::Mouse(eye, Norm(z * -1.0f + x * (nx * th * aspect) + y * (ny * th)), forced);
+		}
+
 		// A click on a bone's dot (Bones shown) picks it for the weights heat map.
 		{
 			ImGuiIO& io = ImGui::GetIO();
@@ -2506,6 +2629,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		if (hr == D3DERR_DEVICELOST && gDev->TestCooperativeLevel() == D3DERR_DEVICENOTRESET) ResetDevice();
 	}
 
+	if (maker::gM.worker.joinable()) maker::gM.worker.join();   // a build still running finishes first
 	ImGui_ImplDX9_Shutdown();
 	ImGui_ImplWin32_Shutdown();
 	ImGui::DestroyContext();

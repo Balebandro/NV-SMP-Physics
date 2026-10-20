@@ -56,10 +56,11 @@ Once a frame, right after New Vegas has animated every actor and before it draws
 | `tools/smpify.cpp` | Makes a skinned coat or skirt an SMP item: cloth bone grid, reweighting, partitions, `SMP Bones`, the XML |
 | `tools/smpdress.cpp` | `smpify` for whole outfits: several cloth pieces (grid or radial), bone chains with rigid pieces, low-poly collision proxies, one XML |
 | `tools/smprepair.cpp` | Puts back the SMP bones Outfit Studio drops on export (unweighted bones and their nodes) and rewrites `SMP Bones` |
+| `tools/smpprepare.cpp` | NV SMP Prepare: pick SMP NIFs made elsewhere (a Skyrim body or outfit); it adds the SMP Bones lists, the physics path and the vertex keep flags they need (`tools/smplist.h`, shared with `smprepair --list`) |
 | `tools/nifdump.cpp` | Lists a NIF's shapes, their bones and connected pieces |
 | `tools/systemtest.cpp` | Runs the plugin's builder and world on a NIF outside the game, laid out as the game has it in memory, and walks it |
 | `tools/scene.cpp` | That in-memory NIF, shared by the test and the previewer |
-| `tools/previewer` | NV SMP Previewer: the item on a moving body in a window, with the plugin's own physics |
+| `tools/previewer` | NV SMP Previewer: the item on a moving body in a window, with the plugin's own physics; `maker.h` its Make SMP window (the NV SMP Maker) |
 | `tools/nifcheck.cpp` | What a tool changed in a NIF, block by block, and whether every skin partition is consistent |
 | `tools/kf.cpp` | Reads and samples `.kf` animations (keyframed and B-spline) |
 | `tools/rigpreviewer` | NV Rig Previewer: weights and rigging checks on posed bodies |
@@ -76,8 +77,8 @@ Visual Studio 2022 C++ build tools (x86).
 
 ```
 build.bat                  the plugin: build\NVSMPPhysics.dll
-tools\build_tools.bat         smpify, smpdress, smprepair, nifcheck, nifdump and systemtest
-tools\build_previewer.bat     build\NVSMPPreviewer.exe
+tools\build_tools.bat         smpify, smpdress, smprepair, nifcheck, nifdump, NVSMPPrepare and systemtest
+tools\build_previewer.bat     build\NVSMPPreviewer.exe and build\NVSMPMaker.exe
 tools\build_rigpreviewer.bat  build\NVRigPreviewer.exe
 ```
 
@@ -110,6 +111,26 @@ file..." plays any `.kf`. Save the XML in any editor and it rebuilds. Overlays s
 in-game menu's. Ctrl + drag moves the body by hand; Screenshot saves the view to `screenshots\`.
 
 ## Making an item
+
+### NV SMP Maker
+
+`NVSMPMaker.exe` (the previewer built with `NVSMP_MAKER`; the previewer's **Make SMP...** button opens the same
+window) makes a plain armour an SMP item without the command line. Open the armour; the body holds still.
+
+- **Paint chains**: paint on the mesh where something should hang and swing, starting where it is tied on and
+  dragging to its end. Each stroke becomes a chain of bones laid along it (`smpdress --painted`): the bone it hangs
+  from is picked from what the start of the stroke was weighted to, the links from its length, and its rigging
+  (swing limits, springs, mass, damping, wind) from two sliders, Stiffness and Weight. The brush's soft edge blends
+  into the mesh's own weights. Tick what the chains collide with, then **Build and preview**.
+- **Outfit**: cloth grids, rope chains and collision options, `smpdress` with every option as a form.
+- **Coat or skirt**: `smpify`. **Fix after Outfit Studio**: `smprepair`.
+
+The output is a folder laid out as `Data` (point it at an empty MO2 mod to install it directly); files it replaces
+are kept as `.bak`. Each build saves its settings beside the XML (`*_smp.xml.smprecipe`, with the painted chains
+in `*.smppaint`); **Load recipe...** brings them back to rebuild or change. **Copy command** gives the command line.
+The Maker runs `smpdress.exe`, `smpify.exe` and `smprepair.exe` from its own folder.
+
+### The command-line tools
 
 ```
 smpify in.nif out.nif "Coat Shape" "Meshes\path\coat_smp.xml" coat_smp.xml --collide "Legs"
