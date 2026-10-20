@@ -35,6 +35,7 @@ namespace hdt
 
 		virtual void readTransform(float timeStep) = 0;
 		virtual void writeTransform() = 0;
+		virtual void followTransform() {}   // New Vegas: see SkinnedMeshWorld::followTransform
 
 		void internalUpdate();
 

@@ -2,6 +2,7 @@
 // exception. The solver set-up and the substepping are FSMP's; the frame, pause, shutdown and
 // camera events become one synchronous doUpdate per game frame.
 #include "hdtSkyrimPhysicsWorld.h"
+#include "hdtSkyrimBone.h"
 
 #include <LinearMath/btQuickprof.h>
 
@@ -21,8 +22,6 @@ namespace hdt
 		getSolverInfo().m_restitutionVelocityThreshold = 0.2f;
 		getSolverInfo().m_solverMode = SOLVER_SIMD;
 		getSolverInfo().m_leastSquaresResidualThreshold = 0.0001f;
-
-		m_averageInterval = m_timeTick;
 	}
 
 	SkyrimPhysicsWorld::~SkyrimPhysicsWorld() noexcept
@@ -46,30 +45,49 @@ namespace hdt
 		LARGE_INTEGER t0, t1, freq;
 		QueryPerformanceCounter(&t0);
 
-		// FSMP's stepping: the tick is the average frame interval, at most m_timeTick (60 Hz), and a
-		// frame that took longer than m_maxSubSteps ticks drops the excess rather than catching up.
+		// New Vegas: a fixed step, m_timeTick (1 / the rate setting), whatever the frame rate. FSMP stepped the frame
+		// time itself above its rate (and whole ticks plus a remainder below it), so the cloth behaved differently at
+		// every frame rate, and a remainder of a sliver of a millisecond kicked it (the joints' error correction scales
+		// with 1 / step). Here the frame's time is banked and spent in whole steps; what is left waits for the next
+		// frame, and a frame with no step puts the bones back on the moving body as last simulated (followTransform).
+		// A frame longer than m_maxSubSteps 60 Hz frames drops the rest rather than catching up.
 		m_accumulatedInterval += interval;
-		m_averageInterval += (interval - m_averageInterval) * .125f;
-		const auto tick = std::min(m_averageInterval, m_timeTick);
+		const float tick = m_timeTick;
+		const int maxSteps = std::max(1, (int)(m_maxSubSteps * (1.0f / 60.0f) / tick + 0.5f));
+		int steps = (int)(m_accumulatedInterval / tick);
+		if (steps > maxSteps) {
+			steps = maxSteps;
+			m_accumulatedInterval = steps * tick;
+		}
 
-		if (m_accumulatedInterval * 2.0f > tick) {
-			const auto remainingTimeStep = std::min(m_accumulatedInterval, tick * m_maxSubSteps);
+		if (steps > 0) {
+			const float remainingTimeStep = steps * tick;
 
 			{
 				NVSMP_PROF(ReadTransform);
+				// The animated bones go as far as the physics advances: it ends this frame behind it by what stays banked.
+				SkyrimBone::s_kinematicFraction = remainingTimeStep / m_accumulatedInterval;
 				readTransform(remainingTimeStep);
+				SkyrimBone::s_kinematicFraction = 1;
 			}
 			m_resetPc -= m_resetPc > 0;
 
 			auto offset = applyTranslationOffset();
-			stepSimulation(remainingTimeStep, 0, tick);
+			stepSimulation(remainingTimeStep, 0, tick * 1.0001f);   // a hair over: n - 1 whole steps and a last one of the same size
 			restoreTranslationOffset(offset);
-			m_accumulatedInterval = 0;
+			m_accumulatedInterval -= remainingTimeStep;
 
 			{
 				NVSMP_PROF(WriteTransform);
+				SkyrimBone::s_stepTime = remainingTimeStep;   // the jitter filter's step
+				SkyrimBone::s_boneByNode.clear();
+				for (auto& s : m_systems)
+					for (auto& b : s->getBones()) { auto* sb = static_cast<SkyrimBone*>(b.get()); SkyrimBone::s_boneByNode[sb->m_node.get()] = sb; }
 				writeTransform();
 			}
+		} else {
+			NVSMP_PROF(WriteTransform);
+			followTransform();
 		}
 
 		QueryPerformanceCounter(&t1);

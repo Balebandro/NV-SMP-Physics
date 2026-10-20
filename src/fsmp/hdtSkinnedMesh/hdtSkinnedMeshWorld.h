@@ -52,6 +52,14 @@ namespace hdt
 			for (int i = 0; i < m_systems.size(); ++i) m_systems[i]->writeTransform();
 		}
 
+		// New Vegas: a frame with no physics step (the physics runs at a fixed rate; a frame shorter than a step takes
+		// none): the bones are put back on their parents as last simulated, so the cloth follows the body.
+		void followTransform()
+		{
+			for (auto& s : m_systems)
+				for (auto& b : s->getBones()) b->followTransform();
+		}
+
 		void applyGravity() override;
 		void applyWind(btScalar timeStep);
 

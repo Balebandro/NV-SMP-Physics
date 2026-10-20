@@ -58,6 +58,5 @@ namespace hdt
 
 		std::mutex m_lock;
 		float m_accumulatedInterval = 0;
-		float m_averageInterval;
 	};
 }

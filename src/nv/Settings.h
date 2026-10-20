@@ -10,8 +10,8 @@ namespace nvsmp
 		int maxActors = 10;            // most actors simulated at once, nearest first
 
 		// FSMP's world settings (its configs.xml defaults).
-		int minFps = 60;               // the simulation's substep rate
-		int maxSubSteps = 4;           // a frame longer than this many substeps drops the rest
+		int minFps = 180;              // the simulation's step rate at least: a frame is cut in equal steps no longer than this (60 fps: 3 steps; 180 kept the cloth's jitter under 0.005 at 60 fps, where 60 gave 0.043)
+		int maxSubSteps = 4;           // a frame longer than this many 60 Hz frames (4: 1/15 s) drops the rest
 		int solverIterations = 10;     // Bullet's constraint solver iterations
 		float gravityScale = 1.0f;
 		bool unclampedResets = true;   // turning faster than the limit below resets the physics
@@ -24,6 +24,10 @@ namespace nvsmp
 		bool collisions = true;         // off: the cloth passes through the body (for finding what pushes it)
 		float waistCollision = 0.0f;    // 0: bones the physics file keeps out of collision stay out; 1: they collide fully
 		bool ground = true;             // a ground plane at the actor's feet the cloth rests on (crouching, sitting)
+
+		// The jitter filter (SkyrimBone::s_filter): smooths what is drawn of each simulated bone, not the physics.
+		bool jitterFilter = true;
+		float jitterSmoothing = 0.5f;   // 0 light (follows every twitch) .. 1 strong (at rest the bones settle slowly)
 
 		int menuKey = 0x76;            // F7
 		int logLevel = 2;              // 0 trace .. 4 errors only

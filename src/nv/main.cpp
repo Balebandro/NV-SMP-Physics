@@ -10,6 +10,7 @@
 #include "Menu.h"
 #include "Settings.h"
 #include "hdtSkyrimPhysicsWorld.h"
+#include "hdtSkyrimBone.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -70,7 +71,7 @@ namespace nvsmp
 			{ "iMinFps", 0, &s.minFps }, { "iMaxSubSteps", 0, &s.maxSubSteps }, { "iSolverIterations", 0, &s.solverIterations },
 			{ "fGravityScale", &s.gravityScale }, { "bUnclampedResets", 0, 0, &s.unclampedResets }, { "fResetAngle", &s.resetAngle },
 			{ "bWind", 0, 0, &s.wind }, { "fWindStrength", &s.windStrength }, { "bWindInInteriors", 0, 0, &s.windInInteriors }, { "bCollisions", 0, 0, &s.collisions },
-			{ "fWaistCollision", &s.waistCollision }, { "bGround", 0, 0, &s.ground },
+			{ "fWaistCollision", &s.waistCollision }, { "bGround", 0, 0, &s.ground }, { "bJitterFilter", 0, 0, &s.jitterFilter }, { "fJitterSmoothing", &s.jitterSmoothing },
 			{ "iMenuKey", 0, &s.menuKey }, { "iLogLevel", 0, &s.logLevel },
 		};
 	}
@@ -93,6 +94,8 @@ namespace nvsmp
 		world->disabled = !s.enabled;
 		world->m_collisionsEnabled = s.collisions;
 		s.waistCollision = std::clamp(s.waistCollision, 0.0f, 1.0f);
+		s.jitterSmoothing = std::clamp(s.jitterSmoothing, 0.0f, 1.0f);
+		hdt::SkyrimBone::SetJitterFilter(s.jitterFilter, s.jitterSmoothing);
 		ActorManager::instance()->applyCollision();
 		Menu::SetKey(s.menuKey);
 	}
