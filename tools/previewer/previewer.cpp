@@ -10,6 +10,7 @@
 #include "datafiles.h"
 #include "kf.h"
 #include "scene.h"
+#include "xmledit.h"
 
 #include "hdtSkinnedMesh/hdtSkinnedMeshShape.h"
 #include "hdtSkyrimBone.h"
@@ -24,9 +25,12 @@
 #include <shellapi.h>
 #include <shobjidl.h>
 
+#include <array>
 #include <cmath>
 #include <deque>
 #include <filesystem>
+#include <fstream>
+#include <numeric>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -56,8 +60,7 @@ static bool gLogScroll = false;
 
 static void AddLog(int level, const std::string& text)
 {
-	gLog.push_back({ level, text });
-	while (gLog.size() > 2000) gLog.pop_front();
+	gLog.push_back({ level, text });	while (gLog.size() > 2000) gLog.pop_front();
 	gLogScroll = true;
 	OutputDebugStringA((text + "\n").c_str());
 }
@@ -319,12 +322,15 @@ struct Settings
 	// Physics (the plugin's F7 menu).
 	bool physics = true;
 	float gravity = 1.0f;
-	int minFps = 60;
+	int minFps = 180;   // as the plugin's default
 	int maxSubSteps = 4;
 	int solverIterations = 10;
 	bool collisions = true;
 	float waistCollision = 0.0f;
 	bool ground = true;
+	bool jitterFilter = true;     // the plugin's jitter filter (SkyrimBone::SetJitterFilter)
+	float jitterSmoothing = 0.5f;
+	float jitterBeta = -1;        // --beta: the filter's speed term, for tuning (-1: the plugin's)
 	bool wind = false;
 	float windStrength = 2.0f;
 	float windDirection = 0.0f;   // degrees, 0 = toward +y (the body's front at start)
@@ -339,6 +345,7 @@ struct Settings
 	bool showBones = false;
 	bool showConstraints = false;
 	bool showColliders = false;
+	std::string heatBone;        // Weights: the bone whose weights the item shows as a heat map (empty: off)
 	bool showFloor = true;
 	bool autoReload = true;
 	float background[3] = { 0.17f, 0.18f, 0.20f };
@@ -372,6 +379,7 @@ static fs::file_time_type TimeOf(const std::string& p)
 static void ApplyWorldSettings()
 {
 	auto* world = hdt::SkyrimPhysicsWorld::get();
+	hdt::SkyrimBone::SetJitterFilter(gS.jitterFilter, gS.jitterSmoothing, gS.jitterBeta);
 	gS.minFps = std::clamp(gS.minFps, 30, 240);
 	gS.maxSubSteps = std::clamp(gS.maxSubSteps, 1, 16);
 	gS.solverIterations = std::clamp(gS.solverIterations, 1, 64);
@@ -384,6 +392,11 @@ static void ApplyWorldSettings()
 	world->m_collisionsEnabled = gS.collisions;
 	world->m_unclampedResets = false;   // the previewer's turns are deliberate
 }
+
+// The physics file's numbers as the Bone values panel has them (xmledit.h).
+static xmledit::Doc gXml;
+static std::string gXmlPath;
+static bool gOpenValues = false;   // --values: the panel starts open (for screenshots)
 
 // Builds (or rebuilds) the physics for the loaded item from its XML.
 static void BuildSystem()
@@ -405,11 +418,21 @@ static void BuildSystem()
 		// Not under a Data folder: next to the NIF, by file name.
 		std::string base = fs::path(gItem.xmlNamed).filename().string();
 		auto next = fs::path(gItem.nifPath).parent_path() / base;
-		if (fs::exists(next)) gItem.xmlPath = next.string();
+		if (fs::exists(next)) {
+			gItem.xmlPath = next.string();
+			// The game only looks where the NIF says (Data folders and archives), not next to the NIF.
+			AddLog(3, "physics file '" + gItem.xmlNamed + "' is not in any Data folder: using the one next to the NIF. "
+			          "The game will NOT find it there: install it at Data\\" + gItem.xmlNamed + " or change the NIF's path.");
+		}
 	}
 	gItem.xmlTime = TimeOf(gItem.xmlPath);
-	std::string xml = gItem.xmlPath;
-	scene::gReadFile = [xml](const char*) { return xml.empty() ? std::string() : datafiles::ReadFile(xml); };
+	std::string xml = gItem.xmlPath;	// The physics is built from the file with the Bone values panel's edits in; a file that changed on disk (saved,
+	// edited by hand, another item) is read afresh and its edits dropped.
+	if (!xml.empty()) {
+		std::string text = datafiles::ReadFile(xml);
+		if (text != gXml.text || xml != gXmlPath) { gXml.Parse(text); gXmlPath = xml; }
+	} else { gXml = xmledit::Doc(); gXmlPath.clear(); }
+	scene::gReadFile = [](const char*) { return gXml.Compose(); };
 	if (xml.empty()) {
 		AddLog(4, "physics file '" + gItem.xmlNamed + "' not found in any Data folder or next to the NIF");
 		return;
@@ -443,6 +466,9 @@ static void BuildSystem()
 // Two ways to move the body. With the game's skeleton and its locomotion animations found (loose .kf files
 // in the Data folders), the presets play them: crossfaded as the game blends, the body carried by each
 // clip's own root motion so the feet stay planted. Without, a procedural stride on the legs.
+
+static const char* kSwayTip = "How far the constraint swings to the sides (its y limit): -1 not at all, 0 as its template has it, 1 two and a half "
+	"times as far (at most 1.5 rad). Leaves its forward-back swing and twist as they are.";
 
 static const char* kPresets[] = { "Stand", "Walk", "Run", "Walk in circles", "Spin in place", "Start and stop", "Jumping", "Sneak", "Sneak walk", "Drive (WASD)", "Animation file" };
 enum { kStand, kWalk, kRun, kCircles, kSpin, kStartStop, kJumping, kSneak, kSneakWalk, kDrive, kCustom };
@@ -901,6 +927,8 @@ static void LoadItem(const std::string& path)
 			std::string n = info.geometry->m_name ? info.geometry->m_name : "";
 			for (auto& c : n) c = (char)tolower((unsigned char)c);
 			if (n.find("cap") != std::string::npos || n.find("meathead") != std::string::npos) d.visible = false;
+			// smpdress --proxy collision stand-ins are app-culled: never drawn in game.
+			if (n.rfind("smp proxy:", 0) == 0) d.visible = false;
 		}
 		gItem.shapes.push_back(std::move(d));
 	}
@@ -1079,6 +1107,93 @@ static void DrawLines(const std::vector<LineVertex>& lines, D3DPRIMITIVETYPE typ
 	gDev->SetRenderState(D3DRS_ZENABLE, TRUE);
 }
 
+// Weights heat map (as the rig previewer's): dark blue at 0, through blue, cyan, green and yellow to red at 1.
+static D3DCOLOR Heat(float w, float shade = 1.0f)
+{
+	w = std::clamp(w, 0.0f, 1.0f);
+	float r, g, b;
+	if (w <= 0.0f) { r = 18 / 255.0f; g = 22 / 255.0f; b = 70 / 255.0f; }
+	else {
+		const float stops[][3] = { { 0.10f, 0.15f, 0.75f }, { 0.0f, 0.75f, 0.95f }, { 0.15f, 0.85f, 0.25f }, { 0.95f, 0.90f, 0.15f }, { 0.95f, 0.15f, 0.10f } };
+		float x = w * 4.0f;
+		int i = std::min(3, (int)x);
+		float t = x - i;
+		r = stops[i][0] + (stops[i + 1][0] - stops[i][0]) * t; g = stops[i][1] + (stops[i + 1][1] - stops[i][1]) * t; b = stops[i][2] + (stops[i + 1][2] - stops[i][2]) * t;
+	}
+	auto c = [&](float v) { return (int)std::clamp(v * shade * 255.0f, 0.0f, 255.0f); };
+	return D3DCOLOR_ARGB(255, c(r), c(g), c(b));
+}
+
+static const char* SkinBoneName(const ShapeDraw& s, int slot)
+{
+	auto* skin = s.info.geometry->skinInstance;
+	if (!skin || slot < 0 || slot >= (int)skin->boneCount || !skin->bones[slot]) return nullptr;
+	return skin->bones[slot]->m_name;
+}
+
+// The chain being edited in Bone values (hovered, dragged, or pinned with its show button): its bones (lower case)
+// and constraints (bodyA, bodyB), highlighted in the view in place of the heat-map bone. Set by the panel each frame.
+static std::set<std::string> gHighlightBones;
+static std::vector<std::pair<std::string, std::string>> gHighlightLinks;
+static int gPinChain = -1;   // --chain N: the chain pinned at start (for screenshots)
+static bool gRealtime = false;   // --realtime: measuring (--jitter, --clip...) at the real frame time instead of a fixed 120 Hz
+static float gMeasureStep = 1.0f / 120.0f;   // --step s: the fixed frame time when measuring
+
+// A shape's weight on the heat-map bone, or on the highlighted chain's bones together, per vertex (several skin
+// slots can name the same bone).
+static float HeatWeight(const ShapeDraw& s, int v)
+{
+	float w = 0;
+	for (auto& [slot, wt] : s.weights[v]) {
+		const char* n = SkinBoneName(s, slot);
+		if (!n) continue;
+		if (!gHighlightBones.empty()) {
+			std::string l = n;
+			for (auto& c : l) c = (char)tolower((unsigned char)c);
+			if (gHighlightBones.count(l)) w += wt;
+		} else if (_stricmp(n, gS.heatBone.c_str()) == 0) w += wt;
+	}
+	return w;
+}
+
+// Every bone the item's shapes are skinned to, sorted (SMP bones last).
+static std::vector<std::string> SkinBoneNames()
+{
+	std::set<std::string> names;
+	for (auto& s : gItem.shapes) {
+		auto* skin = s.info.geometry->skinInstance;
+		if (!skin) continue;
+		for (uint32_t b = 0; b < skin->boneCount; b++) if (const char* n = SkinBoneName(s, (int)b)) names.insert(n);
+	}
+	std::vector<std::string> out(names.begin(), names.end());
+	std::stable_partition(out.begin(), out.end(), [](const std::string& n) { return _strnicmp(n.c_str(), "SMP", 3) != 0; });
+	return out;
+}
+
+// A shape drawn as the heat map of the chosen bone's weights, lit by the key light (no texture).
+static void DrawHeat(const ShapeDraw& s)
+{
+	V3 key = Norm(V3(0.35f, 0.6f, 0.7f));
+	std::vector<LineVertex> v(s.verts.size());
+	for (size_t i = 0; i < s.verts.size(); i++) {
+		auto& m = s.verts[i];
+		V3 n(m.nx, m.ny, m.nz);
+		float l = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+		float shade = l > 1e-6f ? 0.55f + 0.45f * std::fabs((n.x * key.x + n.y * key.y + n.z * key.z) / l) : 1.0f;
+		v[i] = { m.px, m.py, m.pz, Heat(i < s.weights.size() ? HeatWeight(s, (int)i) : 0.0f, shade) };
+	}
+	gDev->SetVertexShader(nullptr);
+	gDev->SetPixelShader(nullptr);
+	gDev->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE);
+	gDev->SetTexture(0, nullptr);
+	gDev->SetRenderState(D3DRS_LIGHTING, FALSE);
+	gDev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, (UINT)v.size(), (UINT)s.indices.size() / 3, s.indices.data(), D3DFMT_INDEX16, v.data(), sizeof(LineVertex));
+	// Back to the item's shaders for the next shape.
+	gDev->SetVertexShader(gVS);
+	gDev->SetPixelShader(gPS);
+	gDev->SetVertexDeclaration(gDecl);
+}
+
 static void DrawScene(const M4& viewProj, const M4& view, const M4& proj)
 {
 	gDev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
@@ -1122,6 +1237,7 @@ static void DrawScene(const M4& viewProj, const M4& view, const M4& proj)
 		auto& s = gItem.shapes[i];
 		if (!s.visible || s.indices.empty()) continue;
 		SkinShape(s);
+		if (!gS.heatBone.empty() || !gHighlightBones.empty()) { DrawHeat(s); continue; }
 		bool tex = gS.textures && s.texture && !s.info.uvs.empty();
 		const float white[4] = { 1, 1, 1, 1 };
 		SetPS(tex ? white : kPalette[i % 6], tex ? 1.0f : 0.0f, s.info.alpha && tex ? 1.0f : 0.0f, 0);
@@ -1164,11 +1280,35 @@ static void DrawScene(const M4& viewProj, const M4& view, const M4& proj)
 				auto* bone = static_cast<hdt::SkyrimBone*>(b.get());
 				bool dyn = !bone->m_rig.isStaticOrKinematicObject();
 				D3DCOLOR c = dyn ? D3DCOLOR_ARGB(255, 255, 170, 40) : D3DCOLOR_ARGB(255, 150, 160, 180);
+				if (!gS.heatBone.empty() && _stricmp(bone->m_name.c_str(), gS.heatBone.c_str()) == 0) c = D3DCOLOR_ARGB(255, 255, 255, 255);   // the heat-map bone
 				V3 p = P(bone->m_node->world.translate);
 				points.push_back({ p.x, p.y, p.z, c });
 				RE::NiAVObject* parent = bone->m_anchor ? (RE::NiAVObject*)bone->m_anchor.get() : (RE::NiAVObject*)bone->m_node->parent;
 				if (parent && parent != gItem.scene.skeleton.actor) add(P(parent->world.translate), p, dyn ? D3DCOLOR_ARGB(255, 200, 130, 30) : D3DCOLOR_ARGB(255, 100, 108, 125));
 			}
+		}
+		DrawLines(lines, D3DPT_LINELIST, true);
+		DrawLines(points, D3DPT_POINTLIST, true);
+	}
+
+	// The chain being edited: its links and bones in white, through everything (Bones on or off).
+	if (gItem.system && !gHighlightLinks.empty()) {
+		std::map<std::string, V3> at;
+		for (auto& b : gItem.system->getBones()) {
+			auto* bone = static_cast<hdt::SkyrimBone*>(b.get());
+			std::string n = bone->m_name.c_str();
+			for (auto& c : n) c = (char)tolower((unsigned char)c);
+			at[n] = V3(bone->m_node->world.translate);
+		}
+		std::vector<LineVertex> lines, points;
+		const D3DCOLOR white = D3DCOLOR_ARGB(255, 255, 255, 255);
+		for (auto& [a, b] : gHighlightLinks) {
+			auto ia = at.find(a), ib = at.find(b);
+			if (ia == at.end() || ib == at.end()) continue;
+			lines.push_back({ ia->second.x, ia->second.y, ia->second.z, white });
+			lines.push_back({ ib->second.x, ib->second.y, ib->second.z, white });
+			points.push_back({ ia->second.x, ia->second.y, ia->second.z, white });
+			points.push_back({ ib->second.x, ib->second.y, ib->second.z, white });
 		}
 		DrawLines(lines, D3DPT_LINELIST, true);
 		DrawLines(points, D3DPT_POINTLIST, true);
@@ -1189,12 +1329,43 @@ static void Help(const char* text)
 	}
 }
 
+// The settings as the previewer starts (the undo buttons' "default").
+static const Settings kDefaults;
+
+static std::string Shown(float v) { char b[32]; snprintf(b, sizeof b, "%g", v); return b; }
+static std::string Shown(int v) { return std::to_string(v); }
+static std::string Shown(bool v) { return v ? "on" : "off"; }
+static std::string Shown(const std::string& v) { return v.empty() ? "(off)" : v; }
+
+// An undo button after the last item: greyed out while the value is as it was, else puts it back. True when clicked.
+static bool UndoButton(const char* id, bool differs, const std::string& was)
+{
+	ImGui::SameLine();
+	ImGui::BeginDisabled(!differs);
+	ImGui::PushID(id);
+	bool clicked = ImGui::SmallButton("undo");
+	ImGui::PopID();
+	ImGui::EndDisabled();
+	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(differs ? "back to %s" : "as it was (%s)", was.c_str());
+	return clicked;
+}
+
+template <class T>
+static bool Undo(const char* id, T& v, const T& was)
+{
+	if (!UndoButton(id, !(v == was), Shown(was))) return false;
+	v = was;
+	return true;
+}
+
 static void Panels(float fps)
 {
+	gHighlightBones.clear();   // set again below while a chain is hovered, dragged or pinned
+	gHighlightLinks.clear();
 	auto* world = hdt::SkyrimPhysicsWorld::get();
 	ImGuiIO& io = ImGui::GetIO();
 	ImGui::SetNextWindowPos(ImVec2(8, 8), ImGuiCond_FirstUseEver);
-	ImGui::SetNextWindowSize(ImVec2(360, io.DisplaySize.y - 16), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(ImVec2(440, io.DisplaySize.y - 16), ImGuiCond_FirstUseEver);
 	ImGui::Begin("NV SMP Previewer");
 
 	if (ImGui::Button("Open NIF...")) OpenDialog();
@@ -1220,7 +1391,7 @@ static void Panels(float fps)
 		ImGui::TextWrapped("Open an SMP NIF (or drop one on the window).");
 	}
 
-	if (ImGui::CollapsingHeader("Motion", ImGuiTreeNodeFlags_DefaultOpen)) {
+	if (ImGui::CollapsingHeader("Motion", gOpenValues ? 0 : ImGuiTreeNodeFlags_DefaultOpen)) {
 		if (ImGui::Combo("Motion##preset", &gS.preset, kPresets, IM_ARRAYSIZE(kPresets))) {   // own ID: the header is "Motion" too
 			// The sneak presets crouch; leaving them stands up.
 			bool sneakPreset = gS.preset == kSneak || gS.preset == kSneakWalk;
@@ -1259,13 +1430,18 @@ static void Panels(float fps)
 				ImGui::TreePop();
 			}
 		}
+		ImGui::PushItemWidth(-ImGui::GetFontSize() * 7);
 		ImGui::SliderFloat("Speed", &gS.speedScale, 0.1f, 2.0f, "%.2f x");
-		ImGui::SliderFloat("Time", &gS.timeScale, 0.05f, 1.0f, "%.2f x"); Help("Slow motion: the body and the physics both slow down.");
+		Undo("speed", gS.speedScale, kDefaults.speedScale);
+		ImGui::SliderFloat("Time", &gS.timeScale, 0.05f, 1.0f, "%.2f x");
+		Undo("time", gS.timeScale, kDefaults.timeScale);
+		Help("Slow motion: the body and the physics both slow down.");
+		ImGui::PopItemWidth();
 		if (ImGui::Button("Back to start")) { gMotion = Motion(); gAnim.current = gAnim.previous = ClipPlay(); world->resetSystems(); }
 		ImGui::TextDisabled("Ctrl + drag: move the body by hand");
 	}
 
-	if (ImGui::CollapsingHeader("Physics", ImGuiTreeNodeFlags_DefaultOpen)) {
+	if (ImGui::CollapsingHeader("Physics", gOpenValues ? 0 : ImGuiTreeNodeFlags_DefaultOpen)) {
 		bool changed = false;
 		if (ImGui::Button("Reset physics")) { AddLog(2, "physics reset"); BuildSystem(); }
 		Help("As the game's F7 menu: throws the physics away and builds it again from the XML, the cloth at rest on the body as it is now.");
@@ -1273,36 +1449,347 @@ static void Panels(float fps)
 		if (ImGui::Button("Reset pose")) world->resetSystems();
 		Help("Only puts the cloth back at rest, keeping the physics as built.");
 		ImGui::Checkbox("Simulate", &gS.physics);
+		Undo("simulate", gS.physics, kDefaults.physics);
+		ImGui::PushItemWidth(-ImGui::GetFontSize() * 13);   // room for the labels and the undo buttons
 		changed |= ImGui::SliderFloat("Gravity", &gS.gravity, 0.0f, 3.0f, "%.2f x");
-		changed |= ImGui::SliderInt("Rate (min fps)", &gS.minFps, 30, 240); Help("Physics steps per second at least (FSMP's min-fps).");
+		changed |= Undo("gravity", gS.gravity, kDefaults.gravity);
+		changed |= ImGui::SliderInt("Rate (min fps)", &gS.minFps, 30, 240);
+		changed |= Undo("rate", gS.minFps, kDefaults.minFps);
+		Help("Physics steps per second at least (FSMP's min-fps).");
 		changed |= ImGui::SliderInt("Max substeps", &gS.maxSubSteps, 1, 16);
+		changed |= Undo("substeps", gS.maxSubSteps, kDefaults.maxSubSteps);
 		changed |= ImGui::SliderInt("Solver iterations", &gS.solverIterations, 1, 64);
+		changed |= Undo("iterations", gS.solverIterations, kDefaults.solverIterations);
 		changed |= ImGui::Checkbox("Collisions", &gS.collisions);
-		ImGui::SameLine();
-		if (ImGui::Checkbox("Ground collision", &gS.ground) && gItem.loaded) BuildSystem();
+		changed |= Undo("collisions", gS.collisions, kDefaults.collisions);
+		bool rebuild = ImGui::Checkbox("Ground collision", &gS.ground);
+		rebuild |= Undo("ground", gS.ground, kDefaults.ground);
 		Help("As the game's F7 menu: a ground plane at the feet the cloth rests on when crouching or sitting (the floor grid is at its height).");
 		ImGui::SliderFloat("Waist collision", &gS.waistCollision, 0.0f, 1.0f, "%.2f");
-		bool waistReleased = ImGui::IsItemDeactivatedAfterEdit();
+		rebuild |= ImGui::IsItemDeactivatedAfterEdit();
+		rebuild |= Undo("waist", gS.waistCollision, kDefaults.waistCollision);
 		Help("As in the game's F7 menu: the rows the physics file keeps out of collision. 0 = they follow the body, 1 = they collide. Rebuilds on release.");
-		if (waistReleased && gItem.loaded) BuildSystem();
+		if (rebuild && gItem.loaded) BuildSystem();
+		changed |= ImGui::Checkbox("Jitter filter", &gS.jitterFilter);
+		changed |= Undo("filter", gS.jitterFilter, kDefaults.jitterFilter);
+		Help("As in the game's F7 menu: smooths the small fast shaking of the cloth (what is drawn, not the physics). The Chains readouts in Bone values show the jitter left.");
+		if (gS.jitterFilter) {
+			changed |= ImGui::SliderFloat("Jitter smoothing", &gS.jitterSmoothing, 0.0f, 1.0f, "%.2f");
+			changed |= Undo("smoothing", gS.jitterSmoothing, kDefaults.jitterSmoothing);
+		}
 		changed |= ImGui::Checkbox("Wind", &gS.wind);
+		changed |= Undo("wind", gS.wind, kDefaults.wind);
 		if (gS.wind) {
 			changed |= ImGui::SliderFloat("Wind strength", &gS.windStrength, 0.0f, 10.0f, "%.2f");
+			changed |= Undo("windstrength", gS.windStrength, kDefaults.windStrength);
 			ImGui::SliderFloat("Wind from", &gS.windDirection, -180.0f, 180.0f, "%.0f deg");
+			Undo("winddir", gS.windDirection, kDefaults.windDirection);
 			ImGui::Checkbox("Gusts", &gS.windGusts);
+			Undo("gusts", gS.windGusts, kDefaults.windGusts);
 		}
+		ImGui::PopItemWidth();
 		if (changed) ApplyWorldSettings();
 	}
 
-	if (ImGui::CollapsingHeader("Display", ImGuiTreeNodeFlags_DefaultOpen)) {
-		ImGui::Checkbox("Textures", &gS.textures); ImGui::SameLine();
-		ImGui::Checkbox("Wireframe", &gS.wireframe); ImGui::SameLine();
-		ImGui::Checkbox("Floor", &gS.showFloor);
-		ImGui::Checkbox("Bones", &gS.showBones); ImGui::SameLine();
-		ImGui::Checkbox("Constraints", &gS.showConstraints); ImGui::SameLine();
-		ImGui::Checkbox("Collision", &gS.showColliders);
+	if (gOpenValues) ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+	if (ImGui::CollapsingHeader("Bone values")) {
+		static bool live = false;
+		if (gXml.blocks.empty()) ImGui::TextDisabled(gItem.xmlPath.empty() ? "No physics file loaded." : "Nothing to edit in the physics file.");
+		else {
+			bool rebuild = false;
+			static float stiff = 0, heavy = 0, lively = 0;   // the master sliders (below), at the middle for each file read
+			static int forVersion = -1;
+			if (forVersion != gXml.version) { stiff = heavy = lively = 0; forVersion = gXml.version; }
+			ImGui::BeginDisabled(!gXml.Edited());
+			if (ImGui::Button("Save to XML")) {
+				// A backup of the file as it was before the first save from here.
+				std::string bak = gItem.xmlPath + ".bak";
+				if (!fs::exists(bak)) { std::error_code ec; fs::copy_file(gItem.xmlPath, bak, ec); }
+				std::ofstream o(gItem.xmlPath, std::ios::binary);
+				if (o) {
+					o << gXml.Compose();
+					o.close();
+					AddLog(2, "saved the bone values to " + gItem.xmlPath + " (the file as it was: " + bak + ")");
+					rebuild = true;   // reads the saved file afresh: its values become the new originals
+				} else AddLog(4, "could not write " + gItem.xmlPath);
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Reset values")) { gXml.Reset(); stiff = heavy = lively = 0; rebuild = true; }
+			ImGui::EndDisabled();
+			ImGui::SameLine();
+			ImGui::Checkbox("Rebuild while dragging", &live);
+			Help("The physics is rebuilt from the file with these values when a slider is let go (the cloth starts again at rest). "
+			     "While dragging: rebuilt every change. Nothing is written to the file until Save. Ctrl + click a slider to type a value.");
+
+			// The master sliders: the whole cloth at once (xmledit::ApplyMasters). The middle is the file.
+			auto master = [&](const char* id, const char* left, const char* right, float& v, const char* help) {
+				ImGui::PushID(id);
+				ImGui::TextUnformatted(left);
+				ImGui::SameLine(ImGui::GetFontSize() * 4.5f);
+				ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 7.5f);
+				bool changed = ImGui::SliderFloat("##v", &v, -1.0f, 1.0f, v == 0 ? "as the file" : "%+.2f");
+				bool released = ImGui::IsItemDeactivatedAfterEdit();
+				if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) { v = 0; changed = released = true; }   // right click: back to the file
+				ImGui::SameLine();
+				ImGui::TextUnformatted(right);
+				if (UndoButton("undo", v != 0, "as the file")) { v = 0; changed = released = true; }
+				Help(help);
+				ImGui::PopID();
+				if (changed) { xmledit::ApplyMasters(gXml, stiff, heavy); xmledit::ApplyCalm(gXml, lively); }
+				if (released || (live && changed)) rebuild = true;
+			};
+			master("stiff", "Soft", "Stiff", stiff,
+				"How firmly the cloth keeps its shape. Stiff: it springs back to the shape it was modelled in and bends less. "
+				"Soft: it relaxes and hangs, folding freely. Sets every cloth joint's springs (angularStiffness) and swing limits. Right click: back to the file.");
+			master("heavy", "Flowy", "Heavy", heavy,
+				"How heavy the cloth feels. Heavy: it moves slowly and settles, as thick wool or leather. Flowy: light and lively, it flutters "
+				"and swings. Sets the cloth bones' damping. Right click: back to the file.");
+			master("lively", "Calm", "Lively", lively,
+				"How much the cloth's joints may jitter. Calm: each joint's swing is braked, so small shakes die out at once (too calm feels "
+				"sluggish). Lively: little braking, so it reacts to every jolt. Sets the cloth joints' damping (angularDamping). Right click: back to the file.");
+
+			// Jitter: the plugin's own measure (SkyrimBone::m_jitter, on what is drawn; m_rawJitter, the physics before
+			// the jitter filter), averaged over a chain's bones.
+			auto lower = [](std::string s) { for (auto& c : s) c = (char)tolower((unsigned char)c); return s; };
+			std::map<std::string, hdt::SkyrimBone*> boneByName;
+			if (gItem.system)
+				for (auto& b : gItem.system->getBones()) boneByName[lower(b->m_name.c_str())] = static_cast<hdt::SkyrimBone*>(b.get());
+			auto chainJitterOf = [&](const xmledit::Chain& c, bool raw) {
+				float s = 0; int k = 0;
+				for (auto& l : c.links) {
+					auto it = boneByName.find(lower(l.bodyA));
+					if (it == boneByName.end() || it->second->m_rig.isStaticOrKinematicObject() || it->second->m_jitterSamples < 3) continue;
+					s += raw ? it->second->m_rawJitter : it->second->m_jitter; k++;
+				}
+				return k ? s / k : -1.0f;
+			};
+			auto chainJitter = [&](const xmledit::Chain& c) { return chainJitterOf(c, false); };
+
+			// Chains: each cloth column and rope on its own.
+			if (gOpenValues) ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+			if (ImGui::TreeNode("Chains", "Chains (%zu)", gXml.chains.size())) {
+				Help("Each chain (a cloth column from the collar down, a rope) on its own: Soft-Stiff and Calm-Lively as the master sliders, "
+				     "for that chain only, on top of the templates. Jitter: the plugin's measure of the zig-zag shaking left in what is drawn (units per physics step; green under 0.005, yellow under 0.02, red above). Hover it for the physics before the jitter filter (Physics > Jitter filter). "
+				     "show: the chain's middle bone in the weights heat map, to see which part of the cloth it is. Right click a slider: back to the template.");
+				float meanJ = 0;
+				{ int k = 0; for (auto& c : gXml.chains) { float j = chainJitter(c); if (j >= 0) { meanJ += j; k++; } } if (k) meanJ /= k; }
+				if (meanJ > 0) ImGui::TextDisabled("average jitter %.4f (physics before the filter %.4f)", meanJ, [&] { float s = 0; int k = 0; for (auto& c : gXml.chains) { float r = chainJitterOf(c, true); if (r >= 0) { s += r; k++; } } return k ? s / k : 0.0f; }());
+				// The chain being edited: the one hovered or dragged, else the one pinned with its show button.
+				static int pinned = -1, pinnedFor = -1;
+				if (pinnedFor != gXml.version) { pinned = gPinChain; pinnedFor = gXml.version; }
+				int focus = -1;
+				static int shown = -1;   // last frame's highlighted chain, to colour its row
+				for (size_t ci = 0; ci < gXml.chains.size(); ci++) {
+					auto& c = gXml.chains[ci];
+					ImGui::PushID((int)ci);
+					ImGui::BeginGroup();
+					int removed = 0;
+					for (auto& l : c.links) removed += l.removed;
+					bool edited = removed > 0;
+					for (auto& l : c.links) edited |= l.stiff != l.origStiff || l.lively != l.origLively || l.sway != l.origSway;
+					float j = chainJitter(c);
+					ImVec4 jc = j < 0 ? ImVec4(0.6f, 0.6f, 0.6f, 1) : j < 0.005f ? ImVec4(0.5f, 0.9f, 0.5f, 1) : j < 0.02f ? ImVec4(1, 0.85f, 0.4f, 1) : ImVec4(1, 0.45f, 0.4f, 1);
+					bool lit = (int)ci == shown;
+					// Physics on or off for the whole chain (ticked only while every constraint is on): off, its constraints are removed and its
+					// bones follow the animation as modelled.
+					{
+						bool on = removed == 0;
+						if (ImGui::Checkbox("##physics", &on)) { for (auto& l : c.links) l.removed = !on; rebuild = true; }
+						if (ImGui::IsItemHovered()) ImGui::SetTooltip(on ? "physics on: untick to remove this chain's constraints (its bones then follow the animation)" : "physics off (or partly): tick to put every constraint back");
+						ImGui::SameLine();
+					}
+					if (lit || edited) ImGui::PushStyleColor(ImGuiCol_Text, lit ? ImVec4(0.45f, 0.9f, 1, 1) : ImVec4(1, 0.8f, 0.4f, 1));
+					ImGui::TextUnformatted(c.label.c_str());
+					if (lit || edited) ImGui::PopStyleColor();
+					ImGui::SameLine();
+					if (j >= 0) {
+						ImGui::TextColored(jc, "jitter %.4f", j);
+						if (ImGui::IsItemHovered()) ImGui::SetTooltip("before the jitter filter: %.4f", chainJitterOf(c, true));
+					}
+					ImGui::SameLine();
+					if (ImGui::SmallButton(pinned == (int)ci ? "hide" : "show")) pinned = pinned == (int)ci ? -1 : (int)ci;
+					if (UndoButton("physics", removed > 0, "every constraint on")) { for (auto& l : c.links) l.removed = false; rebuild = true; }
+					// Two sliders side by side, each with its undo (back to the value the file has, or the template's).
+					const float undoW = ImGui::CalcTextSize("undo").x + ImGui::GetStyle().FramePadding.x * 2 + ImGui::GetStyle().ItemSpacing.x;
+					const float sliderW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f - undoW;
+					// A slider with its undo; soft-stiff goes to 2 (past 1 the swing narrows, to none at 2: locked).
+					// Returns 1 when moved, 2 when undone (back to was).
+					auto slider = [&](const char* id, const char* fmtL, float& v, float hi, bool differs, const std::string& wasText, const char* tip = nullptr) {
+						ImGui::SetNextItemWidth(sliderW);
+						char fmt[48];
+						if (v >= 2.0f) snprintf(fmt, sizeof fmt, "locked");
+						else snprintf(fmt, sizeof fmt, v == 0 ? "%s" : "%s %%+.2f", fmtL);
+						bool ch = ImGui::SliderFloat(id, &v, -1.0f, hi, fmt);
+						if (ImGui::IsItemActive()) focus = (int)ci;
+						if (hi > 1 && ImGui::IsItemHovered()) ImGui::SetTooltip("-1 soft .. 1 stiff; past 1 the joint swings less and less, at 2 it is locked: the link holds its pose on the bone it hangs from (static at a knot).");
+						if (tip && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+						bool rel = ImGui::IsItemDeactivatedAfterEdit();
+						if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) { v = 0; ch = rel = true; }
+						int result = ch || rel ? 1 : 0;
+						if (UndoButton(id, differs, wasText)) result = 2;
+						if (rel || result == 2 || (live && ch)) rebuild = true;
+						return result;
+					};
+					// The chain's sliders set every constraint of the chain; undo puts each back as the file has it.
+					{
+						bool stiffDiffers = false, livelyDiffers = false;
+						for (auto& l : c.links) { stiffDiffers |= l.stiff != l.origStiff; livelyDiffers |= l.lively != l.origLively; }
+						int r = slider("##stiff", "soft-stiff", c.stiff, 2.0f, stiffDiffers, "each constraint as in the file");
+						if (r == 1) for (auto& l : c.links) l.stiff = c.stiff;
+						if (r == 2) { for (auto& l : c.links) l.stiff = l.origStiff; c.stiff = c.origStiff; }
+						ImGui::SameLine();
+						r = slider("##lively", "calm-lively", c.lively, 1.0f, livelyDiffers, "each constraint as in the file");
+						if (r == 1) for (auto& l : c.links) l.lively = c.lively;
+						if (r == 2) { for (auto& l : c.links) l.lively = l.origLively; c.lively = c.origLively; }
+						bool swayDiffers = false;
+						for (auto& l : c.links) swayDiffers |= l.sway != l.origSway;
+						r = slider("##sway", "side sway", c.sway, 1.0f, swayDiffers, "each constraint as in the file", kSwayTip);
+						if (r == 1) for (auto& l : c.links) l.sway = c.sway;
+						if (r == 2) { for (auto& l : c.links) l.sway = l.origSway; c.sway = c.origSway; }
+					}
+					// Each constraint on its own: unticked, it is removed and its bone (the first named) follows the animation.
+					if (ImGui::TreeNode("##links", "constraints (%d of %zu on)", (int)c.links.size() - removed, c.links.size())) {
+						for (size_t li = 0; li < c.links.size(); li++) {
+							auto& l = c.links[li];
+							ImGui::PushID((int)li);
+							bool on = !l.removed;
+							std::string label = l.bodyA + "  ->  " + l.bodyB;
+							if (ImGui::Checkbox(label.c_str(), &on)) { l.removed = !on; rebuild = true; }
+							if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s hangs from %s (template %s). Untick: the constraint is removed and %s follows the animation.", l.bodyA.c_str(), l.bodyB.c_str(), l.tmpl.c_str(), l.bodyA.c_str());
+							if (UndoButton("link", l.removed, "on")) { l.removed = false; rebuild = true; }
+							// This constraint's own sliders (the chain's set them all).
+							if (!l.removed) {
+								ImGui::Indent();
+								auto was = [](float v) { return v == 0 ? std::string("the template") : Shown(v); };
+								if (slider("##lstiff", "soft-stiff", l.stiff, 2.0f, l.stiff != l.origStiff, was(l.origStiff)) == 2) l.stiff = l.origStiff;
+								ImGui::SameLine();
+								if (slider("##llively", "calm-lively", l.lively, 1.0f, l.lively != l.origLively, was(l.origLively)) == 2) l.lively = l.origLively;
+								if (slider("##lsway", "side sway", l.sway, 1.0f, l.sway != l.origSway, was(l.origSway), kSwayTip) == 2) l.sway = l.origSway;
+								ImGui::Unindent();
+							}
+							ImGui::PopID();
+						}
+						ImGui::TreePop();
+					}
+					ImGui::EndGroup();
+					if (focus < 0 && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) focus = (int)ci;
+					ImGui::PopID();
+				}
+				shown = focus >= 0 ? focus : pinned;
+				if (shown >= 0 && shown < (int)gXml.chains.size()) {
+					auto lower = [](std::string s) { for (auto& ch : s) ch = (char)tolower((unsigned char)ch); return s; };
+					for (auto& l : gXml.chains[shown].links) {
+						gHighlightBones.insert(lower(l.bodyA));
+						gHighlightBones.insert(lower(l.bodyB));
+						gHighlightLinks.push_back({ lower(l.bodyA), lower(l.bodyB) });
+					}
+				}
+				ImGui::TreePop();
+			}
+			ImGui::Separator();
+			ImGui::PushItemWidth(-ImGui::GetFontSize() * 14);   // room for the longer labels (angularLowerLimit) and the undo
+			for (size_t b = 0; b < gXml.blocks.size(); b++) {
+				auto& block = gXml.blocks[b];
+				bool blockEdited = false;
+				for (auto& f : block.fields) for (int s : f.slots) blockEdited |= gXml.slots[s].value != gXml.slots[s].original;
+				ImGui::PushID((int)b);
+				if (blockEdited) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.8f, 0.4f, 1));
+				bool open = ImGui::TreeNode("##block", "%s%s", block.label.c_str(), blockEdited ? "  *" : "");
+				if (blockEdited) ImGui::PopStyleColor();
+				if (open) {
+					for (size_t fi = 0; fi < block.fields.size(); fi++) {
+						auto& f = block.fields[fi];
+						ImGui::PushID((int)fi);
+						float lo, hi;
+						xmledit::Range(f.label, gXml.slots[f.slots[0]].value, lo, hi);
+						bool edited = false;
+						for (int s : f.slots) edited |= gXml.slots[s].value != gXml.slots[s].original;
+						bool changedNow = false;
+						if (f.slots.size() == 3) {
+							float v[3] = { gXml.slots[f.slots[0]].value, gXml.slots[f.slots[1]].value, gXml.slots[f.slots[2]].value };
+							for (float x : v) { if (x < lo) lo = x * 2; if (x > hi) hi = x * 2; }
+							changedNow = ImGui::SliderFloat3(f.label.c_str(), v, lo, hi, "%.3g");
+							if (changedNow) for (int k = 0; k < 3; k++) gXml.slots[f.slots[k]].value = v[k];
+						} else {
+							for (int s : f.slots) { ImGui::PushID(s); changedNow |= ImGui::SliderFloat(f.label.c_str(), &gXml.slots[s].value, lo, hi, "%.3g"); ImGui::PopID(); }
+						}
+						bool released = ImGui::IsItemDeactivatedAfterEdit();
+						{
+							std::string was;
+							for (int s : f.slots) { char t[32]; snprintf(t, sizeof t, "%s%g", was.empty() ? "" : " ", gXml.slots[s].original); was += t; }
+							if (UndoButton("undo", edited, "the file's " + was)) { for (int s : f.slots) gXml.slots[s].value = gXml.slots[s].original; rebuild = true; }
+						}
+						if (released || (live && changedNow)) rebuild = true;
+						ImGui::PopID();
+					}
+					ImGui::TreePop();
+				}
+				ImGui::PopID();
+			}
+			ImGui::PopItemWidth();
+			if (rebuild && gItem.loaded) BuildSystem();
+		}
+	}
+
+	if (ImGui::CollapsingHeader("Display", gOpenValues ? 0 : ImGuiTreeNodeFlags_DefaultOpen)) {
+		// Two toggles a line, each with its undo.
+		auto toggle = [](const char* label, bool& v, const bool& was, bool sameLine) {
+			if (sameLine) ImGui::SameLine(ImGui::GetContentRegionMax().x * 0.5f);
+			ImGui::Checkbox(label, &v);
+			Undo(label, v, was);
+		};
+		toggle("Textures", gS.textures, kDefaults.textures, false);
+		toggle("Wireframe", gS.wireframe, kDefaults.wireframe, true);
+		toggle("Floor", gS.showFloor, kDefaults.showFloor, false);
+		toggle("Bones", gS.showBones, kDefaults.showBones, true);
+		toggle("Constraints", gS.showConstraints, kDefaults.showConstraints, false);
+		toggle("Collision", gS.showColliders, kDefaults.showColliders, true);
 		Help("Bones: orange simulated, grey animated. Constraints: the links between bones. Collision: orange = cloth (per-vertex), blue = body (per-triangle).");
 		ImGui::ColorEdit3("Background", gS.background, ImGuiColorEditFlags_NoInputs);
+		{
+			bool differs = memcmp(gS.background, kDefaults.background, sizeof gS.background) != 0;
+			if (UndoButton("background", differs, "the default grey")) memcpy(gS.background, kDefaults.background, sizeof gS.background);
+		}
+		if (gItem.loaded) {
+			// Weights: one bone's skin weights as a heat map on the item.
+			static char filter[64] = "";
+			ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 9);   // room for the label and the undo
+			if (ImGui::BeginCombo("Weights", gS.heatBone.empty() ? "(off)" : gS.heatBone.c_str(), ImGuiComboFlags_HeightLarge)) {
+				if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+				ImGui::InputTextWithHint("##filter", "filter", filter, sizeof filter);
+				if (ImGui::Selectable("(off)", gS.heatBone.empty())) gS.heatBone.clear();
+				for (auto& n : SkinBoneNames()) {
+					if (filter[0]) {
+						std::string a = n, b = filter;
+						for (auto& c : a) c = (char)tolower((unsigned char)c);
+						for (auto& c : b) c = (char)tolower((unsigned char)c);
+						if (a.find(b) == std::string::npos) continue;
+					}
+					bool sel = _stricmp(n.c_str(), gS.heatBone.c_str()) == 0;
+					if (ImGui::Selectable(n.c_str(), sel)) gS.heatBone = n;
+					if (sel && ImGui::IsWindowAppearing()) ImGui::SetScrollHereY();
+				}
+				ImGui::EndCombo();
+			}
+			Undo("weights", gS.heatBone, kDefaults.heatBone);
+			Help("Shows how much each vertex follows the chosen bone (its skin weight): dark blue 0, through blue, cyan, green and yellow, to red 1. "
+			     "Click a bone's dot in the view (Bones on) to pick it. The chosen bone's dot turns white.");
+			if (!gS.heatBone.empty()) {
+				ImDrawList* dl = ImGui::GetWindowDrawList();
+				ImVec2 p = ImGui::GetCursorScreenPos();
+				float w = ImGui::GetContentRegionAvail().x, h = 10;
+				for (int i = 0; i < 64; i++) {
+					D3DCOLOR c = Heat(i / 63.0f);
+					dl->AddRectFilled(ImVec2(p.x + w * i / 64, p.y), ImVec2(p.x + w * (i + 1) / 64 + 1, p.y + h), IM_COL32((c >> 16) & 255, (c >> 8) & 255, c & 255, 255));
+				}
+				ImGui::Dummy(ImVec2(w, h));
+				// How many vertices the bone moves, over all shapes.
+				int moved = 0, full = 0;
+				for (auto& s : gItem.shapes)
+					for (int v = 0; v < (int)s.weights.size(); v++) { float wt = HeatWeight(s, v); moved += wt > 0; full += wt > 0.999f; }
+				ImGui::TextDisabled("0          0.5          1     %d vertices weighted, %d fully", moved, full);
+			}
+		}
 		if (gItem.loaded && ImGui::TreeNode("Shapes")) {
 			for (size_t i = 0; i < gItem.shapes.size(); i++) {
 				auto& s = gItem.shapes[i];
@@ -1310,6 +1797,7 @@ static void Panels(float fps)
 				ImGui::Checkbox(s.info.geometry->m_name ? s.info.geometry->m_name : "(unnamed)", &s.visible);
 				if (s.collider) { ImGui::SameLine(); ImGui::TextColored(s.collider == 1 ? ImVec4(1, 0.62f, 0.15f, 1) : ImVec4(0.25f, 0.85f, 1, 1), s.collider == 1 ? "cloth" : "body"); }
 				if (!s.textureNote.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", s.info.diffuse.c_str(), s.textureNote.c_str());
+				{ bool shown = true; Undo("visible", s.visible, shown); }
 				ImGui::PopID();
 			}
 			ImGui::TreePop();
@@ -1469,6 +1957,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	}
 	LocalFree(argv);
 	std::string start, shots, jitterOut, clipOut;   // --jitter / --clip file: how much the cloth shakes / clips (see below)
+	std::string clipMeshOut;   // --clipmesh file: how much the cloth shapes sink into the body collision shapes (see below)
 	int shotEvery = 20, shotCount = 0;
 	bool noUi = false, exitAfter = false;
 	for (size_t i = 0; i < args.size(); i++) {
@@ -1481,7 +1970,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--yaw") gCam.yaw = (float)atof(next().c_str()) * 3.14159f / 180.0f;
 		else if (a == "--pitch") gCam.pitch = (float)atof(next().c_str()) * 3.14159f / 180.0f;
 		else if (a == "--dist") gCam.dist = (float)atof(next().c_str());
+		else if (a == "--panz") gCam.pan = V3(0, 0, (float)atof(next().c_str()));
 		else if (a == "--noui") noUi = true;
+		else if (a == "--values") gOpenValues = true;
+		else if (a == "--heat") gS.heatBone = next();
+		else if (a == "--chain") gPinChain = atoi(next().c_str());
+		else if (a == "--realtime") gRealtime = true;
+		else if (a == "--rate") gS.minFps = atoi(next().c_str());
+		else if (a == "--step") gMeasureStep = (float)atof(next().c_str());
+		else if (a == "--filter") gS.jitterFilter = atoi(next().c_str()) != 0;
+		else if (a == "--smoothing") gS.jitterSmoothing = (float)atof(next().c_str());
+		else if (a == "--beta") gS.jitterBeta = (float)atof(next().c_str());
 		else if (a == "--noanim") gAnim.use = false;
 		else if (a == "--sneak") gAnim.sneak = true;
 		else if (a == "--noground") gS.ground = false;
@@ -1489,6 +1988,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--iterations") gS.solverIterations = atoi(next().c_str());
 		else if (a == "--jitter") jitterOut = next();
 		else if (a == "--clip") clipOut = next();
+		else if (a == "--clipmesh") clipMeshOut = next();
 		else if (a == "--stance") gAnim.stance = std::clamp(atoi(next().c_str()), 0, IM_ARRAYSIZE(kStances) - 1);
 		else if (a == "--kf") { gAnim.customPath = next(); gS.preset = kCustom; }
 		else if (a == "--exit") exitAfter = true;
@@ -1543,7 +2043,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		}
 
 		if (gItem.loaded) {
-			float simDt = jitterOut.empty() && clipOut.empty() ? dt * gS.timeScale : 1.0f / 120.0f;   // measuring: a fixed step, comparable runs
+			float simDt = (jitterOut.empty() && clipOut.empty() && clipMeshOut.empty()) || gRealtime ? dt * gS.timeScale : gMeasureStep;   // measuring: a fixed step, comparable runs (--realtime: the real one)
 			UpdateMotion(simDt);
 			UpdateWind(wallTime);
 			if (gS.physics && gItem.system) hdt::SkyrimPhysicsWorld::get()->doUpdate(simDt);
@@ -1637,20 +2137,216 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 				}
 			}
 
+			// --clipmesh: the cloth shapes' vertices that hang on SMP bones, against the body collision shapes as the
+			// physics sees them (per-triangle shapes, skinned this frame): a vertex counts as inside when the nearest
+			// triangle is less than 4 units away and the vertex is behind it by more than 0.3. Every 4th frame of 4 s.
+			if (!clipMeshOut.empty() && gItem.system && frameNo >= 240) {
+				static int frames = 0;
+				struct Stat { long samples = 0, inside = 0; float deepest = 0; };
+				static std::map<std::string, Stat> stats;
+				if (frames % 4 == 0) {
+					struct Tri { RE::NiPoint3 a, b, c, n; };
+					std::vector<Tri> tris;
+					std::unordered_map<long long, std::vector<int>> grid;
+					const float cell = 4.0f;
+					auto key = [](int x, int y, int z) { return ((long long)(x & 0xFFFFF) << 40) | ((long long)(y & 0xFFFFF) << 20) | (long long)(z & 0xFFFFF); };
+					// A collider that is an smpdress --proxy stand-in is measured by the render mesh it stands for (what shows).
+					std::vector<const ShapeDraw*> bodies;
+					for (auto& s : gItem.shapes) {
+						if (s.collider != 2) continue;
+						std::string n = s.info.geometry->m_name ? s.info.geometry->m_name : "";
+						const ShapeDraw* use = &s;
+						if (n.rfind("SMP Proxy:", 0) == 0)
+							for (auto& o : gItem.shapes) if (o.info.geometry->m_name && n.substr(10) == o.info.geometry->m_name) use = &o;
+						bodies.push_back(use);
+					}
+					for (auto* sp : bodies) {
+						auto& s = *sp;
+						std::vector<RE::NiPoint3> p(s.weights.size());
+						for (int v = 0; v < (int)p.size(); v++) p[v] = scene::SkinVertex(s.info.geometry, v, s.weights);
+						for (size_t t = 0; t + 2 < s.indices.size(); t += 3) {
+							Tri tr{ p[s.indices[t]], p[s.indices[t + 1]], p[s.indices[t + 2]] };
+							RE::NiPoint3 e1 = tr.b - tr.a, e2 = tr.c - tr.a;
+							RE::NiPoint3 n(e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x);
+							float l = n.Length();
+							if (l < 1e-8f) continue;
+							tr.n = n * (1.0f / l);
+							int id = (int)tris.size();
+							tris.push_back(tr);
+							float lo[3] = { std::min({ tr.a.x, tr.b.x, tr.c.x }), std::min({ tr.a.y, tr.b.y, tr.c.y }), std::min({ tr.a.z, tr.b.z, tr.c.z }) };
+							float hi[3] = { std::max({ tr.a.x, tr.b.x, tr.c.x }), std::max({ tr.a.y, tr.b.y, tr.c.y }), std::max({ tr.a.z, tr.b.z, tr.c.z }) };
+							for (int x = (int)std::floor(lo[0] / cell); x <= (int)std::floor(hi[0] / cell); x++)
+								for (int y = (int)std::floor(lo[1] / cell); y <= (int)std::floor(hi[1] / cell); y++)
+									for (int z = (int)std::floor(lo[2] / cell); z <= (int)std::floor(hi[2] / cell); z++) grid[key(x, y, z)].push_back(id);
+						}
+					}
+					// The closest point on a triangle (Ericson, Real-Time Collision Detection 5.1.5).
+					auto closest = [](const Tri& t, const RE::NiPoint3& p) {
+						auto dot = [](const RE::NiPoint3& u, const RE::NiPoint3& v) { return u.x * v.x + u.y * v.y + u.z * v.z; };
+						RE::NiPoint3 ab = t.b - t.a, ac = t.c - t.a, ap = p - t.a;
+						float d1 = dot(ab, ap), d2 = dot(ac, ap);
+						if (d1 <= 0 && d2 <= 0) return t.a;
+						RE::NiPoint3 bp = p - t.b; float d3 = dot(ab, bp), d4 = dot(ac, bp);
+						if (d3 >= 0 && d4 <= d3) return t.b;
+						float vc = d1 * d4 - d3 * d2;
+						if (vc <= 0 && d1 >= 0 && d3 <= 0) return t.a + ab * (d1 / (d1 - d3));
+						RE::NiPoint3 cp = p - t.c; float d5 = dot(ab, cp), d6 = dot(ac, cp);
+						if (d6 >= 0 && d5 <= d6) return t.c;
+						float vb = d5 * d2 - d1 * d6;
+						if (vb <= 0 && d2 >= 0 && d6 <= 0) return t.a + ac * (d2 / (d2 - d6));
+						float va = d3 * d6 - d5 * d4;
+						if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) return t.b + (t.c - t.b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+						float den = 1.0f / (va + vb + vc);
+						return t.a + ab * (vb * den) + ac * (vc * den);
+					};
+					for (auto& s : gItem.shapes) {
+						if (s.collider != 1) continue;
+						std::string shapeName = s.info.geometry->m_name ? s.info.geometry->m_name : "?";
+						for (int v = 0; v < (int)s.weights.size(); v++) {
+							bool onSmp = false;
+							const char* main = nullptr; float mainW = 0;
+							for (auto& [slot, w] : s.weights[v]) {
+								const char* n = s.info.geometry->skinInstance->bones[slot]->m_name;
+								if (w > 0.3f && n && _strnicmp(n, "SMP", 3) == 0) onSmp = true;
+								if (w > mainW) { mainW = w; main = n; }
+							}
+							if (!onSmp) continue;
+							// Ropes per link (the last space-separated part of the main bone's name: L1, L2 ...).
+							std::string statKey = shapeName;
+							if (main && strstr(main, "Rope")) { const char* sp = strrchr(main, ' '); statKey += std::string(" ") + (sp ? sp + 1 : main); }
+							Stat& st = stats[statKey];
+							RE::NiPoint3 p = scene::SkinVertex(s.info.geometry, v, s.weights);
+							int cx = (int)std::floor(p.x / cell), cy = (int)std::floor(p.y / cell), cz = (int)std::floor(p.z / cell);
+							float best = 1e9f, signedD = 0;
+							for (int x = cx - 1; x <= cx + 1; x++) for (int y = cy - 1; y <= cy + 1; y++) for (int z = cz - 1; z <= cz + 1; z++) {
+								auto it = grid.find(key(x, y, z));
+								if (it == grid.end()) continue;
+								for (int id : it->second) {
+									const Tri& t = tris[id];
+									RE::NiPoint3 q = closest(t, p), d = p - q;
+									float len = d.Length();
+									if (len < best) { best = len; signedD = d.x * t.n.x + d.y * t.n.y + d.z * t.n.z; }
+								}
+							}
+							st.samples++;
+							if (best < 4.0f && signedD < -0.3f) { st.inside++; st.deepest = std::max(st.deepest, -signedD); }
+						}
+					}
+					// Rigid pieces (vertices wholly on one SMP rope bone) against each other: one piece's vertices inside
+					// another piece's surface.
+					for (auto& s : gItem.shapes) {
+						if (!s.collider) continue;
+						std::map<int, std::vector<int>> pieces;   // bone slot -> vertices
+						for (int v = 0; v < (int)s.weights.size(); v++) {
+							if (s.weights[v].size() != 1 || s.weights[v][0].second < 0.999f) continue;
+							const char* n = s.info.geometry->skinInstance->bones[s.weights[v][0].first]->m_name;
+							if (n && strstr(n, "SMP") && strstr(n, "Rope")) pieces[s.weights[v][0].first].push_back(v);
+						}
+						// Only each bone's biggest connected part (the rigid piece itself, not the rope end tied to it).
+						{
+							std::vector<int> up(s.weights.size());
+							std::iota(up.begin(), up.end(), 0);
+							auto root = [&](int x) { while (up[x] != x) x = up[x] = up[up[x]]; return x; };
+							std::map<int, int> boneOf;
+							for (auto& [slot, vs] : pieces) for (int v : vs) boneOf[v] = slot;
+							for (size_t t = 0; t + 2 < s.indices.size(); t += 3) {
+								int a = s.indices[t], b = s.indices[t + 1], c = s.indices[t + 2];
+								auto ia = boneOf.find(a), ib = boneOf.find(b), ic = boneOf.find(c);
+								if (ia == boneOf.end() || ib == boneOf.end() || ic == boneOf.end() || ia->second != ib->second || ia->second != ic->second) continue;
+								up[root(b)] = root(a); up[root(c)] = root(a);
+							}
+							// Vertices at the same place count as one (UV seams split them).
+							std::map<std::tuple<int, int, int, int>, int> at;
+							for (auto& [v, slot] : boneOf) {
+								RE::NiPoint3 q = scene::SkinVertex(s.info.geometry, v, s.weights);
+								auto key = std::make_tuple(slot, (int)std::lround(q.x * 100), (int)std::lround(q.y * 100), (int)std::lround(q.z * 100));
+								auto it = at.find(key);
+								if (it == at.end()) at[key] = v;
+								else up[root(v)] = root(it->second);
+							}
+							for (auto& [slot, vs] : pieces) {
+								std::map<int, int> size;
+								for (int v : vs) size[root(v)]++;
+								int big = -1, bigN = 0;
+								for (auto& [r, n] : size) if (n > bigN) { bigN = n; big = r; }
+								std::vector<int> keep;
+								for (int v : vs) if (root(v) == big) keep.push_back(v);
+								vs = keep;
+							}
+						}
+						if (pieces.size() < 2) continue;
+						std::vector<RE::NiPoint3> p(s.weights.size());
+						for (auto& [slot, vs] : pieces) for (int v : vs) p[v] = scene::SkinVertex(s.info.geometry, v, s.weights);
+						// Each piece as a cylinder (centre, long axis from its spread, radius 3/4 of its mean radial
+						// distance: a broken bottle's jagged rim and neck stay out); the other pieces' vertices inside it.
+						Stat& st = stats[std::string("piece vs piece (frames with overlap)")];
+						bool overlap = false;
+						for (auto& [slotB, vsB] : pieces) {
+							RE::NiPoint3 c(0, 0, 0);
+							for (int v : vsB) c = c + p[v];
+							c = c * (1.0f / vsB.size());
+							RE::NiPoint3 ax(0, 0, 1);
+							for (int it = 0; it < 12; it++) {
+								RE::NiPoint3 n(0, 0, 0);
+								for (int v : vsB) { RE::NiPoint3 d = p[v] - c; float k = d.x * ax.x + d.y * ax.y + d.z * ax.z; n = n + d * k; }
+								float l = n.Length();
+								if (l < 1e-8f) break;
+								ax = n * (1.0f / l);
+							}
+							float t0 = 1e9f, t1 = -1e9f, rs = 0;
+							for (int v : vsB) {
+								RE::NiPoint3 d = p[v] - c; float t = d.x * ax.x + d.y * ax.y + d.z * ax.z;
+								t0 = std::min(t0, t); t1 = std::max(t1, t); rs += (d - ax * t).Length();
+							}
+							float r = 0.75f * rs / vsB.size();
+							for (auto& [slotA, vsA] : pieces) {
+								if (slotA == slotB) continue;
+								int in = 0;
+								for (int v : vsA) {
+									RE::NiPoint3 d = p[v] - c; float t = d.x * ax.x + d.y * ax.y + d.z * ax.z;
+									if (t < t0 + 0.5f || t > t1 - 0.5f) continue;
+									float rad = (d - ax * t).Length();
+									if (rad < r) { in++; st.deepest = std::max(st.deepest, r - rad); }
+								}
+								if (in >= 3) overlap = true;
+							}
+						}
+						st.samples++;
+						if (overlap) st.inside++;
+					}
+				}
+				if (++frames == 480) {
+					FILE* f = fopen(clipMeshOut.c_str(), "w");
+					if (f) {
+						for (auto& [name, st] : stats)
+							fprintf(f, "%s: %.2f%% of samples inside the body, deepest %.2f units\n", name.c_str(), st.samples ? 100.0 * st.inside / st.samples : 0.0, st.deepest);
+						fclose(f);
+					}
+					done = true;
+				}
+			}
+
 			static std::map<std::string, std::vector<RE::NiPoint3>> track;
 			static int measured = 0;
 			if (!jitterOut.empty() && gItem.system && frameNo >= 240) {
 				RE::NiTransform toActor = gItem.scene.skeleton.actor->world.Invert();
+				// The cape's sway is measured in the upper spine's frame (what it hangs from), not the actor's.
+				RE::NiTransform toSpine = toActor;
+				for (auto& b : gItem.system->getBones())
+					if (_stricmp(b->m_name.c_str(), "Bip01 Spine2") == 0)
+						toSpine = static_cast<hdt::SkyrimBone*>(b.get())->m_node->world.Invert();
 				for (auto& b : gItem.system->getBones()) {
 					if (b->m_rig.isStaticOrKinematicObject()) continue;
 					auto* bone = static_cast<hdt::SkyrimBone*>(b.get());
 					track[bone->m_name.c_str()].push_back(toActor * bone->m_node->world.translate);
+					if (strstr(bone->m_name.c_str(), "Cape")) track[std::string("~spine ") + bone->m_name.c_str()].push_back(toSpine * bone->m_node->world.translate);
 				}
 				if (++measured == 480) {
 					std::vector<std::pair<double, std::string>> perBone;
 					double total = 0;
 					int count = 0;
 					for (auto& [name, pts] : track) {
+						if (name.rfind("~spine ", 0) == 0) continue;
 						double sum = 0;
 						for (size_t i = 2; i < pts.size(); i++) sum += (pts[i] - pts[i - 1] * 2.0f + pts[i - 2]).Length();
 						double avg = sum / std::max<size_t>(1, pts.size() - 2);
@@ -1662,7 +2358,87 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 					FILE* f = fopen(jitterOut.c_str(), "w");
 					if (f) {
 						fprintf(f, "shake: average %.4f units per frame over %d bones\n", count ? total / count : 0.0, count);
+						fprintf(f, "  physics %.3f ms per frame\n", hdt::SkyrimPhysicsWorld::get()->m_averageStepMs);
+#ifdef NVSMP_PROFILE
+						// A profiling build: where the physics' time went over the measured frames.
+						for (int s = 0; s < nvsmp::prof::Count; s++) fprintf(f, "  prof %-24s %8.1f ms total\n", nvsmp::prof::kNames[s], nvsmp::prof::gTotal[s]);
+#endif
 						for (size_t i = 0; i < perBone.size() && i < 6; i++) fprintf(f, "  %-18s %.4f\n", perBone[i].second.c_str(), perBone[i].first);
+						// Sway: how far the cloth bones wander from their mean place (in the actor's frame), on average.
+						{
+							double sway = 0; int n = 0;
+							for (auto& [name, pts] : track) {
+								if (name.rfind("~spine ", 0) != 0 || pts.empty()) continue;
+								RE::NiPoint3 m(0, 0, 0);
+								for (auto& q : pts) m = m + q;
+								m = m * (1.0f / pts.size());
+								double s = 0;
+								for (auto& q : pts) s += (q - m).Length();
+								sway += s / pts.size(); n++;
+							}
+							fprintf(f, "  cape sway: %.3f units from the mean place on average\n", n ? sway / n : 0.0);
+						}
+						// Per chain (the bones' names without the last word: "SMP Cape0 C06"): shake and sway.
+						{
+							std::map<std::string, std::pair<double, int>> sh;
+							for (auto& [score, name] : perBone) {
+								size_t sp = name.rfind(' ');
+								if (name.rfind("SMP ", 0) != 0 || sp == std::string::npos) continue;
+								auto& e = sh[name.substr(0, sp)];
+								e.first += score; e.second++;
+							}
+							std::map<std::string, std::pair<double, int>> sw;
+							for (auto& [name, pts] : track) {
+								if (name.rfind("~spine ", 0) != 0 || pts.empty()) continue;
+								std::string bone = name.substr(7);
+								size_t sp = bone.rfind(' ');
+								if (sp == std::string::npos) continue;
+								RE::NiPoint3 m(0, 0, 0);
+								for (auto& q : pts) m = m + q;
+								m = m * (1.0f / pts.size());
+								double s = 0;
+								for (auto& q : pts) s += (q - m).Length();
+								auto& e = sw[bone.substr(0, sp)];
+								e.first += s / pts.size(); e.second++;
+							}
+							for (auto& [chain, e] : sh) {
+								auto it = sw.find(chain);
+								if (it != sw.end()) fprintf(f, "  chain %-16s shake %.4f  sway %.3f\n", chain.c_str(), e.first / e.second, it->second.first / it->second.second);
+								else fprintf(f, "  chain %-16s shake %.4f\n", chain.c_str(), e.first / e.second);
+							}
+						// The plugin's jitter measure (SkyrimBone::m_jitter, drawn; m_rawJitter, before the jitter filter),
+						// per chain and the worst chain.
+						{
+							std::map<std::string, std::array<double, 4>> pj;   // drawn, raw, bones, lag
+							for (auto& b : gItem.system->getBones()) {
+								auto* bone = static_cast<hdt::SkyrimBone*>(b.get());
+								if (bone->m_rig.isStaticOrKinematicObject() || bone->m_jitterSamples < 3) continue;
+								std::string name = bone->m_name.c_str();
+								size_t sp = name.rfind(' ');
+								auto& e = pj[sp == std::string::npos ? name : name.substr(0, sp)];
+								e[0] += bone->m_jitter; e[1] += bone->m_rawJitter; e[2] += 1; e[3] += bone->m_filterLag;
+							}
+							double worst = 0, all = 0, allRaw = 0, lag = 0; std::string worstName;
+							for (auto& [chain, e] : pj) {
+								double d = e[0] / e[2], r = e[1] / e[2];
+								all += d; allRaw += r; lag += e[3] / e[2];
+								if (d > worst) { worst = d; worstName = chain; }
+								fprintf(f, "  jitter %-16s %.4f  (before the filter %.4f)\n", chain.c_str(), d, r);
+							}
+							if (!pj.empty()) fprintf(f, "  jitter average %.4f (before the filter %.4f), worst %.4f (%s), filter lag %.3f units\n", all / pj.size(), allRaw / pj.size(), worst, worstName.c_str(), lag / pj.size());
+						}
+						}
+						// Rope ends (the rigid pieces): how close each pair comes, to see whether they knock or pass through.
+						std::vector<std::string> ends;
+						for (auto& [name, pts] : track) if (name.find("Rope") != std::string::npos && !track.count(name.substr(0, name.size() - 1) + char(name.back() + 1)) && name.back() != '0') ends.push_back(name);
+						for (size_t i = 0; i < ends.size(); i++) for (size_t j = i + 1; j < ends.size(); j++) {
+							auto& a = track[ends[i]]; auto& b = track[ends[j]];
+							std::vector<float> d;
+							for (size_t k = 0; k < a.size() && k < b.size(); k++) d.push_back((a[k] - b[k]).Length());
+							std::sort(d.begin(), d.end());
+							if (!d.empty()) fprintf(f, "  %s - %s: start %.2f, min %.2f, 5%% %.2f, median %.2f\n", ends[i].c_str(), ends[j].c_str(),
+								(a[0] - b[0]).Length(), d.front(), d[d.size() / 20], d[d.size() / 2]);
+						}
 						fclose(f);
 					}
 					done = true;
@@ -1679,6 +2455,26 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		M4 view = LookAtRH(CameraEye(), gCam.target + gCam.pan, V3(0, 0, 1));
 		M4 proj = PerspectiveRH(0.75f, aspect, 2.0f, 20000.0f);
 		M4 viewProj = Mul(view, proj);
+
+		// A click on a bone's dot (Bones shown) picks it for the weights heat map.
+		{
+			ImGuiIO& io = ImGui::GetIO();
+			if (gItem.system && gS.showBones && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !io.WantCaptureMouse && !io.KeyCtrl) {
+				float best = 12.0f * 12.0f;
+				std::string picked;
+				for (auto& b : gItem.system->getBones()) {
+					auto* bone = static_cast<hdt::SkyrimBone*>(b.get());
+					RE::NiPoint3 p = bone->m_node->world.translate;
+					float c[4];
+					for (int j = 0; j < 4; j++) c[j] = p.x * viewProj.m[0][j] + p.y * viewProj.m[1][j] + p.z * viewProj.m[2][j] + viewProj.m[3][j];
+					if (c[3] <= 0) continue;
+					float sx = (c[0] / c[3] * 0.5f + 0.5f) * rc.right, sy = (0.5f - c[1] / c[3] * 0.5f) * rc.bottom;
+					float d = (sx - io.MousePos.x) * (sx - io.MousePos.x) + (sy - io.MousePos.y) * (sy - io.MousePos.y);
+					if (d < best) { best = d; picked = bone->m_name.c_str(); }
+				}
+				if (!picked.empty()) { gS.heatBone = picked; AddLog(2, "weights: " + picked); }
+			}
+		}
 
 		D3DCOLOR bg = D3DCOLOR_RGBA((int)(gS.background[0] * 255), (int)(gS.background[1] * 255), (int)(gS.background[2] * 255), 255);
 		gDev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, bg, 1.0f, 0);
