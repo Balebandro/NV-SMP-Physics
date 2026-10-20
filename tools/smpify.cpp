@@ -86,6 +86,19 @@ static void addStringExtra(File& f, AVObject& av, const std::string& name, const
 	av.extraData.push_back(f.addBlock("NiStringExtraData", w.b));
 }
 
+// "SMP Bones" in pieces under 2000 characters, split between entries: "SMP Bones", "SMP Bones 2", ... (Outfit Studio
+// cannot read a NIF string of 2048 characters or more; the plugin joins the pieces).
+static void addSmpBones(File& f, AVObject& av, const std::string& list)
+{
+	size_t at = 0;
+	for (int piece = 1; at < list.size() || piece == 1; ++piece) {
+		size_t end = list.size();
+		if (end - at > 2000) end = list.rfind(';', at + 2000) + 1;
+		addStringExtra(f, av, piece == 1 ? "SMP Bones" : "SMP Bones " + std::to_string(piece), list.substr(at, end - at));
+		at = end;
+	}
+}
+
 int main(int argc, char** argv)
 {
 	if (argc < 6) {
@@ -316,7 +329,7 @@ int main(int argc, char** argv)
 			if ((int)b >= bodyBoneCount) parent = grid[b - bodyBoneCount].parent;
 			smpBones += boneNames[b] + "|" + parent + ";";
 		}
-		addStringExtra(f, geom.av, "SMP Bones", smpBones);
+		addSmpBones(f, geom.av, smpBones);
 		addStringExtra(f, geom.av, "HDT Skinned Mesh Physics Object", physicsPath);
 		addStringExtra(f, root, "HDT Skinned Mesh Physics Object", physicsPath);
 

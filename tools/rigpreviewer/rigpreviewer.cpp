@@ -514,9 +514,8 @@ static void BuildItemBones()
 	std::map<RE::NiGeometry*, std::vector<std::string>> slotNames;
 	for (auto& info : gItem.scene.shapes) {
 		auto* g = info.geometry;
-		const char* list = g->FindStringExtra("SMP Bones");
-		if (!list || !g->skinInstance) continue;
-		std::stringstream ss(list);
+		if (!g->FindStringExtra("SMP Bones") || !g->skinInstance) continue;
+		std::stringstream ss(g->SmpBonesList());
 		std::string entry;
 		uint32_t slot = 0;
 		while (std::getline(ss, entry, ';') && slot < g->skinInstance->boneCount) {

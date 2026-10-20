@@ -142,6 +142,19 @@ namespace RE
 			}
 			return nullptr;
 		}
+		// "SMP Bones" may go on in "SMP Bones 2", "SMP Bones 3"... (Outfit Studio cannot read a NIF string of 2048
+		// characters or more, so long lists are split): the whole list, or empty when there is none.
+		std::string SmpBonesList() const
+		{
+			std::string list;
+			if (const char* first = FindStringExtra("SMP Bones")) list = first;
+			for (int i = 2; !list.empty(); ++i) {
+				const char* more = FindStringExtra(("SMP Bones " + std::to_string(i)).c_str());
+				if (!more) break;
+				list += more;
+			}
+			return list;
+		}
 	};
 
 	class NiNode;

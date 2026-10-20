@@ -336,11 +336,21 @@ namespace hdt
 		if (!obj || depth > 64)
 			return;
 		if (auto* g = castNiGeometry(obj)) {
-			const char* list = g->FindStringExtra("SMP Bones");
+			const std::string listed = g->SmpBonesList();
+			const char* list = g->FindStringExtra("SMP Bones") ? listed.c_str() : nullptr;
 			if (list) {
 				++m_listedShapes;
 				if (!g->skinInstance || !g->skinInstance->boneCount)
 					logger::warn("[SMP] {} lists its bones but has no skin yet", g->GetName());
+				else {
+					// The list names the skin's slots in order: a different count means the skin was changed after
+					// (an editor removed unweighted bones) and every slot after the first change is misnamed.
+					uint32_t entries = 0;
+					for (const char* c = list; *c; ++c) entries += *c == ';';
+					if (entries != g->skinInstance->boneCount)
+						logger::warn("[SMP] {}: \"SMP Bones\" lists {} bones but the skin has {}: the NIF was edited after it was made "
+						             "(Outfit Studio removes unweighted bones); run tools\\smprepair on it", g->GetName(), entries, g->skinInstance->boneCount);
+				}
 			}
 			if (list && g->skinInstance) {
 				uint32_t slot = 0;
