@@ -5,8 +5,8 @@
 #	include <windows.h>
 namespace nvsmp::prof
 {
-	enum Slot { ReadTransform, BonesAndBounds, Broadphase, Narrowphase, Solve, Integrate, WriteTransform, Count };
-	inline const char* kNames[Count] = { "read transforms", "bones + bounds", "broadphase", "narrowphase (collision)", "constraint solve", "predict + integrate", "write transforms" };
+	enum Slot { ReadTransform, BonesAndBounds, Broadphase, Narrowphase, Solve, Integrate, WriteTransform, SkinColliders, PairTests, Count };
+	inline const char* kNames[Count] = { "read transforms", "bones + bounds", "broadphase", "narrowphase (collision)", "constraint solve", "predict + integrate", "write transforms", "  of which: skin colliders", "  of which: pair tests" };
 	inline double gTotal[Count] = {};
 	struct Scope
 	{

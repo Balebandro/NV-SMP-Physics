@@ -126,6 +126,8 @@ namespace hdt
 		std::sort(extra_vertex_shapes.begin(), extra_vertex_shapes.end());
 		extra_vertex_shapes.erase(std::unique(extra_vertex_shapes.begin(), extra_vertex_shapes.end()), extra_vertex_shapes.end());
 
+		{
+		NVSMP_PROF(SkinColliders);
 		tbb::parallel_for_each(bodies.begin(), bodies.end(), [](SkinnedMeshBody* shape) {
 			if (shape->m_useBoundingSphere)
 				shape->internalUpdate();
@@ -136,9 +138,11 @@ namespace hdt
 				shape->internalUpdate();
 			});
 		}
+		}
 
 		{
 			BT_PROFILE("HDTSMP_collision_pair_checks");
+			NVSMP_PROF(PairTests);
 
 			tbb::parallel_for_each(m_pairs.begin(), m_pairs.end(), [&, this](const std::pair<SkinnedMeshBody*, SkinnedMeshBody*>& i) {
 				// collapseCollideL is a candidate for optimizations since we'll re-traverse the tree in checkCollisionL. However,
