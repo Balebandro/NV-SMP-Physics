@@ -14,6 +14,7 @@ namespace Game
 	constexpr uint32_t kCreateFixedString = 0x00A5B690;    // NiFixedString from a C string
 	constexpr uint32_t kSetName = 0x00A5B950;              // NiObjectNET::SetName
 	constexpr uint32_t kRefGet3D = 0x0043FCD0;             // TESObjectREFR::Get3D
+	constexpr uint32_t kPlayerGet3D = 0x00950BB0;          // PlayerCharacter::Get3D(bool firstPerson) (as NV Cloth Physics uses it)
 	constexpr uint32_t kWaitForParallelUpdate = 0x00872AD0; // TESMain::DrawWorld_WaitForParallelUpdate
 	constexpr uint32_t kFileFinderGetFile = 0x00AFDF20;    // FileFinder::GetFile (loose, then archives)
 
@@ -45,6 +46,14 @@ namespace Game
 	{
 		typedef RE::NiAVObject*(__thiscall * Get3D_t)(void*);
 		auto* obj = ref ? ((Get3D_t)kRefGet3D)(ref) : nullptr;
+		return obj ? obj->AsNode() : nullptr;
+	}
+
+	// The player's first-person model (arms, the worn items again), shown in first-person view.
+	inline RE::NiNode* PlayerFirstPerson3D(void* player)
+	{
+		typedef RE::NiAVObject*(__thiscall * Get3DPerson_t)(void*, int);
+		auto* obj = player ? ((Get3DPerson_t)kPlayerGet3D)(player, 1) : nullptr;
 		return obj ? obj->AsNode() : nullptr;
 	}
 

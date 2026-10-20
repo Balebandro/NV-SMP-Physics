@@ -1242,6 +1242,10 @@ namespace hdt
 				logger::warn("Shape {} has no vertex positions in memory, skipped", meshName.c_str());
 				continue;
 			}
+			// An smpdress --proxy collision stand-in is drawn by the game until now: hidden (app-culled, NiAVObject
+			// flags at 0x30 bit 0) once the physics has it. Culled in the NIF, its collisions do not work in game.
+			if (_strnicmp(meshName.c_str(), "SMP Proxy:", 10) == 0)
+				*reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(g) + 0x30) |= 1;
 
 			RE::NiSkinData* skinData = skin->skinData;
 			const uint32_t boneCount = std::min(skinData->boneCount, skin->boneCount);

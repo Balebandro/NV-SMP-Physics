@@ -9,6 +9,26 @@ namespace nvsmp
 {
 	static const char* kPhysicsKey = "HDT Skinned Mesh Physics Object";
 
+	// smpdress --proxy collision stand-ins (shapes named "SMP Proxy:...") are hidden (app-culled, NiAVObject flags at
+	// 0x30 bit 0) when their physics is built (generateMeshBody). Culled before the game binds the item's skin, a
+	// stand-in loses its collisions, and the game does not bind the skin again after a re-equip of the same model: so
+	// they are shown again whenever the item's physics goes (the model may be attached again as it is). The player's
+	// first-person model gets no physics: hidden every frame.
+	static void SetProxiesHidden(RE::NiAVObject* obj, bool hidden, int depth = 0)
+	{
+		if (!obj || depth > 48)
+			return;
+		if (auto* node = obj->AsNode()) {
+			for (uint16_t i = 0; i < node->ChildEnd(); ++i)
+				SetProxiesHidden(node->children[i], hidden, depth + 1);
+			return;
+		}
+		if (!obj->m_name || _strnicmp(obj->m_name, "SMP Proxy:", 10) != 0)
+			return;
+		auto& flags = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(obj) + 0x30);
+		flags = hidden ? (flags | 1) : (flags & ~1u);
+	}
+
 	ActorManager* ActorManager::instance()
 	{
 		static ActorManager manager;
@@ -23,6 +43,7 @@ namespace nvsmp
 			// The same node now names another file: rebuild.
 			if (it->second.system)
 				hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(it->second.system.get());
+			SetProxiesHidden(it->second.model.get(), false);
 			m_items.erase(it);
 			it = m_items.end();
 		}
@@ -42,6 +63,7 @@ namespace nvsmp
 			logger::warn("[SMP] {}: the game re-pointed its skin (detached and attached again), building again", model->GetName());
 			it->second.system->m_itemDetached = true;
 			hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(it->second.system.get());
+			SetProxiesHidden(model, false);
 			it->second.system = nullptr;
 			it->second.builds = 0;
 			it->second.failed = false;
@@ -54,6 +76,7 @@ namespace nvsmp
 				logger::warn("[SMP] {}: the game unbound its skin, physics paused until it is bound again", model->GetName());
 				it->second.system->m_itemDetached = true;
 				hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(it->second.system.get());
+				SetProxiesHidden(model, false);
 				it->second.system = nullptr;
 				it->second.builds = 0;
 			}
@@ -170,6 +193,8 @@ namespace nvsmp
 		void* player = Game::Player();
 		RE::NiNode* playerRoot = player ? Game::Get3D(player) : nullptr;
 		m_playerRootName = playerRoot ? playerRoot->GetName() : "(none)";
+		if (RE::NiNode* firstPerson = player ? Game::PlayerFirstPerson3D(player) : nullptr; firstPerson && firstPerson != playerRoot)
+			SetProxiesHidden(firstPerson, true);
 		std::vector<std::pair<float, RE::NiNode*>> actors;
 		if (playerRoot)
 			actors.push_back({ 0.0f, playerRoot });
@@ -197,6 +222,7 @@ namespace nvsmp
 					it->second.system->m_itemDetached = true;   // unequipped, or its actor's 3D went
 					hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(it->second.system.get());
 				}
+				SetProxiesHidden(it->second.model.get(), false);
 				it = m_items.erase(it);
 				continue;
 			}
