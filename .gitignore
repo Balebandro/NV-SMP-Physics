@@ -2,3 +2,4 @@ build/
 *.obj
 *.exe
 *.pdb
+local/

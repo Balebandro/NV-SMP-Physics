@@ -54,11 +54,15 @@ Once a frame, right after New Vegas has animated every actor and before it draws
 | `extern/bullet` | Bullet 3.25 with FSMP's patches (`tools/patch_bullet.pl`: non-Hookean springs, profiler gate) |
 | `extern/imgui` | Dear ImGui, for the menu |
 | `tools/smpify.cpp` | Makes a skinned coat or skirt an SMP item: cloth bone grid, reweighting, partitions, `SMP Bones`, the XML |
+| `tools/smpdress.cpp` | `smpify` for whole outfits: several cloth pieces (grid or radial), bone chains with rigid pieces, low-poly collision proxies, one XML |
+| `tools/smprepair.cpp` | Puts back the SMP bones Outfit Studio drops on export (unweighted bones and their nodes) and rewrites `SMP Bones` |
+| `tools/nifdump.cpp` | Lists a NIF's shapes, their bones and connected pieces |
 | `tools/systemtest.cpp` | Runs the plugin's builder and world on a NIF outside the game, laid out as the game has it in memory, and walks it |
 | `tools/scene.cpp` | That in-memory NIF, shared by the test and the previewer |
 | `tools/previewer` | NV SMP Previewer: the item on a moving body in a window, with the plugin's own physics |
 | `tools/nifcheck.cpp` | What a tool changed in a NIF, block by block, and whether every skin partition is consistent |
-| `tools/kf.cpp` | Reads and samples `.kf` animations (keyframed and B-spline); `tools/kfcheck.cpp` poses a skeleton with them |
+| `tools/kf.cpp` | Reads and samples `.kf` animations (keyframed and B-spline) |
+| `tools/rigpreviewer` | NV Rig Previewer: weights and rigging checks on posed bodies |
 
 ### Changes to FSMP's core
 
@@ -72,15 +76,21 @@ Visual Studio 2022 C++ build tools (x86).
 
 ```
 build.bat                  the plugin: build\NVSMPPhysics.dll
-tools\build_tools.bat      smpify.exe, nifcheck.exe and systemtest.exe
-tools\build_previewer.bat  build\NVSMPPreviewer.exe
-tools\make_content.sh      the Ranger coat (build\content)
+tools\build_tools.bat         smpify, smpdress, smprepair, nifcheck, nifdump and systemtest
+tools\build_previewer.bat     build\NVSMPPreviewer.exe
+tools\build_rigpreviewer.bat  build\NVRigPreviewer.exe
 ```
 
 ## Installing
 
-Copy `NVSMPPhysics.dll` and `NVSMPPhysics.ini` to `Data\nvse\Plugins`, with the items' meshes and XML.
-Needs xNVSE. The menu is on F7. The log is `NVSMPPhysics.log` in the game folder.
+Beta builds are on the [Releases](https://github.com/Balebandro/NV-SMP-Physics/releases) page.
+
+- **The plugin** (`NVSMPPhysics-<version>.zip`): install it with your mod manager, or copy its `nvse` folder into
+  the game's `Data` folder (`Data\nvse\Plugins\NVSMPPhysics.dll` and `.ini`). Needs xNVSE and the game's 1.4.0.525
+  runtime. The plugin does nothing by itself: it simulates items that come with SMP physics (a NIF naming an SMP
+  physics XML, with its `SMP Bones` list). The menu is on F7. The log is `NVSMPPhysics.log` in the game folder.
+- **The previewer** (`NVSMPPreviewer-<version>.zip`): unzip anywhere and run `NVSMPPreviewer.exe` (Windows 10 or
+  later, any Direct3D 9 GPU). It keeps its settings in `NVSMPPreviewer.ini` beside it.
 
 ## Previewing an item
 

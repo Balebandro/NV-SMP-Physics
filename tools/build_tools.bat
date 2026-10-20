@@ -1,5 +1,6 @@
 @echo off
-rem Builds the content tool (build\smpify.exe) and the offline test (build\systemtest.exe).
+rem Builds the content tools (build\smpify.exe, smpdress.exe, smprepair.exe, nifcheck.exe, nifdump.exe) and the offline
+rem test (build\systemtest.exe).
 rem Run build.bat first: the test links the plugin's physics code and build\bullet.lib.
 setlocal
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars32.bat" >nul || exit /b 1
@@ -11,9 +12,9 @@ if not exist "%OUT%\testobj" mkdir "%OUT%\testobj"
 pushd "%OUT%"
 cl /nologo /O2 /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4996 "%ROOT%tools\smpify.cpp" /Fe:smpify.exe /Fo:smpify.obj || (popd & exit /b 1)
 cl /nologo /O2 /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4996 "%ROOT%tools\nifcheck.cpp" /Fe:nifcheck.exe /Fo:nifcheck.obj || (popd & exit /b 1)
-if not exist kfobj mkdir kfobj
-cl /nologo /O2 /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4996 "%ROOT%tools\kfcheck.cpp" "%ROOT%tools\kf.cpp" /Fe:kfcheck.exe /Fo:kfobj\ || (popd & exit /b 1)
-cl /nologo /O2 /EHsc /std:c++17 /W3 "%ROOT%tools\previewer\bsatest.cpp" "%ROOT%tools\previewer\bsa.cpp" "%ROOT%tools\previewer\inflate.cpp" /Fe:bsatest.exe /Fo:kfobj\ || (popd & exit /b 1)
+cl /nologo /O2 /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4996 "%ROOT%tools\smpdress.cpp" /Fe:smpdress.exe /Fo:smpdress.obj || (popd & exit /b 1)
+cl /nologo /O2 /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4996 "%ROOT%tools\smprepair.cpp" /Fe:smprepair.exe /Fo:smprepair.obj || (popd & exit /b 1)
+cl /nologo /O2 /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4996 "%ROOT%tools\nifdump.cpp" /Fe:nifdump.exe /Fo:nifdump.obj || (popd & exit /b 1)
 popd
 
 pushd "%OUT%\testobj"
