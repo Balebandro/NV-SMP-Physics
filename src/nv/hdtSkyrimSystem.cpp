@@ -1192,6 +1192,10 @@ namespace hdt
 			bone->m_marginMultipler = boneTemplate.m_marginMultipler;
 			bone->m_gravityFactor = boneTemplate.m_gravityFactor;
 			bone->m_windFactor = boneTemplate.m_windFactor;
+			bone->m_shapeCollides = boneTemplate.m_collisionFilter != 0 && boneTemplate.m_collisionShape &&
+				boneTemplate.m_collisionShape->getShapeType() != EMPTY_SHAPE_PROXYTYPE;
+			bone->m_canCollideWithBone = boneTemplate.m_canCollideWithBone;
+			bone->m_noCollideWithBone = boneTemplate.m_noCollideWithBone;
 
 			bone->readTransform(RESET_PHYSICS);
 

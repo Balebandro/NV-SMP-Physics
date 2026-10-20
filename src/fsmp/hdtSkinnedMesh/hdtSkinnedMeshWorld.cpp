@@ -89,8 +89,12 @@ namespace hdt
 
 		for (int i = 0; i < system->m_bones.size(); ++i) {
 			system->m_bones[i]->m_rig.setActivationState(DISABLE_DEACTIVATION);
-			// 0,0 mask disables the collision of this object on Bullet.
-			addRigidBody(&system->m_bones[i]->m_rig, 0, 0);
+			// 0,0 mask disables the collision of this object on Bullet. New Vegas: bones whose shape collides go in
+			// group 2, which pairs only with itself (the skinned meshes are group 1).
+			if (system->m_bones[i]->m_shapeCollides)
+				addRigidBody(&system->m_bones[i]->m_rig, 2, 2);
+			else
+				addRigidBody(&system->m_bones[i]->m_rig, 0, 0);
 		}
 
 		for (auto i : system->m_constraintGroups)
@@ -452,6 +456,18 @@ namespace hdt
 		}
 
 		btDiscreteDynamicsWorldMt::solveConstraints(solverInfo);
+
+		// New Vegas: bone shape pairs got Bullet collision algorithms (each owning a manifold) from the near callback.
+		// Every manifold is freed below, so the algorithms go first (they release their own manifolds) and are made
+		// afresh next step; else they would keep pointers to freed manifolds.
+		{
+			auto* pairs = m_broadphasePairCache->getOverlappingPairCache();
+			for (int i = 0; i < pairs->getNumOverlappingPairs(); ++i) {
+				btBroadphasePair& pair = pairs->getOverlappingPairArrayPtr()[i];
+				if (pair.m_algorithm)
+					pairs->cleanOverlappingPair(pair, m_dispatcher1);
+			}
+		}
 
 		// the HDT manifolds are still recreated every frame, clear to prevent stale data.
 		static_cast<CollisionDispatcher*>(m_dispatcher1)->clearAllManifold();
