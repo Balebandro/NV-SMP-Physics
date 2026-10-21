@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <fstream>
 #include <numeric>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -345,6 +346,7 @@ struct Settings
 	bool showBones = false;
 	bool showConstraints = false;
 	bool showColliders = false;
+	bool showProxies = false;   // the hidden "SMP Proxy:" collision stand-ins, as a wireframe
 	std::string heatBone;        // Weights: the bone whose weights the item shows as a heat map (empty: off)
 	bool showFloor = true;
 	bool autoReload = true;
@@ -398,10 +400,35 @@ static xmledit::Doc gXml;
 static std::string gXmlPath;
 static bool gOpenValues = false;   // --values: the panel starts open (for screenshots)
 
+// The XML's collision meshes (per-triangle-shape) the NIF has no low-poly stand-in for ("SMP Proxy:<name>", smpdress
+// --proxy): skinned in full for every contact, they cost far more in game. Names as the NIF has them.
+static std::vector<std::string> gMissingProxies;
+static bool gXmlArchived = false;   // the XML was found inside a BSA (it cannot be rewritten in place)
+
+static std::vector<std::string> MissingProxies(const std::string& xmlText)
+{
+	std::vector<std::string> out;
+	std::regex re("<per-triangle-shape[^>]*\\bname\\s*=\\s*\"([^\"]+)\"", std::regex::icase);
+	std::set<std::string> names;
+	for (auto& s : gItem.shapes) if (s.info.geometry->m_name) names.insert(s.info.geometry->m_name);
+	auto has = [&](const std::string& n) { for (auto& m : names) if (_stricmp(m.c_str(), n.c_str()) == 0) return m; return std::string(); };
+	for (std::sregex_iterator it(xmlText.begin(), xmlText.end(), re), end; it != end; ++it) {
+		std::string n = (*it)[1].str();
+		if (_strnicmp(n.c_str(), "SMP Proxy:", 10) == 0) continue;
+		std::string shape = has(n);
+		if (shape.empty() || !has("SMP Proxy:" + n).empty()) continue;   // not in the NIF (a virtual body's), or done
+		bool skinned = false;
+		for (auto& s : gItem.shapes) if (s.info.geometry->m_name && shape == s.info.geometry->m_name) skinned = s.info.geometry->skinInstance != nullptr;
+		if (skinned && std::find(out.begin(), out.end(), shape) == out.end()) out.push_back(shape);
+	}
+	return out;
+}
+
 // Builds (or rebuilds) the physics for the loaded item from its XML.
 static void BuildSystem()
 {
 	auto* world = hdt::SkyrimPhysicsWorld::get();
+	gMissingProxies.clear();
 	if (gItem.system) {
 		world->removeSkinnedMeshSystem(gItem.system.get());
 		gItem.system = nullptr;   // gives the skin slots back
@@ -413,7 +440,13 @@ static void BuildSystem()
 		return;
 	}
 	gItem.xmlNamed = gItem.scene.physicsFile;
-	gItem.xmlPath = datafiles::Resolve(gItem.roots, gItem.xmlNamed);
+	{
+		std::string source;
+		gItem.xmlPath = datafiles::Resolve(gItem.roots, gItem.xmlNamed, &source);
+		std::string l = source;
+		for (auto& c : l) c = (char)tolower((unsigned char)c);
+		gXmlArchived = l.size() > 4 && l.compare(l.size() - 4, 4, ".bsa") == 0;
+	}
 	if (gItem.xmlPath.empty()) {
 		// Not under a Data folder: next to the NIF, by file name.
 		std::string base = fs::path(gItem.xmlNamed).filename().string();
@@ -436,6 +469,12 @@ static void BuildSystem()
 	if (xml.empty()) {
 		AddLog(4, "physics file '" + gItem.xmlNamed + "' not found in any Data folder or next to the NIF");
 		return;
+	}
+	gMissingProxies = MissingProxies(datafiles::ReadFile(xml));
+	if (!gMissingProxies.empty()) {
+		std::string l;
+		for (auto& m : gMissingProxies) l += (l.empty() ? "" : ", ") + m;
+		AddLog(3, "collision against the full meshes (no low-poly proxies): " + l);
 	}
 
 	hdt::DefaultBBP::PhysicsFile_t file{ gItem.xmlNamed, {} };
@@ -1304,11 +1343,16 @@ static void DrawScene(const M4& viewProj, const M4& view, const M4& proj)
 	gDev->SetRenderState(D3DRS_DEPTHBIAS, 0);
 	gDev->SetTexture(0, nullptr);
 	for (auto& s : gItem.shapes) {
-		if (!s.visible || s.indices.empty()) continue;
+		if (s.indices.empty()) continue;
+		// A proxy is hidden (never drawn in game), so it is skinned here when Proxies shows it.
+		const char* name = s.info.geometry->m_name;
+		const bool proxy = gS.showProxies && name && _strnicmp(name, "SMP Proxy:", 10) == 0;
+		if (!s.visible && !proxy) continue;
+		if (!s.visible) SkinShape(s);
 		bool collider = gS.showColliders && s.collider;
-		if (!gS.wireframe && !collider) continue;
-		const float cloth[4] = { 1.0f, 0.62f, 0.15f, 1 }, body[4] = { 0.25f, 0.85f, 1.0f, 1 }, wire[4] = { 0.05f, 0.05f, 0.05f, 1 };
-		SetPS(collider ? (s.collider == 1 ? cloth : body) : wire, 0, 0, 1);
+		if (!gS.wireframe && !collider && !proxy) continue;
+		const float cloth[4] = { 1.0f, 0.62f, 0.15f, 1 }, body[4] = { 0.25f, 0.85f, 1.0f, 1 }, wire[4] = { 0.05f, 0.05f, 0.05f, 1 }, stand[4] = { 1.0f, 0.35f, 0.85f, 1 };
+		SetPS(proxy ? stand : collider ? (s.collider == 1 ? cloth : body) : wire, 0, 0, 1);
 		gDev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, (UINT)s.verts.size(), (UINT)s.indices.size() / 3, s.indices.data(), D3DFMT_INDEX16, s.verts.data(), sizeof(MeshVertex));
 	}
 	gDev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
@@ -1453,6 +1497,17 @@ static void Panels(float fps)
 			if (ImGui::Button("Add SMP Bones list")) maker::AddBoneLists(gItem.nifPath, gAnim.skeletonPath);
 			ImGui::EndDisabled();
 			Help("Writes the list into this NIF (the old one is kept as .bak) with smprepair --list, against the game's skeleton found in your Data folders, and reloads it.");
+		}
+		if (!gMissingProxies.empty()) {
+			std::string l;
+			for (auto& m : gMissingProxies) l += (l.empty() ? "" : ", ") + m;
+			ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "No collision proxies: collides with the full meshes");
+			ImGui::TextDisabled("  %s", l.c_str());
+			ImGui::BeginDisabled(maker::gM.running || gXmlArchived);
+			if (ImGui::Button("Generate collision proxies")) maker::GenerateProxies(gItem.nifPath, gItem.xmlPath, gMissingProxies, 3.0f);
+			ImGui::EndDisabled();
+			Help(gXmlArchived ? "The XML is inside a BSA archive: extract it to a mod folder first (it is rewritten)."
+			                  : "Adds a hidden low-poly stand-in for each of these meshes to the NIF (smpdress --proxy 3) and points the XML's collision at them: far cheaper in game, about the same collisions. Both files are kept first; then it reloads.");
 		}
 		if (gItem.system)
 			ImGui::Text("%zu bones (%d simulated), %d constraints, %zu bodies", gItem.system->getBones().size(), gItem.simulatedBones, gItem.constraintCount, gItem.system->meshes().size());
@@ -1814,7 +1869,8 @@ static void Panels(float fps)
 		toggle("Bones", gS.showBones, kDefaults.showBones, true);
 		toggle("Constraints", gS.showConstraints, kDefaults.showConstraints, false);
 		toggle("Collision", gS.showColliders, kDefaults.showColliders, true);
-		Help("Bones: orange simulated, grey animated. Constraints: the links between bones. Collision: orange = cloth (per-vertex), blue = body (per-triangle).");
+		toggle("Proxies", gS.showProxies, kDefaults.showProxies, false);
+		Help("Bones: orange simulated, grey animated. Constraints: the links between bones. Collision: orange = cloth (per-vertex), blue = body (per-triangle). Proxies: the hidden low-poly collision stand-ins ('SMP Proxy:'), magenta.");
 		ImGui::ColorEdit3("Background", gS.background, ImGuiColorEditFlags_NoInputs);
 		{
 			bool differs = memcmp(gS.background, kDefaults.background, sizeof gS.background) != 0;
@@ -1861,15 +1917,46 @@ static void Panels(float fps)
 			}
 		}
 		if (gItem.loaded && ImGui::TreeNode("Shapes")) {
+			// Per shape, a pick for "Generate proxies for the picked shapes" below (skinned shapes only: a proxy is skinned).
+			static std::string pickedFor;
+			static std::set<std::string> picked;
+			static int proxyMaxTris = 1000;
+			if (pickedFor != gItem.nifPath) { picked.clear(); pickedFor = gItem.nifPath; }
 			for (size_t i = 0; i < gItem.shapes.size(); i++) {
 				auto& s = gItem.shapes[i];
 				ImGui::PushID((int)i);   // shapes can share a name
+				const char* name = s.info.geometry->m_name;
+				if (name && s.info.geometry->skinInstance) {
+					bool pick = picked.count(name) != 0;
+					if (ImGui::Checkbox("##proxy", &pick)) { if (pick) picked.insert(name); else picked.erase(name); }
+					if (ImGui::IsItemHovered())
+						ImGui::SetTooltip(_strnicmp(name, "SMP Proxy:", 10) == 0 ? "Rebuild this proxy low-poly (%zu triangles now), under the same name"
+						                                                        : "Make a collision proxy for this shape (%zu triangles)", s.indices.size() / 3);
+					ImGui::SameLine();
+				}
 				ImGui::Checkbox(s.info.geometry->m_name ? s.info.geometry->m_name : "(unnamed)", &s.visible);
 				if (s.collider) { ImGui::SameLine(); ImGui::TextColored(s.collider == 1 ? ImVec4(1, 0.62f, 0.15f, 1) : ImVec4(0.25f, 0.85f, 1, 1), s.collider == 1 ? "cloth" : "body"); }
 				if (!s.textureNote.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", s.info.diffuse.c_str(), s.textureNote.c_str());
 				{ bool shown = true; Undo("visible", s.visible, shown); }
 				ImGui::PopID();
 			}
+			std::vector<std::string> shapes;
+			for (auto& s : gItem.shapes)
+				if (s.info.geometry->m_name && picked.count(s.info.geometry->m_name) &&
+				    std::find(shapes.begin(), shapes.end(), s.info.geometry->m_name) == shapes.end())
+					shapes.push_back(s.info.geometry->m_name);
+			ImGui::SetNextItemWidth(120);
+			if (ImGui::InputInt("Max triangles", &proxyMaxTris, 100, 1000)) proxyMaxTris = std::clamp(proxyMaxTris, 50, 65535);
+			Help("Each proxy is made as fine as it can be within this many triangles (its vertices merged in cells, the cells grown until it fits). Fewer is cheaper for the physics and rougher.");
+			ImGui::BeginDisabled(shapes.empty() || maker::gM.running || gXmlArchived);
+			if (ImGui::Button(shapes.empty() ? "Generate proxies (tick shapes above)" : ("Generate proxies for " + std::to_string(shapes.size()) + " shape(s)").c_str())) {
+				maker::GenerateProxies(gItem.nifPath, gItem.xmlPath, shapes, 1.0f, proxyMaxTris);
+				picked.clear();
+			}
+			ImGui::EndDisabled();
+			Help("For each ticked shape, a hidden low-poly stand-in in the NIF ('SMP Proxy:<shape>': its own properties, a never-pass alpha, "
+			     "not culled; the plugin hides it in game) and the XML's collision against that shape pointed at it. A ticked proxy is rebuilt "
+			     "low-poly in place; a shape's existing proxy is replaced. Both files are kept first; then it reloads.");
 			ImGui::TreePop();
 		}
 	}
@@ -2027,7 +2114,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	AddLog(2, "NV SMP Previewer: FSMP physics core, Bullet " + std::to_string(btGetVersion()));
 
 	// Command line: [item.nif] and, for automated captures, --motion N --shots prefix --every frames
-	// --count n --show bones,constraints,collision,wire --yaw deg --pitch deg --dist units --noui --exit.
+	// --count n --show bones,constraints,collision,proxies,wire --yaw deg --pitch deg --dist units --noui --exit.
 	int argc = 0;
 	LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 	std::vector<std::string> args;
@@ -2041,6 +2128,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	std::string clipMeshOut;   // --clipmesh file: how much the cloth shapes sink into the body collision shapes (see below)
 	std::string recipe;   // --recipe file: the Make SMP window loads it (with --maker-build: and builds it, for testing)
 	bool addBoneLists = false;
+	bool genProxies = false;
+	std::vector<std::string> proxyShapes;   // --proxy-shape: the Shapes list's Generate proxies button, for these, pressed once
 	float stroke[4] = { -1, 0, 0, 0 };   // --paint-stroke x0 y0 x1 y1 (window fractions): a simulated brush drag from frame 60 to 120, for testing
 	bool buildAfterStroke = false;
 	int shotEvery = 20, shotCount = 0;
@@ -2081,12 +2170,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--recipe") recipe = next();
 		else if (a == "--maker-build") maker::gM.buildOnOpen = true;
 		else if (a == "--add-bone-lists") addBoneLists = true;   // testing: the Add SMP Bones list button, pressed once
+		else if (a == "--gen-proxies") genProxies = true;   // testing: the Generate collision proxies button, pressed once
+		else if (a == "--proxy-shape") proxyShapes.push_back(next());   // testing: Generate proxies for the picked shapes
 		else if (a == "--paint-stroke") for (int k = 0; k < 4; k++) stroke[k] = (float)atof(next().c_str());
 		else if (a == "--show") {
 			std::string s = next();
 			gS.showBones = s.find("bones") != std::string::npos;
 			gS.showConstraints = s.find("constraints") != std::string::npos;
 			gS.showColliders = s.find("collision") != std::string::npos;
+			gS.showProxies = s.find("proxies") != std::string::npos;
 			gS.wireframe = s.find("wire") != std::string::npos;
 		} else if (a.rfind("--", 0) != 0) start = a;
 	}
@@ -2095,6 +2187,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	if (!start.empty() && fs::exists(start)) LoadItem(start);
 	if (!recipe.empty()) { maker::gM.open = true; maker::LoadRecipe(recipe); }
 	if (addBoneLists && !gMissingBoneLists.empty()) maker::AddBoneLists(gItem.nifPath, gAnim.skeletonPath);
+	if (genProxies && !gMissingProxies.empty()) maker::GenerateProxies(gItem.nifPath, gItem.xmlPath, gMissingProxies, 3.0f);
+	if (!proxyShapes.empty() && gItem.loaded) maker::GenerateProxies(gItem.nifPath, gItem.xmlPath, proxyShapes, 1.0f, 1000);
 	if (stroke[0] >= 0) { maker::gM.open = true; buildAfterStroke = maker::gM.buildOnOpen; maker::gM.buildOnOpen = false; }
 	int frameNo = 0, shotsTaken = 0;
 

@@ -35,7 +35,9 @@
 //                     gets its own templates from those two)
 //   --collide "Shape" a shape of the same NIF everything above collides with (repeatable)
 //   --proxy cell      the colliders collide through low-poly stand-ins hidden in the NIF (vertices merged in cells of
-//                     this many units, about 2-4): far cheaper for the physics to skin and test than the render meshes
+//                     this many units, about 2-4): far cheaper for the physics to skin and test than the render meshes.
+//                     A collider named "SMP Proxy:..." is rebuilt in place; a shape's existing proxy is replaced.
+//   --proxy-tris n    coarsen each proxy's cell (from --proxy's, default 1) until it has at most n triangles
 //   --collide-skip "Bone"   leave out of every collider the triangles weighted only to this bone (and others skipped):
 //                     parts the cloth never reaches (lower legs, forearms) cost time to skin and test (repeatable)
 //   --cloth-margin m, --body-margin m, --penetration d   collision margins (defaults 1, 0.5, 3); lower them for cloth
@@ -439,6 +441,7 @@ static int buildProxy(File& f, int shapeBlock, float cell, const std::string& pr
 	Geometry pg = g;
 	pg.av.name = f.addString(proxyName);
 	pg.av.extraData.clear();
+	pg.av.flags &= ~1u;   // never app-culled: a proxy culled before the game binds its skin never collides (2026-10-19)
 	{
 		// NiAlphaProperty: alpha test on (bit 9), test NEVER (7 << 10), no blending; replaces the shape's own. The
 		// game's shaders ignore it, but it hides the stand-in in NIF viewers. The stand-in's other properties are its
@@ -461,6 +464,98 @@ static int buildProxy(File& f, int shapeBlock, float cell, const std::string& pr
 	pg.data = dataBlk;
 	pg.skin = siBlk;
 	return f.addBlock(f.typeOf(shapeBlock) == "NiTriStrips" ? "NiTriShape" : f.typeOf(shapeBlock), pg.write());
+}
+
+// --proxy-tris: the finest cell (from `cell` up) whose stand-in has at most `maxTris` triangles. buildProxy only
+// appends blocks, so each try's blocks are dropped again before the next.
+static int buildProxyUnder(File& f, int shapeBlock, float cell, int maxTris, const std::string& name, int& tris0, int& tris1, float& used)
+{
+	const size_t firstNew = f.blocks.size();
+	auto attempt = [&](float c) {
+		f.blocks.resize(firstNew);
+		f.blockTypeIndex.resize(firstNew);
+		return buildProxy(f, shapeBlock, c, name, tris0, tris1);
+	};
+	used = cell;
+	int blk = attempt(cell);
+	if (maxTris <= 0 || tris1 <= maxTris) return blk;
+	float lo = cell, hi = cell;
+	do { lo = hi; hi *= 1.5f; blk = attempt(hi); } while (tris1 > maxTris && hi < 1000.0f);
+	for (int k = 0; k < 10; k++) {   // lo is too fine, hi fits: the finest that fits, near enough
+		float mid = 0.5f * (lo + hi);
+		attempt(mid);
+		if (tris1 <= maxTris) hi = mid; else lo = mid;
+	}
+	used = hi;
+	return attempt(hi);
+}
+
+// A new stand-in over an existing one ("SMP Proxy:X" rebuilt, or the old proxy of a shape): the new blocks take the
+// old ones' slots (shape, geometry data, skin instance, skin data, partition, properties of the same type), so the
+// old dense geometry does not stay in the file unreferenced and the parent keeps pointing at the same block. New
+// blocks with no old slot move down to close the gaps. Everything buildProxy added is at or after `firstNew`, and only
+// the new shape and skin instance refer to those blocks.
+static void replaceProxy(File& f, int oldShape, int newShape, int firstNew)
+{
+	// How many shapes use each old block: a slot another shape shares is left alone.
+	std::map<int, int> users;
+	for (int i = 0; i < firstNew; i++) {
+		const std::string& t = f.typeOf(i);
+		if (t != "NiTriShape" && t != "NiTriStrips") continue;
+		Geometry g;
+		g.read(f.blocks[i]);
+		users[g.data]++;
+		for (auto p : g.av.properties) users[p]++;
+		if (g.skin < 0) continue;
+		users[g.skin]++;
+		SkinInstance si;
+		si.read(f.blocks[g.skin], f.typeOf(g.skin) == "BSDismemberSkinInstance");
+		users[si.data]++;
+		users[si.partition]++;
+	}
+	Geometry og, ng;
+	og.read(f.blocks[oldShape]);
+	ng.read(f.blocks[newShape]);
+	SkinInstance oi, ni;
+	if (og.skin >= 0) oi.read(f.blocks[og.skin], f.typeOf(og.skin) == "BSDismemberSkinInstance");
+	ni.read(f.blocks[ng.skin], false);
+	const int newSkin = ng.skin;
+
+	std::map<int, int> slot;   // new block -> the old slot it takes
+	auto take = [&](int nw, int old) {
+		if (nw < firstNew || old < 0 || old >= firstNew || slot.count(nw) || users[old] != 1) return false;
+		for (auto& [n, o] : slot) if (o == old) return false;
+		slot[nw] = old;
+		return true;
+	};
+	slot[newShape] = oldShape;
+	take(ng.data, og.data);
+	if (og.skin >= 0) { take(newSkin, og.skin); take(ni.data, oi.data); take(ni.partition, oi.partition); }
+	for (auto np : ng.av.properties)
+		for (auto op : og.av.properties)
+			if (op >= 0 && f.typeOf(op) == f.typeOf(np) && take(np, op)) break;
+
+	std::map<int, int> where;   // every new block's final index
+	int next = firstNew;
+	for (int n = firstNew; n < (int)f.blocks.size(); n++) where[n] = slot.count(n) ? slot[n] : next++;
+	auto remap = [&](int32_t r) { return r >= firstNew ? where[r] : r; };
+	ng.data = remap(ng.data);
+	ng.skin = remap(ng.skin);
+	for (auto& p : ng.av.properties) p = remap(p);
+	f.blocks[newShape] = ng.write();
+	ni.data = remap(ni.data);
+	ni.partition = remap(ni.partition);
+	f.blocks[newSkin] = ni.write();
+
+	std::vector<Bytes> blocks(f.blocks.begin() + firstNew, f.blocks.end());
+	std::vector<uint16_t> types(f.blockTypeIndex.begin() + firstNew, f.blockTypeIndex.end());
+	f.blocks.resize(firstNew);
+	f.blockTypeIndex.resize(firstNew);
+	for (int n = firstNew; n < firstNew + (int)blocks.size(); n++) {
+		int to = where[n];
+		if (to < firstNew) { f.blocks[to] = std::move(blocks[n - firstNew]); f.blockTypeIndex[to] = types[n - firstNew]; }
+		else { f.blocks.push_back(std::move(blocks[n - firstNew])); f.blockTypeIndex.push_back(types[n - firstNew]); }
+	}
 }
 
 static JobResult runJob(File& f, AVObject& root, const Job& job, const std::string& physicsPath, std::vector<int>& newNodeBlocks)
@@ -922,6 +1017,7 @@ int main(int argc, char** argv)
 	std::vector<std::string> colliders;
 	std::vector<std::string> collideSkip;   // --collide-skip "Bone": the colliders' triangles weighted only to these bones are left out
 	float proxyCell = 0;                    // --proxy cell: the colliders' low-poly stand-ins (0: collide with the render meshes)
+	int proxyMaxTris = 0;                   // --proxy-tris n: coarsen each stand-in's cell until it has at most n triangles
 	float clothMargin = 1.0f, bodyMargin = 0.5f, penetration = 3.0f;   // --cloth-margin, --body-margin, --penetration
 	float bend = 1.0f, stiffness = 1.0f;   // --bend, --stiffness: the cloth links' swing limits and springs, scaled
 	bool weft = true;                      // --no-weft: no links between neighbouring columns
@@ -956,6 +1052,7 @@ int main(int argc, char** argv)
 		else if (a == "--collide") { need(1); colliders.push_back(argv[++i]); }
 		else if (a == "--collide-skip") { need(1); collideSkip.push_back(argv[++i]); }
 		else if (a == "--proxy") { need(1); proxyCell = (float)atof(argv[++i]); }
+		else if (a == "--proxy-tris") { need(1); proxyMaxTris = atoi(argv[++i]); if (proxyCell <= 0) proxyCell = 1.0f; }
 		else if (a == "--anchor") { need(1); cur().anchor = argv[++i]; }
 		else if (a == "--top") { need(1); cur().top = (float)atof(argv[++i]); }
 		else if (a == "--angles") { need(2); cur().angles = true; cur().angleLo = (float)atof(argv[++i]); cur().angleHi = (float)atof(argv[++i]); }
@@ -1010,9 +1107,22 @@ int main(int argc, char** argv)
 			for (size_t c = 0; c < colliders.size(); c++) {
 				int blk = findBlockByName(f, colliders[c]);
 				if (blk < 0) throw std::runtime_error("collision shape not found: " + colliders[c]);
-				std::string name = "SMP Proxy:" + colliders[c];
+				// A proxy given as the shape is rebuilt in place (same name: the physics file needs no change); a shape
+				// that has a proxy already gets it replaced, not a second one.
+				const bool rebuild = colliders[c].rfind("SMP Proxy:", 0) == 0;
+				std::string name = rebuild ? colliders[c] : "SMP Proxy:" + colliders[c];
+				const int existing = rebuild ? blk : findBlockByName(f, name);
+				const int firstNew = (int)f.blocks.size();
 				int t0, t1;
-				int pblk = buildProxy(f, blk, proxyCell, name, t0, t1);
+				float cellUsed = proxyCell;
+				int pblk = buildProxyUnder(f, blk, proxyCell, proxyMaxTris, name, t0, t1, cellUsed);
+				if (cellUsed != proxyCell) printf("proxy %s: cell %.2f to stay under %d triangles\n", colliders[c].c_str(), cellUsed, proxyMaxTris);
+				if (existing >= 0) {
+					replaceProxy(f, existing, pblk, firstNew);
+					printf("proxy %s: %d -> %d triangles (%s)\n", colliders[c].c_str(), t0, t1, rebuild ? "rebuilt in place" : "replaces the old proxy");
+					colliderShapes[c] = name;
+					continue;
+				}
 				bool placed = std::find(root.children.begin(), root.children.end(), blk) != root.children.end();
 				if (placed) root.children.push_back(pblk);
 				for (size_t n = 0; n < f.blocks.size() && !placed; n++) {

@@ -161,6 +161,31 @@ namespace hdt
 			m_drawnRelValid = false;
 		}
 
+		// A blown-up body (a non-finite transform) is never drawn: a skinned shape's bound comes from its bones, so one
+		// such bone gives the item, and with it the whole actor, a broken bound, and the game stops drawing the actor
+		// (an invisible player). The bone goes back to rest on its anchor (or parent) and its body starts again there.
+		const btVector3& o = drawn.getOrigin();
+		const btMatrix3x3& m = drawn.getBasis();
+		bool finite = std::isfinite(o.x()) && std::isfinite(o.y()) && std::isfinite(o.z());
+		for (int r = 0; r < 3 && finite; ++r)
+			finite = std::isfinite(m[r].x()) && std::isfinite(m[r].y()) && std::isfinite(m[r].z());
+		if (!finite) {
+			if (m_anchor) m_node->world = m_anchor->world * m_anchorToNode;
+			else if (m_node->parent) m_node->world = m_node->parent->world * m_node->local;
+			const btTransform rest = convertNi(m_node->world).asTransform() * m_localToRig;
+			static const btVector3 zero(0, 0, 0);
+			m_rig.setWorldTransform(rest);
+			m_rig.setInterpolationWorldTransform(rest);
+			m_rig.setLinearVelocity(zero);
+			m_rig.setAngularVelocity(zero);
+			m_rig.setInterpolationLinearVelocity(zero);
+			m_rig.setInterpolationAngularVelocity(zero);
+			m_currentTransform = convertNi(m_node->world);
+			m_filterReady = false;
+			m_drawnRelValid = false;
+			return;
+		}
+
 		m_node->world.rotate = convertBt(drawn.getBasis());
 		m_node->world.translate = convertBt(drawn.getOrigin());
 

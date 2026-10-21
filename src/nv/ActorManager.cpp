@@ -4,6 +4,7 @@
 #include "hdtSkyrimPhysicsWorld.h"
 
 #include <algorithm>
+#include <unordered_set>
 
 namespace nvsmp
 {
@@ -27,6 +28,145 @@ namespace nvsmp
 			return;
 		auto& flags = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(obj) + 0x30);
 		flags = hidden ? (flags | 1) : (flags & ~1u);
+	}
+
+	// The game drops an item's own bone nodes from the scene when it attaches the item, but until it binds the item's
+	// skin to the skeleton (after the Pip-Boy closes, seconds later) the skin still points at them. Nothing places them
+	// any more: they sit at the world origin, or hold garbage. So the item was drawn at the origin (invisible to the
+	// player), and a garbage one gave it an infinite bound, which took the whole player with it. Those nodes may be
+	// freed, or their memory reused by something else (writing them crashed the game), so they are never written:
+	// while the plugin waits for the bind, each slot not on a live skeleton bone gets a node of the plugin's own with
+	// the same name, put at its rest pose every frame -- onto the skeleton bone of that name, or at its bind offset
+	// from one (as SkyrimSystemCreator::createExtraBoneNode places its nodes), a slot already on a live skeleton bone
+	// preferred as that one. The game's bind overwrites the slots as it did the old pointers.
+
+	// The plugin's own stand-ins for stale skin slots during a bind wait. Never released: the game may still hold them
+	// in a skin's slots after the plugin lets go of the item (a few hundred bytes a node).
+	static std::vector<RE::NiPointer<RE::NiNode>> g_waitNodes;
+	static std::unordered_set<const RE::NiAVObject*> g_waitSet;
+
+	// A skin slot's node, under SEH (a slot left from an earlier attach may point at a freed object): null if unreadable.
+	static RE::NiAVObject* ReadSlot(RE::NiAVObject** bones, uint32_t i)
+	{
+		__try {
+			return bones[i];
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return nullptr;
+		}
+	}
+
+	// The node's name into `out`, under SEH: false if unreadable or unnamed.
+	static bool CopyName(RE::NiAVObject* node, char* out, size_t size)
+	{
+		__try {
+			const char* n = node->m_name;
+			if (!n) return false;
+			size_t i = 0;
+			for (; i + 1 < size && n[i]; ++i) out[i] = n[i];
+			out[i] = 0;
+			return i > 0;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// Whether the node is a live skeleton bone: under `actor`, outside `model` (the item's subtree). Under SEH.
+	static bool IsLiveBone(RE::NiAVObject* node, RE::NiAVObject* actor, RE::NiAVObject* model)
+	{
+		__try {
+			for (RE::NiAVObject* p = node; p; p = p->parent) {
+				if (p == model) return false;
+				if (p == actor) return true;
+			}
+			return false;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// A node by name under `obj`, outside `skip` (the item's subtree).
+	static RE::NiAVObject* FindOutside(RE::NiAVObject* obj, RE::NiAVObject* skip, const char* name, int depth = 0)
+	{
+		if (!obj || obj == skip || depth > 64)
+			return nullptr;
+		if (obj->m_name && !_stricmp(obj->m_name, name))
+			return obj;
+		if (auto* node = obj->AsNode())
+			for (uint16_t i = 0; i < node->ChildEnd(); ++i)
+				if (auto* found = FindOutside(node->children[i], skip, name, depth + 1))
+					return found;
+		return nullptr;
+	}
+
+	static void PlaceDroppedBones(RE::NiAVObject* obj, RE::NiNode* actor, RE::NiAVObject* model, int depth = 0)
+	{
+		if (!obj || depth > 64)
+			return;
+		if (auto* g = hdt::castNiGeometry(obj)) {
+			auto* skin = g->skinInstance;
+			if (!g->FindStringExtra("SMP Bones") || !skin || !skin->bones || !skin->skinData || !skin->skinData->boneData)
+				return;
+			const uint32_t n = skin->skinData->boneCount;
+			std::vector<RE::NiAVObject*> nodes(n, nullptr), skeleton(n, nullptr);
+			int reference = -1;
+			bool liveReference = false;
+			for (uint32_t i = 0; i < n; ++i) {
+				RE::NiAVObject* slot = ReadSlot(skin->bones, i);
+				if (!slot) continue;
+				char name[128];
+				const bool named = CopyName(slot, name, sizeof(name));
+				if (!g_waitSet.count(slot)) {
+					if (IsLiveBone(slot, actor, model)) {
+						skeleton[i] = slot;   // the best reference, left as it is
+						if (!liveReference) { reference = (int)i; liveReference = true; }
+						continue;
+					}
+					RE::NiPointer<RE::NiNode> own(hdt::createNode(named ? name : "SMP Wait"));
+					if (!own) continue;
+					g_waitNodes.push_back(own);
+					g_waitSet.insert(own.get());
+					skin->bones[i] = own.get();
+					slot = own.get();
+				}
+				nodes[i] = slot;
+				if (named)
+					if (RE::NiAVObject* bone = FindOutside(actor, model, name)) {
+						skeleton[i] = bone;
+						if (reference < 0) reference = (int)i;
+					}
+			}
+			if (reference < 0)
+				return;   // no skeleton bone to place them from: they stay at the origin (finite, so no broken bound)
+			const auto* data = skin->skinData->boneData;
+			const RE::NiTransform skinToWorld = skeleton[reference]->world * data[reference].skinToBone;
+			for (uint32_t i = 0; i < n; ++i)
+				if (nodes[i])
+					nodes[i]->world = skeleton[i] ? skeleton[i]->world : skinToWorld * data[i].skinToBone.Invert();
+			return;
+		}
+		if (auto* node = obj->AsNode())
+			for (uint16_t i = 0; i < node->ChildEnd(); ++i)
+				PlaceDroppedBones(node->children[i], actor, model, depth + 1);
+	}
+
+	// A safety net for the player: while the root's bound radius is not finite (one broken bone in any skinned item makes
+	// it so, and the game then draws nothing of the player), the last good radius is written back so the view test
+	// passes. The bound (a pointer at NiAVObject +0x20 in New Vegas) is read under SEH; the game recomputes it each
+	// frame, so this holds only while it is needed.
+	static bool KeepRadius(RE::NiAVObject* obj, float& lastGood)
+	{
+		__try {
+			auto* b = *reinterpret_cast<RE::NiBound**>(reinterpret_cast<uint8_t*>(obj) + 0x20);
+			if (!b || !std::isfinite(b->center.x) || !std::isfinite(b->center.y) || !std::isfinite(b->center.z))
+				return false;
+			if (std::isfinite(b->radius) && b->radius > 0)
+				lastGood = b->radius;
+			else if (lastGood > 0)
+				b->radius = lastGood;
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
 	}
 
 	ActorManager* ActorManager::instance()
@@ -82,6 +222,8 @@ namespace nvsmp
 			}
 			if (!it->second.waiting)
 				logger::info("[SMP] {}: waiting for the game to bind its skin", model->GetName());
+			// The item's stale bone slots are held at rest meanwhile (see PlaceDroppedBones).
+			PlaceDroppedBones(model, root, model);
 			it->second.waiting = true;
 			it->second.buildAt = m_frame + kSettleFrames;
 			return;
@@ -193,6 +335,8 @@ namespace nvsmp
 		void* player = Game::Player();
 		RE::NiNode* playerRoot = player ? Game::Get3D(player) : nullptr;
 		m_playerRootName = playerRoot ? playerRoot->GetName() : "(none)";
+		if (playerRoot)
+			KeepRadius(playerRoot, m_lastRootRadius);
 		if (RE::NiNode* firstPerson = player ? Game::PlayerFirstPerson3D(player) : nullptr; firstPerson && firstPerson != playerRoot)
 			SetProxiesHidden(firstPerson, true);
 		std::vector<std::pair<float, RE::NiNode*>> actors;

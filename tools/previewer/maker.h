@@ -10,6 +10,7 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <functional>
 #include <thread>
 
 #include "backup.h"
@@ -107,6 +108,7 @@ namespace maker
 		std::atomic<bool> running{ false }, finished{ false };
 		int exitCode = 0;
 		std::string resultNif, recipeToSave, lastCommand, lastResult;
+		std::function<void()> afterSuccess;   // runs once the tool succeeded, before the result is opened
 		bool buildOnOpen = false;           // --maker-build (testing): build once the window has a source
 	};
 	static State gM;
@@ -348,6 +350,7 @@ namespace maker
 		std::string cmd = Quote(exe);
 		for (auto& a : args) cmd += " " + Quote(a);
 		gM.lastCommand = cmd;
+		gM.afterSuccess = nullptr;
 		gM.resultNif = resultNif;
 		gM.recipeToSave = recipePath;
 		gM.running = true;
@@ -416,6 +419,8 @@ namespace maker
 		gM.worker.join();
 		gM.running = false;
 		gM.finished = false;
+		auto after = std::move(gM.afterSuccess);
+		gM.afterSuccess = nullptr;
 		if (gM.exitCode != 0) {
 			gM.lastResult = "failed (see the log)";
 			AddLog(4, "the build failed: nothing was opened");
@@ -425,6 +430,7 @@ namespace maker
 			std::ofstream(gM.recipeToSave) << RecipeText();
 			AddLog(2, "recipe saved: " + gM.recipeToSave);
 		}
+		if (after) after();
 		gM.lastResult = "done: " + gM.resultNif;
 		LoadItem(gM.resultNif);
 	}
@@ -500,6 +506,51 @@ namespace maker
 		Backup(nif);
 		if (gM.mode == Coat || jobs) Backup(xml);
 		Run(gM.mode == Coat ? "smpify.exe" : "smpdress.exe", a, nif, (gM.mode == Coat || jobs) ? xml + ".smprecipe" : std::string());
+	}
+
+	/* Low-poly collision proxies for an armour that collides with its full meshes: smpdress's proxy-only mode adds a
+	   hidden "SMP Proxy:<name>" stand-in beside each of `shapes` in the NIF (vertices merged in cells of `cell` units),
+	   then, once that worked, the XML's per-triangle-shapes of those names are renamed to the proxies (the plugin
+	   hides the proxies in game). Both files kept first (backup.h); the result opened. A shape that is a proxy already
+	   ("SMP Proxy:...") is rebuilt in place under its name, and a shape's existing proxy is replaced (smpdress).
+	   maxTris > 0: each proxy's cell grows from `cell` until it has at most that many triangles (smpdress --proxy-tris). */
+	static void GenerateProxies(const std::string& nif, const std::string& xml, const std::vector<std::string>& shapes, float cell, int maxTris = 0)
+	{
+		if (nif.empty() || shapes.empty()) return;
+		Backup(nif);
+		if (!xml.empty()) Backup(xml);
+		std::vector<std::string> a = { nif, nif, "x", "x" };
+		for (auto& s : shapes) { a.push_back("--collide"); a.push_back(s); }
+		a.push_back("--proxy");
+		a.push_back(Num(cell));
+		if (maxTris > 0) { a.push_back("--proxy-tris"); a.push_back(std::to_string(maxTris)); }
+		Run("smpdress.exe", a, nif, {});
+		if (!gM.running) return;   // could not start it
+		gM.afterSuccess = [xml, shapes]() {
+			if (xml.empty()) return;
+			std::ifstream in(xml, std::ios::binary);
+			std::string text((std::istreambuf_iterator<char>(in)), {});
+			in.close();
+			int renamed = 0;
+			for (auto& s : shapes) {
+				// A proxy rebuilt in place keeps its name: the XML already points at it.
+				if (_strnicmp(s.c_str(), "SMP Proxy:", 10) == 0) continue;
+				// <per-triangle-shape ... name="Shape" ...>: the name, matched as the plugin does (case aside).
+				std::regex re("(<per-triangle-shape[^>]*\\bname\\s*=\\s*\")([^\"]+)(\")", std::regex::icase);
+				std::string outText;
+				auto begin = text.cbegin();
+				for (std::sregex_iterator it(text.begin(), text.end(), re), end; it != end; ++it) {
+					outText.append(begin, (*it)[0].first);
+					if (_stricmp((*it)[2].str().c_str(), s.c_str()) == 0) { outText += (*it)[1].str() + "SMP Proxy:" + s + (*it)[3].str(); renamed++; }
+					else outText += (*it)[0].str();
+					begin = (*it)[0].second;
+				}
+				outText.append(begin, text.cend());
+				text = outText;
+			}
+			std::ofstream(xml, std::ios::binary) << text;
+			AddLog(2, "the XML collides with the proxies now (" + std::to_string(renamed) + " collision shape(s) renamed): " + xml);
+		};
 	}
 
 	// Writes the missing "SMP Bones" lists into the NIF (smprepair --list, the game's skeleton deciding which bones are

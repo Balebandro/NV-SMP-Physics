@@ -60,6 +60,7 @@ namespace nvsmp
 
 		std::map<std::pair<void*, void*>, Item> m_items;   // by (skeleton, model)
 		unsigned m_frame = 0;
+		float m_lastRootRadius = 0;   // the player root's last finite bound radius (see KeepRadius)
 		std::string m_playerRootName;   // what the last scan took as the player's 3D (for the log)
 		float m_builtWaistCollision = -1.0f;   // the waist collision the systems were built with
 		int m_builtGround = -1;                // and the ground setting
