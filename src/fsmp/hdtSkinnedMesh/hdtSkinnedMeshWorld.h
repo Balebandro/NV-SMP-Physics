@@ -18,6 +18,9 @@ namespace hdt
 
 		// NV SMP Physics: off skips collision detection (a debugging switch in the menu).
 		bool m_collisionsEnabled = true;
+		// NV SMP Physics: the collision tests run on a frame's first step only; its later steps reuse those contacts,
+		// moved with their bodies (btPersistentManifold::refreshContactPoints).
+		bool m_collideOncePerFrame = false;
 
 		void updateConstraintsForBone(SkinnedMeshBone* bone);
 
@@ -29,6 +32,8 @@ namespace hdt
 
 	protected:
 		std::vector<float> m_timeSteps;
+		bool m_reuseContacts = false;   // this step reuses the last step's contacts (m_collideOncePerFrame)
+		bool m_keepContacts = false;    // this step's contacts are kept for the next one
 
 		void readTransform(float timeStep)
 		{

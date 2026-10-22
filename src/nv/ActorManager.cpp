@@ -1235,7 +1235,8 @@ namespace nvsmp
 				dropMenuSystem("race menu closed");
 		}
 
-		// The player, then the nearest high-process actors up to the limit.
+		// The player, then every actor with its 3D loaded, in any process level, nearest first. None is dropped for distance
+		// or count: the far ones run without collision (see the collision LOD below).
 		void* player = Game::Player();
 		RE::NiNode* playerRoot = player ? Game::Get3D(player) : nullptr;
 		m_playerRootName = playerRoot ? playerRoot->GetName() : "(none)";
@@ -1247,16 +1248,12 @@ namespace nvsmp
 		if (playerRoot)
 			actors.push_back({ 0.0f, playerRoot, player });
 		RE::NiPoint3 playerPos = playerRoot ? playerRoot->world.translate : RE::NiPoint3{};
-		Game::ForEachHighProcessActor([&](void* ref) {
+		Game::ForEachProcessActor([&](void* ref) {
 			if (auto* root = Game::Get3D(ref)) {
-				float d = (root->world.translate - playerPos).Length();
-				if (d <= s.maxDistance)
-					actors.push_back({ d, root, ref });
+				actors.push_back({ (root->world.translate - playerPos).Length(), root, ref });
 			}
 		});
 		std::sort(actors.begin(), actors.end(), [](auto& a, auto& b) { return std::get<0>(a) < std::get<0>(b); });
-		if ((int)actors.size() > std::max(1, s.maxActors))
-			actors.resize(std::max(1, s.maxActors));
 
 		for (auto& a : actors)
 			scanActor(std::get<1>(a), std::get<2>(a));
@@ -1298,6 +1295,15 @@ namespace nvsmp
 				continue;
 			}
 			failed += it->second.failed;
+			// Collision LOD: past the collision distance, or beyond the nearest iMaxActors, physics without collision (the
+			// player, nearest at distance 0, always collides).
+			if (it->second.system) {
+				float d = 0.0f;
+				int rank = 0;
+				for (size_t i = 0; i < actors.size(); ++i)
+					if (std::get<1>(actors[i]) == it->first.first) { d = std::get<0>(actors[i]); rank = (int)i; break; }
+				it->second.system->setCollisionLod(d > s.collisionDistance || rank >= std::max(1, s.maxActors));
+			}
 			if (std::find(roots.begin(), roots.end(), it->first.first) == roots.end())
 				roots.push_back(it->first.first);
 			++it;

@@ -67,10 +67,10 @@ namespace nvsmp
 	{
 		Settings& s = gSettings;
 		return {
-			{ "bEnabled", 0, 0, &s.enabled }, { "fMaxDistance", &s.maxDistance }, { "iMaxActors", 0, &s.maxActors },
-			{ "iMinFps", 0, &s.minFps }, { "iMaxSubSteps", 0, &s.maxSubSteps }, { "iSolverIterations", 0, &s.solverIterations }, { "bAsyncStep", 0, 0, &s.asyncStep },
+			{ "bEnabled", 0, 0, &s.enabled }, { "fCollisionDistance", &s.collisionDistance },{ "iMaxActors", 0, &s.maxActors },
+			{ "iMinFps", 0, &s.minFps }, { "iMaxSubSteps", 0, &s.maxSubSteps }, { "iSolverIterations", 0, &s.solverIterations }, { "bCollisionThreads", 0, 0, &s.collisionThreadsOn }, { "iCollisionThreads", 0, &s.collisionThreads },{ "bAsyncStep", 0, 0, &s.asyncStep },
 			{ "fGravityScale", &s.gravityScale }, { "bUnclampedResets", 0, 0, &s.unclampedResets }, { "fResetAngle", &s.resetAngle },
-			{ "bWind", 0, 0, &s.wind }, { "fWindStrength", &s.windStrength }, { "bWindInInteriors", 0, 0, &s.windInInteriors }, { "bCollisions", 0, 0, &s.collisions },
+			{ "bWind", 0, 0, &s.wind }, { "fWindStrength", &s.windStrength }, { "bWindInInteriors", 0, 0, &s.windInInteriors }, { "bCollisions", 0, 0, &s.collisions }, { "bCollideOncePerFrame", 0, 0, &s.collideOncePerFrame },
 			{ "fWaistCollision", &s.waistCollision }, { "bGround", 0, 0, &s.ground }, { "bJitterFilter", 0, 0, &s.jitterFilter }, { "fJitterSmoothing", &s.jitterSmoothing },
 			{ "iMenuKey", 0, &s.menuKey }, { "iLogLevel", 0, &s.logLevel },
 		};
@@ -87,6 +87,8 @@ namespace nvsmp
 		world->m_timeTick = 1.0f / (float)s.minFps;
 		world->m_maxSubSteps = s.maxSubSteps;
 		world->getSolverInfo().m_numIterations = s.solverIterations;
+		s.collisionThreads = std::clamp(s.collisionThreads, -1, 8);
+		tbb::SetWorkers(!s.collisionThreadsOn ? 0 : s.collisionThreads < 0 ? tbb::AutoWorkers() : s.collisionThreads);   // after waitForStep: no loop is running
 		world->setGravity(btVector3(0, 0, -9.8f * hdt::scaleSkyrim * s.gravityScale));
 		world->m_unclampedResets = s.unclampedResets;
 		world->m_unclampedResetAngle = s.resetAngle;
@@ -94,6 +96,7 @@ namespace nvsmp
 		world->m_windStrength = s.windStrength;
 		world->disabled = !s.enabled;
 		world->m_collisionsEnabled = s.collisions;
+		world->m_collideOncePerFrame = s.collideOncePerFrame;
 		s.waistCollision = std::clamp(s.waistCollision, 0.0f, 1.0f);
 		s.jitterSmoothing = std::clamp(s.jitterSmoothing, 0.0f, 1.0f);
 		hdt::SkyrimBone::SetJitterFilter(s.jitterFilter, s.jitterSmoothing);

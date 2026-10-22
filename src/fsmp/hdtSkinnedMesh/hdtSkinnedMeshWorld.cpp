@@ -160,11 +160,6 @@ namespace hdt
 		if (hdt::SkyrimPhysicsWorld::get()->m_enableWind)
 			applyWind(remainingTimeStep);
 
-		while (remainingTimeStep > fixedTimeStep) {
-			internalSingleStepSimulation(fixedTimeStep);
-			remainingTimeStep -= fixedTimeStep;
-		}
-
 		// For the sake of the bullet library, we don't manage a step that would be lower than a 300Hz frame.
 		// Review this when (screens / Skyrim) will allow 300Hz+.
 		// Note: We are taking a final variable-sized step for the remaining time.
@@ -172,8 +167,28 @@ namespace hdt
 		// this variable tick can cause constraints to behave a bit differently
 		// (appearing more stiff or damping differently at various framerates).
 		constexpr auto minPossiblePeriod = 1.0f / 300.0f;
+
+		// New Vegas: the frame's step count first, so each step knows whether one follows (m_collideOncePerFrame).
+		int steps = 0;
+		btScalar left = remainingTimeStep;
+		for (; left > fixedTimeStep; left -= fixedTimeStep) ++steps;   // the same subtractions as the loop below
+		if (left > minPossiblePeriod) ++steps;
+		int done = 0;
+		auto step = [&](btScalar timeStep) {
+			m_reuseContacts = m_collideOncePerFrame && done > 0;
+			m_keepContacts = m_collideOncePerFrame && done + 1 < steps;
+			internalSingleStepSimulation(timeStep);
+			++done;
+		};
+
+		while (remainingTimeStep > fixedTimeStep) {
+			step(fixedTimeStep);
+			remainingTimeStep -= fixedTimeStep;
+		}
+
 		if (remainingTimeStep > minPossiblePeriod)
-			internalSingleStepSimulation(remainingTimeStep);
+			step(remainingTimeStep);
+		m_reuseContacts = m_keepContacts = false;
 		clearForces();
 
 		_bodies.clear();
@@ -200,6 +215,17 @@ namespace hdt
 
 		if (!m_collisionsEnabled)
 			return;
+
+		// New Vegas: a later step of the frame keeps the first step's contacts, refreshed to where their bodies are
+		// now (points that separated past the breaking threshold are dropped).
+		if (m_reuseContacts) {
+			auto* dispatcher = static_cast<CollisionDispatcher*>(m_dispatcher1);
+			for (int i = 0; i < dispatcher->getNumManifolds(); ++i) {
+				btPersistentManifold* manifold = dispatcher->getManifoldByIndexInternal(i);
+				manifold->refreshContactPoints(manifold->getBody0()->getWorldTransform(), manifold->getBody1()->getWorldTransform());
+			}
+			return;
+		}
 
 		btDispatcherInfo& dispatchInfo = getDispatchInfo();
 		{
@@ -456,6 +482,10 @@ namespace hdt
 		}
 
 		btDiscreteDynamicsWorldMt::solveConstraints(solverInfo);
+
+		// New Vegas: the next step of this frame reuses these contacts (m_collideOncePerFrame).
+		if (m_keepContacts)
+			return;
 
 		// New Vegas: bone shape pairs got Bullet collision algorithms (each owning a manifold) from the near callback.
 		// Every manifold is freed below, so the algorithms go first (they release their own manifolds) and are made

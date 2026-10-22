@@ -178,8 +178,15 @@ static std::string Prepare(const std::string& nifPath)
 		}
 	}
 
-	// The lists.
-	auto done = smplist::addLists(f, skeleton);
+	// The lists (bones sitting on the NIF's root hang where the XML's constraints say).
+	std::map<std::string, std::string> xmlParents;
+	if (!xmlOnDisk.empty()) {
+		std::ifstream in(xmlOnDisk, std::ios::binary);
+		std::stringstream text;
+		text << in.rdbuf();
+		xmlParents = smplist::constraintParents(text.str(), skeleton);
+	}
+	auto done = smplist::addLists(f, skeleton, xmlParents);
 	for (auto& d : done) {
 		log << "  " << d.shape << ": SMP Bones added (";
 		for (size_t i = 0; i < d.own.size(); i++) log << (i ? ", " : "") << d.own[i];

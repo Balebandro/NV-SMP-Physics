@@ -326,7 +326,9 @@ struct Settings
 	int minFps = 180;   // as the plugin's default
 	int maxSubSteps = 4;
 	int solverIterations = 10;
+	int collisionThreads = -1;   // as the plugin's iCollisionThreads
 	bool collisions = true;
+	bool collideOncePerFrame = false;   // as the plugin's bCollideOncePerFrame
 	float waistCollision = 0.0f;
 	bool ground = true;
 	bool jitterFilter = true;     // the plugin's jitter filter (SkyrimBone::SetJitterFilter)
@@ -388,10 +390,13 @@ static void ApplyWorldSettings()
 	world->m_timeTick = 1.0f / (float)gS.minFps;
 	world->m_maxSubSteps = gS.maxSubSteps;
 	world->getSolverInfo().m_numIterations = gS.solverIterations;
+	gS.collisionThreads = std::clamp(gS.collisionThreads, -1, 8);
+	tbb::SetWorkers(gS.collisionThreads < 0 ? tbb::AutoWorkers() : gS.collisionThreads);
 	world->setGravity(btVector3(0, 0, -9.8f * hdt::scaleSkyrim * gS.gravity));
 	world->m_enableWind = gS.wind;
 	world->m_windStrength = gS.windStrength;
 	world->m_collisionsEnabled = gS.collisions;
+	world->m_collideOncePerFrame = gS.collideOncePerFrame;
 	world->m_unclampedResets = false;   // the previewer's turns are deliberate
 }
 
@@ -1674,6 +1679,8 @@ static void Panels(float fps)
 		changed |= Undo("iterations", gS.solverIterations, kDefaults.solverIterations);
 		changed |= ImGui::Checkbox("Collisions", &gS.collisions);
 		changed |= Undo("collisions", gS.collisions, kDefaults.collisions);
+		changed |= ImGui::Checkbox("Collide once per frame", &gS.collideOncePerFrame);
+		changed |= Undo("collideonce", gS.collideOncePerFrame, kDefaults.collideOncePerFrame);
 		bool rebuild = ImGui::Checkbox("Ground collision", &gS.ground);
 		rebuild |= Undo("ground", gS.ground, kDefaults.ground);
 		Help("As the game's F7 menu: a ground plane at the feet the cloth rests on when crouching or sitting (the floor grid is at its height).");
@@ -2246,7 +2253,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--sneak") gAnim.sneak = true;
 		else if (a == "--noground") gS.ground = false;
 		else if (a == "--nocollisions") gS.collisions = false;
+		else if (a == "--collide-once") gS.collideOncePerFrame = true;
 		else if (a == "--iterations") gS.solverIterations = atoi(next().c_str());
+		else if (a == "--threads") gS.collisionThreads = atoi(next().c_str());
 		else if (a == "--jitter") jitterOut = next();
 		else if (a == "--clip") clipOut = next();
 		else if (a == "--clipmesh") clipMeshOut = next();

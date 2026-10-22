@@ -64,6 +64,8 @@ namespace hdt
 		// slots are then left alone and the nodes retired (putting the slots back then left the item unbound on the
 		// next equip: the actor turned invisible). Not set (an item still worn: menu reset, settings): put back.
 		bool m_itemDetached = false;
+		// Its actor is past the collision distance: the bodies keep out of every collision pair (cheap far physics).
+		void setCollisionLod(bool off) { for (auto& m : m_meshes) m->m_lodNoCollide = off; }
 
 		// New Vegas: the skin slots put back as the game had them and let go of (no reference to the skin kept), the system
 		// running on: its bones are then only driven, not drawn by that skin (race hair in the race menu, which skins

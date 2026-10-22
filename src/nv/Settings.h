@@ -6,13 +6,15 @@ namespace nvsmp
 	struct Settings
 	{
 		bool enabled = true;
-		float maxDistance = 4000.0f;   // actors farther from the player than this are not simulated
-		int maxActors = 10;            // most actors simulated at once, nearest first
+		float collisionDistance = 1500.0f;   // actors farther than this are simulated without collision (much cheaper)
+		int maxActors = 10;            // most actors with collision, nearest first (the others simulated without it)
 
 		// FSMP's world settings (its configs.xml defaults).
 		int minFps = 180;              // the simulation's step rate at least: a frame is cut in equal steps no longer than this (60 fps: 3 steps; 180 kept the cloth's jitter under 0.005 at 60 fps, where 60 gave 0.043)
 		int maxSubSteps = 4;           // a frame longer than this many 60 Hz frames (4: 1/15 s) drops the rest
 		int solverIterations = 10;     // Bullet's constraint solver iterations
+		bool collisionThreadsOn = false;  // off: the collision tests all on the physics thread, whatever collisionThreads says (experimental)
+		int collisionThreads = -1;     // extra threads for the collision tests (the physics thread works too): -1 auto, 0 none
 		bool asyncStep = true;         // the step runs on a physics thread while the game draws (the bones a frame behind it)
 		float gravityScale = 1.0f;
 		bool unclampedResets = true;   // turning faster than the limit below resets the physics
@@ -23,6 +25,7 @@ namespace nvsmp
 		bool windInInteriors = false;
 
 		bool collisions = true;         // off: the cloth passes through the body (for finding what pushes it)
+		bool collideOncePerFrame = false; // the collision tests on a frame's first step only, later steps reuse its contacts
 		float waistCollision = 0.0f;    // 0: bones the physics file keeps out of collision stay out; 1: they collide fully
 		bool ground = true;             // a ground plane at the actor's feet the cloth rests on (crouching, sitting)
 

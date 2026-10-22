@@ -188,7 +188,10 @@ static void BuildUI() {
 		changed |= ImGui::SliderInt("Rate (min fps)", &s.minFps, 30, 240); Help("Physics steps per second, fixed whatever the frame rate (the cloth behaves the same at any fps). Higher = smoother and more accurate, and more expensive.");
 		changed |= ImGui::SliderInt("Max substeps", &s.maxSubSteps, 1, 16); Help("A frame longer than this many 60 Hz frames (4 = 1/15 s) drops the rest instead of catching up: the cloth slows down rather than the game.");
 		changed |= ImGui::SliderInt("Solver iterations", &s.solverIterations, 1, 64); Help("Higher = stiffer constraints, more expensive.");
+		changed |= ImGui::Checkbox("Collision threads", &s.collisionThreadsOn); Help("Spread the collision tests over extra threads. Off: they all run on the physics thread, as before.");
+		if (s.collisionThreadsOn) { changed |= ImGui::SliderInt("Thread count", &s.collisionThreads, -1, 8); Help("Extra threads the collision tests are spread over (the physics thread works too). -1 = auto (about half the cores minus one, at most 4), 0 = none."); }
 		changed |= ImGui::Checkbox("Collisions", &s.collisions); Help("Off: the cloth passes through the body. For telling whether a collision shape pushes it.");
+		changed |= ImGui::Checkbox("Collide once per frame", &s.collideOncePerFrame); Help("The collision tests run on the frame's first physics step only; the frame's other steps reuse those contacts, moved with the body. Cheaper (the more steps a frame has, the more it saves); fast moves can push the cloth through a little more easily.");
 		changed |= ImGui::SliderFloat("Waist collision", &s.waistCollision, 0.0f, 1.0f, "%.2f"); Help("The tight rows at the waist and hips, which the physics file leaves out of collision: 0 = they follow the body, 1 = they collide like the rest. Changing it rebuilds the physics (a short reset).");
 		changed |= ImGui::Checkbox("Ground collision", &s.ground); Help("The cloth rests on the ground at the actor's feet instead of sinking through it when crouching or sitting. Changing it rebuilds the physics.");
 		changed |= ImGui::Checkbox("Jitter filter", &s.jitterFilter); Help("Smooths the small fast shaking of the cloth (what is drawn, not the physics): a bone barely moving is held steady, a swinging one passes through.");
@@ -205,8 +208,8 @@ static void BuildUI() {
 	if (ImGui::CollapsingHeader("Performance")) {
 		changed |= ImGui::Checkbox("Step on its own thread", &s.asyncStep); Help("The simulation runs on a thread of its own while the game draws the frame, instead of holding the frame up. The cloth answers the body's moves a frame later.");
 		ImGui::TextDisabled("Game thread: %.2f ms of %.2f ms", world->m_averageMainMs, world->m_averageStepMs);
-		changed |= ImGui::SliderFloat("Max distance", &s.maxDistance, 0.0f, 10000.0f, "%.0f"); Help("Actors farther from the player than this are not simulated.");
-		changed |= ImGui::SliderInt("Max actors", &s.maxActors, 1, 40); Help("Most actors simulated at once, nearest first.");
+		changed |= ImGui::SliderFloat("Collision distance", &s.collisionDistance, 0.0f, 20000.0f, "%.0f"); Help("Actors farther than this keep their physics (swing, gravity) but without collision, the expensive part: cloth may pass through the body, which hardly shows at that distance. The player always collides.");
+		changed |= ImGui::SliderInt("Max actors", &s.maxActors, 1, 40); Help("Most actors with collision at once, nearest first. The others keep their physics without collision.");
 	}
 	if (changed) ApplySettings();
 	ImGui::Separator();

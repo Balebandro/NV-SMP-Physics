@@ -39,6 +39,7 @@ namespace hdt
 		int bodyCount() const { return getNumCollisionObjects(); }
 		using SkinnedMeshWorld::updateConstraintsForBone;
 		using SkinnedMeshWorld::m_collisionsEnabled;
+		using SkinnedMeshWorld::m_collideOncePerFrame;
 
 		std::unique_lock<std::mutex> lockSimulation() { return std::unique_lock(m_lock); }
 

@@ -442,7 +442,9 @@ namespace hdt
 			auto* b = skin->bones[s];
 			if (!b || !b->m_name || s == use.slot)
 				continue;
-			if (parentNode && b == parentNode)
+			// The slot must be the parent's own (its listed name): an unbound slot also points at the skeleton root, so
+			// with the root as parent ("Bip01") another bone's bind would place this one.
+			if (parentNode && b == parentNode && _stricmp(b->m_name, skinSlotName(use.geometry, s).c_str()) == 0)
 				reference = (int)s;
 		}
 		// A slot the game bound: its node carries the name the item lists for it. (An unbound slot

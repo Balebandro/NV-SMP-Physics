@@ -73,20 +73,22 @@ namespace Game
 		return obj ? obj->AsNode() : nullptr;
 	}
 
-	// Every actor in high process (the ones the game animates in full), the player excluded:
-	// ProcessLists::kAllProcessArrays[0], from its begin to end index.
+	// Every actor in a process list, the player excluded: high, middle-high, middle-low and low process (the game moves
+	// actors down the levels with distance; the lower ones are still drawn). ProcessLists' one array holds all four,
+	// each level from its begin index (0x14 + 4 * level) to its end index (0x24 + 4 * level).
 	template <class F>
-	inline void ForEachHighProcessActor(F&& f)
+	inline void ForEachProcessActor(F&& f)
 	{
 		char* pl = (char*)kProcessLists;
 		void** objs = *(void***)(pl + 0x08);
-		uint32_t begin = *(uint32_t*)(pl + 0x14), end = *(uint32_t*)(pl + 0x24);
 		uint16_t count = *(uint16_t*)(pl + 0x0E);
 		if (!objs)
 			return;
-		end = std::min<uint32_t>(end, count);
-		for (uint32_t i = begin; i < end; ++i)
-			if (objs[i] && objs[i] != Player())
-				f(objs[i]);
+		for (int level = 0; level < 4; ++level) {
+			uint32_t begin = *(uint32_t*)(pl + 0x14 + 4 * level), end = std::min<uint32_t>(*(uint32_t*)(pl + 0x24 + 4 * level), count);
+			for (uint32_t i = begin; i < end; ++i)
+				if (objs[i] && objs[i] != Player())
+					f(objs[i]);
+		}
 	}
 }

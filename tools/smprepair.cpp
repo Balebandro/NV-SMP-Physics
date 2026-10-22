@@ -14,9 +14,13 @@
 #include "nif.h"
 #include "smplist.h"
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <set>
+#include <sstream>
 using namespace nif;
+namespace fs = std::filesystem;
 
 static std::string strName(const File& f, int block)
 {
@@ -72,7 +76,27 @@ static int listMode(const char* in, const char* skeletonPath, const char* out)
 {
 	File f;
 	f.load(in);
-	auto done = smplist::addLists(f, smplist::skeletonBones(skeletonPath));
+	auto skeleton = smplist::skeletonBones(skeletonPath);
+	// The physics XML the NIF names (relative to Data: the folder holding the NIF's Meshes folder), else one of that
+	// name beside the NIF: its constraints say where bones sitting on the NIF's root hang.
+	std::map<std::string, std::string> xmlParents;
+	if (std::string physics = smplist::physicsPath(f); !physics.empty()) {
+		std::vector<fs::path> tries;
+		for (fs::path p = fs::absolute(in).parent_path(); p.has_parent_path() && p != p.parent_path(); p = p.parent_path())
+			if (_stricmp(p.filename().string().c_str(), "meshes") == 0) { tries.push_back(p.parent_path() / physics); break; }
+		tries.push_back(fs::absolute(in).parent_path() / fs::path(physics).filename());
+		for (auto& t : tries) {
+			std::ifstream x(t, std::ios::binary);
+			if (!x) continue;
+			std::stringstream text;
+			text << x.rdbuf();
+			xmlParents = smplist::constraintParents(text.str(), skeleton);
+			printf("parents from %s (%zu bones placed by its constraints)\n", t.string().c_str(), xmlParents.size());
+			break;
+		}
+		if (xmlParents.empty()) printf("physics file %s not found: bones on the NIF's root hang from the skeleton bone they share most weight with\n", physics.c_str());
+	}
+	auto done = smplist::addLists(f, skeleton, xmlParents);
 	std::set<std::string> shapes;
 	for (auto& d : done) {
 		shapes.insert(d.shape);

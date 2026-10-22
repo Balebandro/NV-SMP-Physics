@@ -5,12 +5,15 @@
 //   "SMP Bones" on every skinned shape with bones the game's skeleton lacks (New Vegas drops them on attach; the
 //     plugin rebuilds them from this list): "name|parent;" per skin slot, in slot order. A bone the skeleton has is
 //     the body's ("name|"); one it lacks gets its parent node in the NIF, or, sitting on the NIF's root (as Skyrim
-//     bodies have them), the skeleton bone it shares most weight with (a breast bone: the chest).
+//     bodies have them), the bone the physics XML's constraints hang it from (a hair chain: the bone above), else the
+//     skeleton bone it shares most weight with (a breast bone: the chest).
 //   "HDT Skinned Mesh Physics Object" on the root: the physics XML, relative to Data.
 //   The keep flags on the geometry data the physics reads (XYZ and bone data kept after upload), else the game drops
 //     the vertices and the plugin has nothing to collide with.
 #include "nif.h"
 #include <map>
+#include <queue>
+#include <regex>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -95,8 +98,35 @@ namespace smplist
 		return out;
 	}
 
+	// Each bone's parent by the physics XML's constraints (any element with bodyA and bodyB): from the skeleton bones
+	// outward, a bone joined to a placed one hangs from it. Which of bodyA/bodyB is the parent varies between XMLs, so
+	// the direction comes from the skeleton, not the attribute order. Bones no constraint reaches are left out.
+	inline std::map<std::string, std::string> constraintParents(const std::string& xml, const std::set<std::string>& skeleton)
+	{
+		std::map<std::string, std::vector<std::string>> joined;
+		std::regex tag("<[A-Za-z-]*constraint\\b[^>]*>"), a("\\bbodyA\\s*=\\s*\"([^\"]+)\""), b("\\bbodyB\\s*=\\s*\"([^\"]+)\"");
+		for (std::sregex_iterator it(xml.begin(), xml.end(), tag), end; it != end; ++it) {
+			std::string t = it->str();
+			std::smatch ma, mb;
+			if (!std::regex_search(t, ma, a) || !std::regex_search(t, mb, b)) continue;
+			joined[ma[1].str()].push_back(mb[1].str());
+			joined[mb[1].str()].push_back(ma[1].str());
+		}
+		std::map<std::string, std::string> parents;
+		std::queue<std::string> open;
+		for (auto& [name, others] : joined) if (skeleton.count(name)) open.push(name);
+		while (!open.empty()) {
+			std::string at = open.front();
+			open.pop();
+			for (auto& other : joined[at])
+				if (!skeleton.count(other) && !parents.count(other)) { parents[other] = at; open.push(other); }
+		}
+		return parents;
+	}
+
 	// Writes "SMP Bones" on every skinned shape with bones the skeleton lacks and no list yet. Returns what it did.
-	inline std::vector<ShapeReport> addLists(File& f, const std::set<std::string>& skeleton)
+	// xmlParents: constraintParents of the item's physics XML, for bones sitting on the NIF's root.
+	inline std::vector<ShapeReport> addLists(File& f, const std::set<std::string>& skeleton, const std::map<std::string, std::string>& xmlParents = {})
 	{
 		std::map<int, int> parent;
 		for (size_t i = 0; i < f.blocks.size(); i++) {
@@ -142,6 +172,7 @@ namespace smplist
 				if (!skeleton.count(name)) {
 					auto it = parent.find(b);
 					par = it != parent.end() && it->second != f.roots[0] ? strName(f, it->second) : "";
+					if (par.empty()) if (auto x = xmlParents.find(name); x != xmlParents.end()) par = x->second;
 					if (par.empty()) par = sharedParent((int)slot);
 					if (par.empty()) par = "Bip01";   // weighted alone: it stays with the skeleton's root
 					rep.own.push_back(name + " on " + par);
