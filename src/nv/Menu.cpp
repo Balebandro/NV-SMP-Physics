@@ -203,6 +203,8 @@ static void BuildUI() {
 		ImGui::TextDisabled("Weather wind now: %.0f%%%s", *(float*)Game::kWindMagnitude * 100.0f, Game::InInterior() ? ", interior" : "");
 	}
 	if (ImGui::CollapsingHeader("Performance")) {
+		changed |= ImGui::Checkbox("Step on its own thread", &s.asyncStep); Help("The simulation runs on a thread of its own while the game draws the frame, instead of holding the frame up. The cloth answers the body's moves a frame later.");
+		ImGui::TextDisabled("Game thread: %.2f ms of %.2f ms", world->m_averageMainMs, world->m_averageStepMs);
 		changed |= ImGui::SliderFloat("Max distance", &s.maxDistance, 0.0f, 10000.0f, "%.0f"); Help("Actors farther from the player than this are not simulated.");
 		changed |= ImGui::SliderInt("Max actors", &s.maxActors, 1, 40); Help("Most actors simulated at once, nearest first.");
 	}

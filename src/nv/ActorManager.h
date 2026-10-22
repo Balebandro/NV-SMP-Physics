@@ -6,6 +6,7 @@
 #include "hdtSkyrimSystem.h"
 
 #include <map>
+#include <memory>
 
 namespace nvsmp
 {
@@ -31,6 +32,8 @@ namespace nvsmp
 		void applyCollision();
 		// Once per frame, before update: does that rebuild.
 		void rebuildIfPending();
+		// Once per frame, after the world steps: race hair skinned on the CPU (see CpuSkin).
+		void skinOnCpu();
 
 		ActorStats stats;
 
@@ -46,20 +49,67 @@ namespace nvsmp
 			int builds = 0;
 			bool failed = false;
 			bool waiting = false;                 // the game has not bound its skin yet
+			hdt::DefaultBBP::NameMap_t names;     // race hair: the physics file's shape names -> the game's (see RaceHairFile)
+			std::unordered_map<std::string, std::string> boneLists;   // and the "SMP Bones" lists the game stripped
+			// Race hair is drawn without skinning (see CpuSkin): its shapes skinned here, their skins held aside.
+			struct CpuSkin
+			{
+				RE::NiPointer<RE::NiAVObject> shape;
+				RE::NiPointer<RE::NiSkinInstance> skin;
+				std::vector<RE::NiPoint3> bind;      // the vertices as the game made them (its slider morphs included)
+				std::vector<RE::NiPoint3> written;   // what was written last frame: anything else is a new morph from the game
+				bool unskinnedFlag = false;          // the Skinned shader flag was cleared (given back with the skin)
+				// The face sliders, applied here (the game does not reshape a skinned hair): the file's vertices, its .egm,
+				// how the NPC's values are read (-1: not found to rebuild what the game drew), and the values last used.
+				std::vector<RE::NiPoint3> fileBase;
+				std::shared_ptr<struct Egm> egm;
+				int symWay = -1, asymWay = -1;
+				float sym[50] = {}, asym[30] = {};
+				int colourWay = -1;                  // the NPC's hair colour into the tint: 0 RGB, 1 BGR (-1: no match)
+			};
+			std::vector<CpuSkin> cpuSkins;
+			void* npc = nullptr;                  // race hair: the actor's TESNPC (face values, hair colour)
+			std::string hairModel;                // and its hair's model path
 		};
 
 		static constexpr unsigned kSettleFrames = 10, kRetryFrames = 30;
 		static constexpr int kMaxBuilds = 4;
 
 		void build(Item& item);
+		static void ReleaseCpuSkins(Item& item);
 		static bool rebound(const Item& item);   // the game re-pointed a skin slot the system had bound
 		static bool skinsBound(RE::NiAVObject* obj, int depth = 0);
-		void scanActor(RE::NiNode* root);
+		void scanActor(RE::NiNode* root, void* ref);
 		void scan(RE::NiNode* root, RE::NiAVObject* obj, int depth);
-		void found(RE::NiNode* root, RE::NiAVObject* model, const char* file);
+		void found(RE::NiNode* root, RE::NiAVObject* model, const char* file, const hdt::DefaultBBP::NameMap_t* names = nullptr,
+			const std::unordered_map<std::string, std::string>* lists = nullptr, RE::NiAVObject* hairShape = nullptr);
 
 		std::map<std::pair<void*, void*>, Item> m_items;   // by (skeleton, model)
 		unsigned m_frame = 0;
+		void* m_scanRef = nullptr;   // the actor whose 3D scanActor is walking (its hair form, for race hair)
+		bool m_raceMenuWhenScanned = false;   // for the log line when the race menu closes
+		unsigned m_hatSwapAt = 0;             // the frame the game's hat swap runs again after the race menu closed (0: none)
+		bool m_hatSwapAfterBuild = false;     // and once more when the player's race hair is built in game after it
+		static constexpr unsigned kHatSwapDelay = 1;    // the frame after: the hair copies are settled by then
+		// The race menu rebuilds the head whenever the hair or the face changes: race hair is not held there (no system, no
+		// references kept between frames), only placed on the head each frame from what the scan found (skinMenuHair).
+		bool m_raceMenu = false;
+		struct MenuHair { RE::NiAVObject* shape; RE::NiNode* root; void* npc; std::string model; };
+		std::vector<MenuHair> m_menuHair;   // this frame's, found by the scan
+		void skinMenuHair();
+		// The player's race hair physics in the race menu: running on its own bone nodes, holding nothing of the hair (its
+		// skin slots released), for whichever copy of the hair the menu shows (see skinMenuHair).
+		RE::BSTSmartPointer<hdt::SkyrimSystem> m_menuSystem;
+		std::string m_menuModel;                                       // the hair it was built for
+		std::unordered_map<std::string, RE::NiAVObject*> m_menuBones;   // its bones by name, lower case
+		unsigned m_menuMissing = 0;                                    // frames its hair was not seen
+		// Its skeleton: stand-ins of the player's skeleton nodes (the plugin's own, by name, lower case), given the real
+		// ones' places every frame (the race menu rebuilds the player's 3D: nothing of it may be held).
+		RE::NiPointer<RE::NiNode> m_menuRoot;
+		std::unordered_map<std::string, RE::NiNode*> m_menuProxies;
+		void refreshMenuProxies(RE::NiNode* playerRoot);
+		void dropMenuSystem(const char* why);
+		bool buildMenuSystem(RE::NiNode* root, RE::NiAVObject* shape, const std::string& model);
 		float m_lastRootRadius = 0;   // the player root's last finite bound radius (see KeepRadius)
 		std::string m_playerRootName;   // what the last scan took as the player's 3D (for the log)
 		float m_builtWaistCollision = -1.0f;   // the waist collision the systems were built with

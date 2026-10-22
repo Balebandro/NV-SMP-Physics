@@ -13,6 +13,7 @@ namespace nvsmp
 		int minFps = 180;              // the simulation's step rate at least: a frame is cut in equal steps no longer than this (60 fps: 3 steps; 180 kept the cloth's jitter under 0.005 at 60 fps, where 60 gave 0.043)
 		int maxSubSteps = 4;           // a frame longer than this many 60 Hz frames (4: 1/15 s) drops the rest
 		int solverIterations = 10;     // Bullet's constraint solver iterations
+		bool asyncStep = true;         // the step runs on a physics thread while the game draws (the bones a frame behind it)
 		float gravityScale = 1.0f;
 		bool unclampedResets = true;   // turning faster than the limit below resets the physics
 		float resetAngle = 120.0f;     // per second (FSMP's unclamped-reset-angle)

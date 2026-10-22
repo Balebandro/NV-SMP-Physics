@@ -68,7 +68,7 @@ namespace nvsmp
 		Settings& s = gSettings;
 		return {
 			{ "bEnabled", 0, 0, &s.enabled }, { "fMaxDistance", &s.maxDistance }, { "iMaxActors", 0, &s.maxActors },
-			{ "iMinFps", 0, &s.minFps }, { "iMaxSubSteps", 0, &s.maxSubSteps }, { "iSolverIterations", 0, &s.solverIterations },
+			{ "iMinFps", 0, &s.minFps }, { "iMaxSubSteps", 0, &s.maxSubSteps }, { "iSolverIterations", 0, &s.solverIterations }, { "bAsyncStep", 0, 0, &s.asyncStep },
 			{ "fGravityScale", &s.gravityScale }, { "bUnclampedResets", 0, 0, &s.unclampedResets }, { "fResetAngle", &s.resetAngle },
 			{ "bWind", 0, 0, &s.wind }, { "fWindStrength", &s.windStrength }, { "bWindInInteriors", 0, 0, &s.windInInteriors }, { "bCollisions", 0, 0, &s.collisions },
 			{ "fWaistCollision", &s.waistCollision }, { "bGround", 0, 0, &s.ground }, { "bJitterFilter", 0, 0, &s.jitterFilter }, { "fJitterSmoothing", &s.jitterSmoothing },
@@ -79,6 +79,7 @@ namespace nvsmp
 	void ApplySettings()
 	{
 		auto* world = hdt::SkyrimPhysicsWorld::get();
+		world->waitForStep();   // the menu changes the world's settings and bodies: not under a running step
 		auto& s = gSettings;
 		s.minFps = std::clamp(s.minFps, 30, 240);
 		s.maxSubSteps = std::clamp(s.maxSubSteps, 1, 16);
@@ -168,6 +169,16 @@ namespace nvsmp
 		if (gLoading)
 			return;
 
+		// The step started last frame on the physics thread (bAsyncStep): its bones are written before anything here
+		// changes the world. With it off, the whole update runs below, as it always did.
+		auto* world = hdt::SkyrimPhysicsWorld::get();
+		world->finishUpdate();
+		if (std::string fault = world->takeStepFailure(); !fault.empty()) {
+			LogLine(LogLevel::Error, "exception in the physics step (physics thread); NV SMP Physics is off for the rest of this session: " + fault);
+			gFailed = true;
+			return;
+		}
+
 		ActorManager::instance()->rebuildIfPending();
 		if (Menu::ConsumeReset()) {
 			ActorManager::instance()->clear();
@@ -182,15 +193,40 @@ namespace nvsmp
 		UpdateWind();
 
 		float dt = Game::FrameTime();
-		if (dt > FLT_EPSILON)   // 0 while paused: the bones keep their last simulated pose
-			hdt::SkyrimPhysicsWorld::get()->doUpdate(std::min(dt, 0.25f));
+		// 0 while paused: the bones keep their last simulated pose. The race menu pauses the game too, but shows the
+		// character turning and changing: there the physics runs on real time.
+		static LARGE_INTEGER lastTick{};
+		LARGE_INTEGER now, freq;
+		QueryPerformanceCounter(&now);
+		QueryPerformanceFrequency(&freq);
+		const float real = lastTick.QuadPart ? (float)((now.QuadPart - lastTick.QuadPart) / (double)freq.QuadPart) : 0.0f;
+		lastTick = now;
+		static bool raceMenu = false;
+		if (Game::RaceMenuOpen() != raceMenu) {
+			raceMenu = !raceMenu;
+			logger::info("[SMP] race menu {}", raceMenu ? "open: physics on real time" : "closed");
+		}
+		if (dt <= FLT_EPSILON && raceMenu)
+			dt = std::min(real, 0.05f);
 
-		// Every 120 frames (by count, so it shows even if the frame time reads 0): what the physics is doing.
+		// Every 120 frames (by count, so it shows even if the frame time reads 0): what the physics is doing. Before the
+		// step starts: the report reads the bodies.
 		static int sinceReport = 0;
 		if (++sinceReport >= 120) {
 			sinceReport = 0;
-			logger::info("[stats] frame time {:.4f} s, {} system(s) in the world", dt, hdt::SkyrimPhysicsWorld::get()->systemCount());
+			logger::info("[stats] frame time {:.4f} s, {} system(s) in the world", dt, world->systemCount());
 			ActorManager::instance()->report();
+		}
+
+		if (gSettings.asyncStep) {
+			// The bones as written above (last frame's step); this frame's step runs while the game draws.
+			ActorManager::instance()->skinOnCpu();   // race hair (also while paused: the bones hold)
+			if (dt > FLT_EPSILON)
+				world->beginUpdate(std::min(dt, 0.25f), true);
+		} else {
+			if (dt > FLT_EPSILON)
+				world->doUpdate(std::min(dt, 0.25f));
+			ActorManager::instance()->skinOnCpu();   // race hair, after the bones moved (also while paused: they hold)
 		}
 	}
 
@@ -295,10 +331,20 @@ namespace hdt
 		return node;
 	}
 
-	// FileFinder::GetFile(name, READ_ONLY, 0x4000, archive type) -> a BSFile: m_bGood at +0x2C,
+	void setName(RE::NiAVObject* obj, const char* name)
+	{
+		typedef char*(__cdecl * CreateFixedString_t)(const char*);
+		typedef void(__thiscall * SetName_t)(void*, char**);
+		char* s = ((CreateFixedString_t)Game::kCreateFixedString)(name);
+		((SetName_t)Game::kSetName)(obj, &s);
+	}
+
+	// FileFinder::GetFile(name, READ_ONLY, 0x4000, archive types) -> a BSFile: m_bGood at +0x2C,
 	// GetSize at vtable slot 10, NiBinaryStream::m_pfnRead at +0x08, Destroy at slot 0. The size
 	// goes in *size and the bytes in buffer (at most capacity); false if the game has no such file.
-	static bool ReadFromArchives(const char* rel, char* buffer, uint32_t capacity, uint32_t* size)
+	// The archive types are flags, as the game passes them (meshes 1, textures 2, menus 4, sounds 8,
+	// voices 0x10, shaders 0x20, trees 0x40, fonts 0x80, misc 0x100): none (0) searches no archive.
+	static bool ReadFromArchives(const char* rel, char* buffer, uint32_t capacity, uint32_t* size, uint32_t types)
 	{
 		*size = 0;
 		__try {
@@ -306,7 +352,7 @@ namespace hdt
 			typedef uint32_t(__cdecl * ReadFn)(void*, void*, uint32_t, uint32_t*, uint32_t);
 			typedef uint32_t(__thiscall * GetSize_t)(void*);
 			typedef void(__thiscall * Destroy_t)(void*, bool);
-			void* file = ((GetFileFn)Game::kFileFinderGetFile)(rel, 0, 0x4000, 0);
+			void* file = ((GetFileFn)Game::kFileFinderGetFile)(rel, 0, 0x4000, types);
 			if (!file)
 				return false;
 			uint32_t* vtbl = *(uint32_t**)file;
@@ -343,13 +389,22 @@ namespace hdt
 		if (in)
 			return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 
-		uint32_t size = 0;
-		if (!ReadFromArchives(rel.c_str(), nullptr, 0, &size) || size == 0 || size > 0x1000000)
-			return {};
-		std::string out(size, '\0');
-		if (!ReadFromArchives(rel.c_str(), out.data(), size, &size))
-			return {};
-		return out;
+		// The archive type by the folder (a mesh, its .egm and its physics file sit in meshes archives), then each of the
+		// others: what an archive is flagged as depends on how it was packed.
+		uint32_t first = 0x100;
+		if (_strnicmp(rel.c_str(), "meshes\\", 7) == 0) first = 1;
+		else if (_strnicmp(rel.c_str(), "textures\\", 9) == 0) first = 2;
+		const uint32_t order[] = { first, 1, 0x100, 2, 4, 8, 0x10, 0x20, 0x40, 0x80 };
+		for (uint32_t i = 0; i < sizeof(order) / sizeof(order[0]); ++i) {
+			if (i > 0 && order[i] == first) continue;
+			uint32_t size = 0;
+			if (!ReadFromArchives(rel.c_str(), nullptr, 0, &size, order[i]) || size == 0 || size > 0x1000000)
+				continue;
+			std::string out(size, '\0');
+			if (ReadFromArchives(rel.c_str(), out.data(), size, &size, order[i]))
+				return out;
+		}
+		return {};
 	}
 }
 

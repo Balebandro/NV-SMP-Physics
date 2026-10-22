@@ -348,6 +348,8 @@ namespace hdt
 
 	// A new, unparented NiNode named `name`, with one reference held by the caller (NiPointer).
 	RE::NiNode* createNode(const char* name);
+	// Renames an object (the game's NiFixedString and NiObjectNET::SetName).
+	void setName(RE::NiAVObject* obj, const char* name);
 
 	// A file from the game's Data folder: loose (through Mod Organizer's virtual file system) or in a BSA.
 	std::string readAllFile(const char* path);

@@ -169,20 +169,341 @@ namespace nvsmp
 		}
 	}
 
+	// Race hair. The game's FaceGen loader keeps only a hair NIF's shapes, renamed "FaceGenHair" + the shape's name (under
+	// BSFaceGenNiNodeSkinned when skinned; the game binds their skeleton bones), and replaces their extra data with its
+	// own: the physics file and the "SMP Bones" lists are gone, and so are the NIF's other shapes. They are read from the
+	// hair's NIF instead (the actor's hair form's model), and the system is built on the shapes under their new names. A
+	// collider proxy ("SMP Proxy:...") goes with the dropped shapes, so race hair has no collision yet.
+	struct RaceHairFile
+	{
+		std::string physics;                                   // the physics file ("" if the hair has none)
+		std::unordered_map<std::string, std::string> lists;    // game shape name, lower case -> its "SMP Bones"
+		std::unordered_map<std::string, int> verts;            // and its vertex count, to tell it is the drawn hair
+		std::unordered_map<std::string, std::vector<RE::NiPoint3>> base;   // and its vertices in the file (no face morphs)
+		std::unordered_map<std::string, std::string> nifName;  // and its name in the NIF (its .egm is <model><name>.egm)
+		hdt::DefaultBBP::NameMap_t names;                      // the physics file's shape names -> the game's
+		std::unordered_map<std::string, hdt::FileMesh> proxies;   // its collision proxies (the game drops them), lower case
+		std::unordered_map<std::string, std::vector<RE::NiPoint3>> normals;   // the shapes' normals and triangles in the file
+		std::unordered_map<std::string, std::vector<uint16_t>> triangles;     // (a recycled copy may come without them)
+	};
+
+	// The extra data the game strips, from the NIF file (20.2.0.7, Fallout 3 / New Vegas): the root's or any shape's
+	// physics file, each shape's "SMP Bones" (and "SMP Bones 2"... continuations) and vertex count.
+	static RaceHairFile ParseRaceHair(const std::string& bytes)
+	{
+		RaceHairFile out;
+		const uint8_t* d = (const uint8_t*)bytes.data();
+		const size_t n = bytes.size();
+		size_t o = 0;
+		auto need = [&](size_t k) { if (o + k > n) throw std::runtime_error("short NIF"); };
+		auto u8 = [&]() { need(1); return d[o++]; };
+		auto u16 = [&]() { need(2); uint16_t v; memcpy(&v, d + o, 2); o += 2; return v; };
+		auto u32 = [&]() { need(4); uint32_t v; memcpy(&v, d + o, 4); o += 4; return v; };
+		auto sized = [&]() { uint32_t l = u32(); need(l); std::string s((const char*)d + o, l); o += l; return s; };
+		auto shortStr = [&]() { uint8_t l = u8(); need(l); o += l; };
+		while (o < n && d[o] != '\n') ++o;
+		++o;
+		const uint32_t version = u32(); u8(); const uint32_t user = u32(); const uint32_t blocks = u32(); u32();
+		if (version != 0x14020007 || user != 11) throw std::runtime_error("not a Fallout 3 / New Vegas NIF");
+		shortStr(); shortStr(); shortStr();
+		std::vector<std::string> types(u16());
+		for (auto& t : types) t = sized();
+		std::vector<uint16_t> typeOf(blocks);
+		for (auto& t : typeOf) t = u16() & 0x7FFF;
+		std::vector<uint32_t> sizes(blocks);
+		for (auto& s : sizes) s = u32();
+		std::vector<std::string> strings(u32());
+		u32();
+		for (auto& s : strings) s = sized();
+		const uint32_t groups = u32();
+		o += 4 * groups;
+		std::vector<size_t> at(blocks);
+		for (uint32_t b = 0; b < blocks; ++b) { at[b] = o; o += sizes[b]; }
+		if (o > n) throw std::runtime_error("short NIF");
+		auto str = [&](uint32_t i) { return i < strings.size() ? strings[i] : std::string(); };
+		auto rd32 = [&](size_t p) { uint32_t v; memcpy(&v, d + p, 4); return v; };
+		auto extras = [&](uint32_t b) {   // NiObjectNET: name, extra data refs
+			std::vector<std::pair<std::string, std::string>> e;
+			const uint32_t count = rd32(at[b] + 4);
+			for (uint32_t i = 0; i < count; ++i) {
+				const int32_t r = (int32_t)rd32(at[b] + 8 + 4 * i);
+				if (r >= 0 && r < (int32_t)blocks && types[typeOf[r]] == "NiStringExtraData") e.push_back({ str(rd32(at[r])), str(rd32(at[r] + 4)) });
+			}
+			return e;
+		};
+		for (uint32_t b = 0; b < blocks; ++b) {
+			const std::string& t = types[typeOf[b]];
+			const bool shape = t == "NiTriShape" || t == "NiTriStrips";
+			if (!shape && b != 0) continue;
+			std::string list;
+			for (auto& [key, value] : extras(b)) {
+				if (!_stricmp(key.c_str(), kPhysicsKey) && out.physics.empty()) out.physics = value;
+				if (!_stricmp(key.c_str(), "SMP Bones")) list = value + list;
+			}
+			for (int k = 2; shape && !list.empty(); ++k) {   // "SMP Bones 2", "SMP Bones 3"... in order
+				std::string more;
+				for (auto& [key, value] : extras(b)) if (!_stricmp(key.c_str(), ("SMP Bones " + std::to_string(k)).c_str())) more = value;
+				if (more.empty()) break;
+				list += more;
+			}
+			if (!shape) continue;
+			const std::string name = str(rd32(at[b]));
+			// NiAVObject after the extra data: controller, flags, transform (52 bytes), properties, collision; then data.
+			size_t p = at[b] + 8 + 4 * rd32(at[b] + 4) + 4 + 4 + 52;
+			p += 4 + 4 * rd32(p) + 4;
+			const int32_t data = (int32_t)rd32(p);
+			// A collision proxy: dropped by the game's hair loader, so read here, whole (see hdt::FileMesh).
+			if (_strnicmp(name.c_str(), "SMP Proxy:", 10) == 0) {
+				const int32_t skinRef = (int32_t)rd32(p + 4);
+				if (data < 0 || data >= (int32_t)blocks || skinRef < 0 || skinRef >= (int32_t)blocks) continue;
+				hdt::FileMesh m;
+				// NiTriShapeData: group id, vertex count, keep/compress flags, vertices, BS flags, normals (+ tangents),
+				// bound, colours, UV sets, consistency, additional data, then the triangles.
+				size_t q = at[data] + 4;
+				uint16_t nv; memcpy(&nv, d + q, 2); q += 4;
+				if (d[q++]) { m.vertices.resize(nv); memcpy(m.vertices.data(), d + q, 12 * (size_t)nv); q += 12 * (size_t)nv; }
+				uint16_t bsFlags; memcpy(&bsFlags, d + q, 2); q += 2;
+				if (d[q++]) { q += 12 * (size_t)nv; if (bsFlags & 4096) q += 24 * (size_t)nv; }
+				q += 16;
+				if (d[q++]) q += 16 * (size_t)nv;
+				if (bsFlags & 1) q += 8 * (size_t)nv;
+				q += 2 + 4;
+				uint16_t nt; memcpy(&nt, d + q, 2); q += 2 + 4;
+				if (d[q++])
+					for (uint16_t t = 0; t < nt; ++t) {
+						uint16_t i3[3]; memcpy(i3, d + q + 6 * (size_t)t, 6);
+						m.triangles.push_back({ i3[0], i3[1], i3[2] });
+					}
+				// The skin: its data and bones (NiSkinInstance / BSDismemberSkinInstance), then NiSkinData's bind per bone.
+				const int32_t skinData = (int32_t)rd32(at[skinRef]);
+				const uint32_t boneCount = rd32(at[skinRef] + 12);
+				if (skinData < 0 || skinData >= (int32_t)blocks || m.vertices.empty() || m.triangles.empty()) continue;
+				size_t s = at[skinData] + 52;
+				const uint32_t dataBones = rd32(s); s += 4;
+				const bool hasWeights = d[s++] != 0;
+				m.weights.resize(m.vertices.size());
+				for (uint32_t b = 0; b < dataBones && b < boneCount; ++b) {
+					hdt::FileMesh::Bone bone;
+					const int32_t node = (int32_t)rd32(at[skinRef] + 16 + 4 * b);
+					bone.name = node >= 0 && node < (int32_t)blocks ? str(rd32(at[node])) : std::string();
+					memcpy(&bone.skinToBone, d + s, 52); s += 52;
+					memcpy(&bone.center, d + s, 12); s += 12;
+					memcpy(&bone.radius, d + s, 4); s += 4;
+					uint16_t count; memcpy(&count, d + s, 2); s += 2;
+					for (uint16_t k = 0; hasWeights && k < count; ++k) {
+						uint16_t v; float w;
+						memcpy(&v, d + s, 2); memcpy(&w, d + s + 2, 4); s += 6;
+						if (v < m.weights.size()) m.weights[v].push_back({ (int)b, w });
+					}
+					m.bones.push_back(bone);
+				}
+				std::string lower = name;
+				for (auto& c : lower) c = (char)tolower((unsigned char)c);
+				out.proxies[lower] = std::move(m);
+				continue;
+			}
+			out.names[name] = { "FaceGenHair" + name };
+			if (list.empty()) continue;
+			std::string game = "facegenhair" + name;
+			for (auto& c : game) c = (char)tolower((unsigned char)c);
+			out.lists[game] = list;
+			out.nifName[game] = name;
+			if (data >= 0 && data < (int32_t)blocks) {
+				// NiTriShapeData: group id, vertex count, keep and compress flags, has vertices, the vertices.
+				uint16_t v; memcpy(&v, d + at[data] + 4, 2); out.verts[game] = v;
+				if (d[at[data] + 8] && at[data] + 9 + 12 * (size_t)v <= n) {
+					auto& b = out.base[game];
+					b.resize(v);
+					memcpy(b.data(), d + at[data] + 9, 12 * (size_t)v);
+				}
+				// Its normals and triangles (laid out as for a proxy above).
+				const size_t end = at[data] + sizes[data];
+				size_t q = at[data] + 8;
+				if (d[q++]) q += 12 * (size_t)v;
+				uint16_t bsFlags; memcpy(&bsFlags, d + q, 2); q += 2;
+				if (d[q++]) {
+					if (q + 12 * (size_t)v <= end) {
+						auto& nn = out.normals[game];
+						nn.resize(v);
+						memcpy(nn.data(), d + q, 12 * (size_t)v);
+					}
+					q += 12 * (size_t)v;
+					if (bsFlags & 4096) q += 24 * (size_t)v;
+				}
+				q += 16;
+				if (q < end && d[q++]) q += 16 * (size_t)v;
+				if (bsFlags & 1) q += 8 * (size_t)v;
+				q += 2 + 4;
+				if (q + 7 <= end) {
+					uint16_t nt; memcpy(&nt, d + q, 2); q += 2 + 4;
+					if (d[q++] && q + 6 * (size_t)nt <= end) {
+						auto& tt = out.triangles[game];
+						tt.resize(3 * (size_t)nt);
+						memcpy(tt.data(), d + q, 6 * (size_t)nt);
+					}
+				}
+			}
+		}
+		return out;
+	}
+
+	// The game's hat swap for an actor, as the race menu calls it (0x7B2E39): this = 0x7AF430(actor), then 0x6062E0(actor, 0),
+	// the 0 for the actor's own 3D. Under SEH: false if it faulted.
+	static bool RunHatSwap(void* actor)
+	{
+		__try {
+			void* self = ((void*(__thiscall*)(void*))0x007AF430)(actor);
+			((void(__thiscall*)(void*, void*, void*))0x006062E0)(self, actor, nullptr);
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// Race hair copies drawn in game (built and skinned here), by plain pointer: copies known to draw. When a hair is chosen again
+	// in the race menu, an old copy of it known to draw is shown again rather than the game's new one, made from a recycled
+	// shape (see the scan): those come unbound, with a stale shader slot for a while, and drew nothing before that was handled.
+	static std::unordered_set<const RE::NiAVObject*> g_drawnHair;
+
+	// The race hair files read so far, by model path (each is read once).
+	static const RaceHairFile& RaceHair(const char* model)
+	{
+		static std::unordered_map<std::string, RaceHairFile> cache;
+		std::string key = model;
+		for (auto& c : key) c = (char)tolower((unsigned char)c);
+		if (auto it = cache.find(key); it != cache.end()) return it->second;
+		RaceHairFile& f = cache[key];
+		const std::string bytes = hdt::readAllFile(("Meshes\\" + std::string(model)).c_str());
+		if (bytes.empty()) logger::warn("[SMP] race hair Meshes\\{}: not found", model);
+		else {
+			try { f = ParseRaceHair(bytes); }
+			catch (std::exception& e) { logger::warn("[SMP] race hair Meshes\\{}: {}", model, e.what()); }
+			if (!f.physics.empty()) logger::info("[SMP] race hair Meshes\\{}: physics '{}', {} shape(s) with bones", model, f.physics, f.lists.size());
+			else logger::info("[SMP] race hair Meshes\\{}: read ({} bytes), no physics", model, bytes.size());
+		}
+		return f;
+	}
+
+	// The model path of an actor's hair (TESNPC::hair at 0x1B8, TESHair's TESModel at 0x24, its path at +4), under SEH.
+	static const char* HairModel(void* ref)
+	{
+		__try {
+			void* base = *(void**)((uint8_t*)ref + 0x20);   // TESObjectREFR::baseForm
+			if (!base || *((uint8_t*)base + 4) != 0x2A)       // kFormType_NPC
+				return nullptr;
+			void* hair = *(void**)((uint8_t*)base + 0x1B8);
+			return hair ? *(const char**)((uint8_t*)hair + 0x28) : nullptr;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return nullptr;
+		}
+	}
+
+	static void* NpcOf(void* ref)
+	{
+		__try {
+			void* base = ref ? *(void**)((uint8_t*)ref + 0x20) : nullptr;
+			return base && *((uint8_t*)base + 4) == 0x2A ? base : nullptr;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return nullptr;
+		}
+	}
+
+	// A FaceGen morph file (FREGM002): 64-byte header (magic, vertex count, symmetric and asymmetric morph counts), then
+	// each morph: a scale and an int16 offset per vertex (x, y, z). A morph moves each vertex by offset * scale * the
+	// NPC's value for it.
+	struct Egm { uint32_t verts = 0, sym = 0, asym = 0; std::vector<float> scale; std::vector<int16_t> delta; };
+	static bool LoadEgm(const std::string& path, Egm& e)
+	{
+		const std::string b = hdt::readAllFile(path.c_str());
+		if (b.size() < 64 || b.compare(0, 8, "FREGM002") != 0) return false;
+		memcpy(&e.verts, b.data() + 8, 4); memcpy(&e.sym, b.data() + 12, 4); memcpy(&e.asym, b.data() + 16, 4);
+		const size_t morphs = e.sym + e.asym, each = 4 + 6 * (size_t)e.verts;
+		if (b.size() < 64 + morphs * each) return false;
+		e.scale.resize(morphs);
+		e.delta.resize(morphs * 3 * (size_t)e.verts);
+		for (size_t m = 0; m < morphs; ++m) {
+			memcpy(&e.scale[m], b.data() + 64 + m * each, 4);
+			memcpy(&e.delta[m * 3 * e.verts], b.data() + 64 + m * each + 4, 6 * (size_t)e.verts);
+		}
+		return true;
+	}
+	static void Morph(const std::vector<RE::NiPoint3>& base, const Egm& e, const float* sym, const float* asym, std::vector<RE::NiPoint3>& out)
+	{
+		out = base;
+		for (uint32_t m = 0; m < e.sym + e.asym; ++m) {
+			const float k = (m < e.sym ? sym[m] : asym[m - e.sym]) * e.scale[m];
+			if (k == 0) continue;
+			const int16_t* d = &e.delta[(size_t)m * 3 * e.verts];
+			for (uint32_t v = 0; v < e.verts && v < out.size(); ++v)
+				out[v] = out[v] + RE::NiPoint3{ d[3 * v] * k, d[3 * v + 1] * k, d[3 * v + 2] * k };
+		}
+	}
+
+	// The NPC's face values (TESNPC::faceGenData at 0x134: geometry symmetric, then asymmetric, 0x20 each), read one of
+	// four ways (the layout is not known for certain; CpuSkin picks the one that rebuilds what the game drew): the values
+	// pointer at +0x0C as the floats, or offset by +0x10 bytes, or through one more pointer, with or without the offset.
+	static bool FaceValues(void* npc, int entry, int way, float* out, uint32_t count)
+	{
+		__try {
+			uint8_t* e = (uint8_t*)npc + 0x134 + 0x20 * entry;
+			uint8_t* values = *(uint8_t**)(e + 0x0C);
+			const uint32_t offset = *(uint32_t*)(e + 0x10);
+			if (!values) return false;
+			uint8_t* p = way & 2 ? *(uint8_t**)values : values;
+			if (!p) return false;
+			if (way & 1) p += offset;
+			memcpy(out, p, count * sizeof(float));
+			for (uint32_t i = 0; i < count; ++i) if (!std::isfinite(out[i]) || std::fabs(out[i]) > 100) return false;
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// A shape's shader property (NiPropertyState at 0x9C, shade at +0x0C) and its first flags word (BSShaderProperty +0x20:
+	// bit 1 Skinned, bit 18 Hair); BSShaderPPLightingProperty::kHairTint at +0x84.
+	static uint32_t& ShaderFlags(uint8_t* property) { return *reinterpret_cast<uint32_t*>(property + 0x20); }
+	// The hair's shader property (its property state's shade slot), only if it is one: a hair shader's flags have Hair (bit
+	// 18). A copy the race menu makes from a recycled shape can hold something else there for a while (flags 0xed1 seen),
+	// which is not written to.
+	static uint8_t* ShadeProperty(RE::NiAVObject* shape)
+	{
+		uint8_t* p = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(shape) + 0x9C + 0x0C);
+		return p && (ShaderFlags(p) & 0x40000) ? p : nullptr;
+	}
+
+	// A hair shape's .egm (<model without .nif><shape's name in the NIF>.egm), read once; null if there is none.
+	static std::shared_ptr<Egm> HairEgm(const std::string& model, const RaceHairFile& f, const std::string& lowerShape)
+	{
+		static std::unordered_map<std::string, std::shared_ptr<Egm>> cache;
+		std::string key = model + "|" + lowerShape;
+		for (auto& c : key) c = (char)tolower((unsigned char)c);
+		if (auto it = cache.find(key); it != cache.end()) return it->second;
+		auto nif = f.nifName.find(lowerShape);
+		std::string path = "Meshes\\" + model;
+		if (path.size() > 4) path = path.substr(0, path.size() - 4);
+		auto e = std::make_shared<Egm>();
+		if (nif == f.nifName.end() || !LoadEgm(path + nif->second + ".egm", *e) || e->sym > 50 || e->asym > 30) e = nullptr;
+		return cache[key] = e;
+	}
+
 	ActorManager* ActorManager::instance()
 	{
 		static ActorManager manager;
 		return &manager;
 	}
 
-	void ActorManager::found(RE::NiNode* root, RE::NiAVObject* model, const char* file)
+	void ActorManager::found(RE::NiNode* root, RE::NiAVObject* model, const char* file, const hdt::DefaultBBP::NameMap_t* names,
+		const std::unordered_map<std::string, std::string>* lists, RE::NiAVObject* hairShape)
 	{
 		auto key = std::make_pair((void*)root, (void*)model);
 		auto it = m_items.find(key);
 		if (it != m_items.end() && it->second.file != file) {
 			// The same node now names another file: rebuild.
-			if (it->second.system)
+			if (it->second.system) {
+				ReleaseCpuSkins(it->second);
 				hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(it->second.system.get());
+			}
 			SetProxiesHidden(it->second.model.get(), false);
 			m_items.erase(it);
 			it = m_items.end();
@@ -192,16 +513,38 @@ namespace nvsmp
 			item.skeleton = root;
 			item.model = model;
 			item.file = file;
+			if (names) item.names = *names;
+			if (lists) { item.boneLists = *lists; item.npc = NpcOf(m_scanRef); if (const char* h = HairModel(m_scanRef)) item.hairModel = h; }
 			item.buildAt = m_frame + kSettleFrames;
 			it = m_items.emplace(key, std::move(item)).first;
 		}
 		it->second.frame = m_frame;
+		// Race hair the game replaced (a new shape under the same node) or skinned again (rebuilt in place, the race
+		// menu): built again on the shape as it is now.
+		if (hairShape && it->second.system && !it->second.cpuSkins.empty()) {
+			bool ours = false;
+			bool reskinned = false;
+			auto* g = hdt::castNiGeometry(hairShape);
+			for (auto& s : it->second.cpuSkins)
+				if (s.shape.get() == hairShape) { ours = true; reskinned = g && g->skinInstance && g->skinInstance != s.skin.get(); }
+			if (!ours || reskinned) {
+				logger::info("[SMP] {}: the game {} the hair, building again", hairShape->GetName(), ours ? "skinned again" : "replaced");
+				it->second.system->m_itemDetached = true;
+				ReleaseCpuSkins(it->second);
+				hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(it->second.system.get());
+				it->second.system = nullptr;
+				it->second.builds = 0;
+				it->second.failed = false;
+				it->second.buildAt = m_frame + kSettleFrames;
+			}
+		}
 		// The game re-pointed the item's skin since it was built: it detached the model and attached it again while
 		// the plugin was not looking (equipping in the Pip-Boy, which pauses the game), and the slots that drew from
 		// the cloth bones now draw from the skeleton, collapsing the cloth. Built again, from scratch.
 		if (it->second.system && rebound(it->second)) {
 			logger::warn("[SMP] {}: the game re-pointed its skin (detached and attached again), building again", model->GetName());
 			it->second.system->m_itemDetached = true;
+			ReleaseCpuSkins(it->second);
 			hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(it->second.system.get());
 			SetProxiesHidden(model, false);
 			it->second.system = nullptr;
@@ -215,6 +558,7 @@ namespace nvsmp
 			if (it->second.system) {
 				logger::warn("[SMP] {}: the game unbound its skin, physics paused until it is bound again", model->GetName());
 				it->second.system->m_itemDetached = true;
+				ReleaseCpuSkins(it->second);
 				hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(it->second.system.get());
 				SetProxiesHidden(model, false);
 				it->second.system = nullptr;
@@ -275,8 +619,10 @@ namespace nvsmp
 		auto* model = item.model.get();
 		const char* file = item.file.c_str();
 		++item.builds;
-		hdt::DefaultBBP::PhysicsFile_t physicsFile{ item.file, {} };
+		hdt::DefaultBBP::PhysicsFile_t physicsFile{ item.file, item.names };
 		hdt::SkyrimSystemCreator creator;
+		creator.m_boneLists = item.boneLists;
+		if (!item.hairModel.empty()) creator.m_fileMeshes = RaceHair(item.hairModel.c_str()).proxies;   // its collision proxies, from the NIF
 		// Waist collision 0 keeps the file's weight thresholds, 1 removes them.
 		creator.m_weightThresholdScale = 1.0f - gSettings.waistCollision;
 		creator.m_ground = gSettings.ground;
@@ -298,6 +644,458 @@ namespace nvsmp
 		item.system = system;
 		hdt::SkyrimPhysicsWorld::get()->addSkinnedMeshSystem(item.system.get());
 		logger::info("[SMP] '{}': {} bones, {} collision bodies", file, item.system->getBones().size(), item.system->meshes().size());
+
+		// Race hair: the game draws it without skinning (its hair shader has no skinned path), at the node holding it. Its
+		// shapes are skinned here every frame instead (skinOnCpu), from their vertices as the game made them (with the face
+		// sliders' morphs), and their skins taken off so nothing else skins them again (NVR's shadows did).
+		if (!item.boneLists.empty())
+			if (auto* node = model->AsNode())
+				for (uint16_t i = 0; i < node->ChildEnd(); ++i) {
+					auto* g = hdt::castNiGeometry(node->children[i]);
+					if (!g || !g->skinInstance || !g->data || !g->data->vertices || !g->skinInstance->skinData || !g->skinInstance->bones) continue;
+					std::string lower = g->GetName();
+					for (auto& c : lower) c = (char)tolower((unsigned char)c);
+					if (!item.boneLists.count(lower)) continue;
+					Item::CpuSkin s;
+					s.shape = g;
+					s.skin = g->skinInstance;
+					s.bind.assign(g->data->vertices, g->data->vertices + g->data->vertexCount);
+					// The hair's colour is applied by the game's hair shader; the Skinned flag (needed by the NIF's skin, now
+					// done here) sends the shape to the plain lighting shader instead, without it.
+					std::string shade = "no shader property";
+					if (uint8_t* p = ShadeProperty(g)) {
+						const float* tint = reinterpret_cast<const float*>(p + 0x84);
+						shade = std::format("shader flags 0x{:08x} (skinned {}, hair {}), tint {:.2f} {:.2f} {:.2f}", ShaderFlags(p), (ShaderFlags(p) >> 1) & 1, (ShaderFlags(p) >> 18) & 1, tint[0], tint[1], tint[2]);
+						if (ShaderFlags(p) & 2) { ShaderFlags(p) &= ~2u; s.unskinnedFlag = true; }
+						// No Alpha_Texture (0x100): the game clears it on a hair it loads (0x82040003 seen), not on the copies the
+						// race menu makes from recycled shapes (0x82040103), which then draw nothing.
+						ShaderFlags(p) &= ~0x100u;
+					}
+					logger::info("[SMP] {}: skinned on the CPU ({} vertices, {} bones; {}; its data used {} time(s))", g->GetName(), g->data->vertexCount,
+						s.skin->skinData->boneCount, shade, (long)g->data->refCount);
+
+					// The face sliders: the game does not reshape a skinned hair, so its .egm is applied here, to the file's
+					// vertices, with the NPC's face values (the values pointer read as the floats: confirmed in game), and
+					// again whenever those change. The hair colour: the NPC's (TESNPC::hairColor at 0x1D8, RGB a byte each,
+					// confirmed in game) is kept in the tint.
+					if (item.npc && !item.hairModel.empty()) {
+						const RaceHairFile& f = RaceHair(item.hairModel.c_str());
+						auto base = f.base.find(lower);
+						auto egm = HairEgm(item.hairModel, f, lower);
+						float sym[50], asym[30];
+						if (base != f.base.end() && base->second.size() == s.bind.size() && egm && egm->verts == s.bind.size() &&
+							FaceValues(item.npc, 0, 0, sym, egm->sym) && FaceValues(item.npc, 1, 0, asym, egm->asym)) {
+							s.symWay = s.asymWay = 0;
+							memcpy(s.sym, sym, sizeof(sym));
+							memcpy(s.asym, asym, sizeof(asym));
+							s.fileBase = base->second;
+							s.egm = egm;
+							Morph(s.fileBase, *s.egm, s.sym, s.asym, s.bind);   // the sliders as they are now
+							logger::info("[SMP] {}: face sliders applied here", g->GetName());
+						} else
+							logger::warn("[SMP] {}: face sliders not applied: no file vertices, .egm or face values", g->GetName());
+						s.colourWay = 0;
+					}
+					g->skinInstance = nullptr;
+					g_drawnHair.insert(g);
+					item.cpuSkins.push_back(std::move(s));
+				}
+		// The player's race hair built after the race menu closed: the game's hat swap once more (see update).
+		if (m_hatSwapAfterBuild && !item.cpuSkins.empty() && root == Game::Get3D(Game::Player())) {
+			m_hatSwapAfterBuild = false;
+			logger::info("[SMP] race hair built: the game's hat swap run again for the player{}", RunHatSwap(Game::Player()) ? "" : " (failed)");
+		}
+	}
+
+	// The skins given back and the vertices as the game made them, when the physics goes (the shapes may stay).
+	void ActorManager::ReleaseCpuSkins(Item& item)
+	{
+		for (auto& s : item.cpuSkins) {
+			auto* g = hdt::castNiGeometry(s.shape.get());
+			if (!g) continue;
+			// The vertices go back unless the game wrote its own since (a new shape from the race menu).
+			const bool ours = s.written.empty() || (g->data && g->data->vertices && g->data->vertexCount == s.written.size() &&
+				memcmp(s.written.data(), g->data->vertices, s.written.size() * sizeof(RE::NiPoint3)) == 0);
+			if (ours && g->data && g->data->vertices && g->data->vertexCount == s.bind.size()) {
+				std::copy(s.bind.begin(), s.bind.end(), g->data->vertices);
+				g->data->dirtyFlags |= 1;
+			}
+			if (!g->skinInstance) g->skinInstance = s.skin.get();
+			if (uint8_t* p = s.unskinnedFlag ? ShadeProperty(g) : nullptr) ShaderFlags(p) |= 2;
+		}
+		item.cpuSkins.clear();
+	}
+
+	// The skins taken off race hair in the race menu (the game draws a skinned shape from the buffers it packed, not from
+	// the vertices written here), by shape. Plain pointers, nothing held: a copy the menu throws away keeps its skin
+	// (leaked, never touched again); the copy that remains gets its skin back when the menu closes (scan).
+	struct MenuSkin { RE::NiSkinInstance* skin; std::string model; };   // the skin taken off, and the hair file the copy is of
+	static std::unordered_map<const RE::NiAVObject*, MenuSkin> g_menuSkins;
+	// Old copies hidden and renamed here (see the scan), by plain pointer, with the name the game gave them: kept across race
+	// menu visits (the game shows such a copy again when its hair is chosen again); only acted on when the scan finds the
+	// object in the scene still carrying the mark.
+	static std::unordered_map<const RE::NiAVObject*, std::string> g_renamedHair;
+	static constexpr const char* kOldHairMark = " (SMP old copy)";
+
+	// Binds a race hair copy's skin the game left unbound (the race menu's copies made from recycled shapes): each slot on the
+	// skeleton's bone of its "SMP Bones" name, the hair's own bones (the physics' to come, "SMP ...") on the head for now
+	// (the physics build puts its nodes there), the root on the actor's. A new slot array from the game's allocator, which
+	// frees it with the skin (the old one, of unknown size, is left).
+	static std::vector<std::string> SlotNames(const std::string& list);
+	static bool BindHairSkin(RE::NiGeometry* g, RE::NiNode* root, const std::string& model)
+	{
+		auto* sk = g->skinInstance;
+		if (!sk || !sk->skinData || !sk->skinData->boneCount || !g->parent)
+			return false;
+		std::string lower = g->GetName();
+		for (auto& c : lower) c = (char)tolower((unsigned char)c);
+		const RaceHairFile& f = RaceHair(model.c_str());
+		auto list = f.lists.find(lower);
+		RE::NiAVObject* head = FindOutside(root, g->parent, "Bip01 Head");
+		if (list == f.lists.end() || !head)
+			return false;
+		const std::vector<std::string> names = SlotNames(list->second);
+		const uint32_t n = sk->skinData->boneCount;
+		auto** bones = static_cast<RE::NiAVObject**>(((void*(__cdecl*)(size_t))Game::kNiNew)(n * sizeof(RE::NiAVObject*)));
+		if (!bones)
+			return false;
+		int named = 0;
+		for (uint32_t i = 0; i < n; ++i) {
+			RE::NiAVObject* node = nullptr;
+			if (i < names.size() && !names[i].empty() && names[i].rfind("smp ", 0) != 0)
+				node = FindOutside(root, g->parent, names[i].c_str());
+			named += node != nullptr;
+			bones[i] = node ? node : head;
+		}
+		sk->bones = bones;
+		sk->boneCount = n;
+		sk->rootParent = root;
+		logger::info("[SMP] race menu: {} {:p} came with its skin unbound: bound here ({} slots, {} on skeleton bones)", g->GetName(), (void*)g, n, named);
+
+		// Its data, drawn here from its own vertices with the skin taken off: a recycled shape's may lack the triangles or
+		// normals (skinned, the game draws from the skin partition's): from the file then, kept (keep flags normals 0x02,
+		// indices 0x10), in arrays from the game's allocator.
+		auto* td = static_cast<RE::NiTriShapeData*>(g->data);
+		const auto tris = f.triangles.find(lower);
+		const auto norms = f.normals.find(lower);
+		logger::info("[SMP] race menu: {} data: {} triangles (list {:p}, {} indices), normals {:p}, keep {:#x}; the file has {} triangles, {} normals",
+			g->GetName(), td->triangleCount, (void*)td->triList, td->triListLength, (void*)td->normals, td->keepFlags,
+			tris != f.triangles.end() ? tris->second.size() / 3 : 0, norms != f.normals.end() ? norms->second.size() : 0);
+		if ((!td->triList || !td->triangleCount) && tris != f.triangles.end() && !tris->second.empty()) {
+			auto* list = static_cast<uint16_t*>(((void*(__cdecl*)(size_t))Game::kNiNew)(tris->second.size() * sizeof(uint16_t)));
+			if (list) {
+				memcpy(list, tris->second.data(), tris->second.size() * sizeof(uint16_t));
+				td->triList = list;
+				td->triangleCount = td->activeTriangleCount = (uint16_t)(tris->second.size() / 3);
+				td->triListLength = (uint32_t)tris->second.size();
+				logger::info("[SMP] race menu: {} given its {} triangles from the file", g->GetName(), td->triangleCount);
+			}
+		}
+		if (!td->normals && norms != f.normals.end() && norms->second.size() == td->vertexCount) {
+			auto* nn = static_cast<RE::NiPoint3*>(((void*(__cdecl*)(size_t))Game::kNiNew)(norms->second.size() * sizeof(RE::NiPoint3)));
+			if (nn) {
+				memcpy(nn, norms->second.data(), norms->second.size() * sizeof(RE::NiPoint3));
+				td->normals = nn;
+				logger::info("[SMP] race menu: {} given its normals from the file", g->GetName());
+			}
+		}
+		td->keepFlags |= 0x12;
+		td->dirtyFlags |= 1;
+		return true;
+	}
+
+	// obj's siblings that are other, not renamed, copies of the same hair shape (the game's name, same vertex count).
+	static std::vector<RE::NiAVObject*> OtherCopies(const RE::NiAVObject* obj, const char* name, uint32_t vertexCount)
+	{
+		std::vector<RE::NiAVObject*> out;
+		auto* parent = obj->parent;
+		if (!parent)
+			return out;
+		for (uint16_t i = 0; i < parent->ChildEnd(); ++i) {
+			auto* child = parent->children[i];
+			if (!child || child == obj || !child->m_name || _stricmp(child->m_name, name) != 0)
+				continue;
+			auto* g = hdt::castNiGeometry(child);
+			if (g && g->data && g->data->vertexCount == vertexCount)
+				out.push_back(child);
+		}
+		return out;
+	}
+
+	// The "SMP Bones" list's slot names (lower case), in slot order.
+	static std::vector<std::string> SlotNames(const std::string& list)
+	{
+		std::vector<std::string> out;
+		size_t p = 0;
+		while (p < list.size()) {
+			size_t end = list.find(';', p);
+			if (end == std::string::npos) end = list.size();
+			std::string entry = list.substr(p, end - p);
+			std::string name = entry.substr(0, entry.find('|'));
+			for (auto& c : name) c = (char)tolower((unsigned char)c);
+			out.push_back(name);
+			p = end + 1;
+		}
+		return out;
+	}
+
+	// The stand-in skeleton (see m_menuRoot): a node of the plugin's own for each of the player's skeleton nodes (made the
+	// first time its name is seen, never released), given the real one's place; read fresh from the player's 3D each
+	// frame, nothing of it held.
+	static std::vector<RE::NiPointer<RE::NiNode>> g_menuProxyNodes;
+	void ActorManager::refreshMenuProxies(RE::NiNode* playerRoot)
+	{
+		if (!playerRoot) return;
+		if (!m_menuRoot) {
+			m_menuRoot = hdt::createNode("SMP Race Menu Skeleton");
+			if (!m_menuRoot) return;
+		}
+		m_menuRoot->world = playerRoot->world;
+		struct Walk
+		{
+			ActorManager* self;
+			void run(RE::NiAVObject* obj, int depth)
+			{
+				auto* node = obj && depth < 64 ? obj->AsNode() : nullptr;
+				if (!node) return;
+				if (node->m_name && *node->m_name && _strnicmp(node->m_name, "BSFaceGen", 9) != 0) {
+					std::string n = node->m_name;
+					for (auto& c : n) c = (char)tolower((unsigned char)c);
+					auto it = self->m_menuProxies.find(n);
+					if (it == self->m_menuProxies.end()) {
+						RE::NiPointer<RE::NiNode> proxy(hdt::createNode(node->m_name));
+						if (proxy) { g_menuProxyNodes.push_back(proxy); it = self->m_menuProxies.emplace(n, proxy.get()).first; }
+					}
+					if (it != self->m_menuProxies.end()) it->second->world = node->world;
+				}
+				for (uint16_t i = 0; i < node->ChildEnd(); ++i) run(node->children[i], depth + 1);
+			}
+		} walk{ this };
+		walk.run(playerRoot, 0);
+	}
+
+	void ActorManager::dropMenuSystem(const char* why)
+	{
+		if (!m_menuSystem) return;
+		hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(m_menuSystem.get());
+		m_menuSystem = nullptr;
+		m_menuBones.clear();
+		m_menuModel.clear();
+		m_menuMissing = 0;
+		logger::info("[SMP] race menu: hair physics dropped ({})", why);
+	}
+
+	// The race menu's hair physics, built on a copy of the hair the game has bound to the head (the creator places its
+	// bones from that), then let go of the copy at once (its skin slots put back, see releaseSlots).
+	bool ActorManager::buildMenuSystem(RE::NiNode* root, RE::NiAVObject* shape, const std::string& model)
+	{
+		const RaceHairFile& f = RaceHair(model.c_str());
+		hdt::DefaultBBP::PhysicsFile_t physicsFile{ f.physics, f.names };
+		hdt::SkyrimSystemCreator creator;
+		creator.m_weightThresholdScale = 1.0f - gSettings.waistCollision;
+		creator.m_ground = gSettings.ground;
+		creator.m_boneLists = f.lists;
+		creator.m_fileMeshes = f.proxies;
+		// On the stand-in skeleton: the system holds only the plugin's nodes.
+		refreshMenuProxies(root);
+		if (!m_menuRoot) return false;
+		creator.m_skeletonNodes = m_menuProxies;
+		// The menu's copies are not bound (their head slot holds the hair file's own Bip01 Head, at the world origin) and
+		// their skin may be off (g_menuSkins): for the build only, the skin on and its head slot on the skeleton's head,
+		// which the creator places the ponytail's bones from.
+		auto* g = hdt::castNiGeometry(shape);
+		RE::NiSkinInstance* skin = g ? g->skinInstance : nullptr;
+		bool reattached = false;
+		if (g && !skin)
+			if (auto it = g_menuSkins.find(g); it != g_menuSkins.end()) { skin = it->second.skin; g->skinInstance = skin; reattached = true; }
+		RE::NiAVObject* head = FindOutside(root, shape->parent, "Bip01 Head");
+		if (!skin || !skin->bones || !skin->boneCount || !head) {
+			if (reattached) g->skinInstance = nullptr;
+			return false;
+		}
+		RE::NiAVObject* slot0 = skin->bones[0];
+		skin->bones[0] = head;
+		auto system = creator.createOrUpdateSystem(m_menuRoot.get(), shape->parent, &physicsFile, {}, nullptr);
+		skin->bones[0] = slot0;
+		if (reattached) g->skinInstance = nullptr;
+		if (!system || !creator.complete()) {
+			if (system) system->releaseSlots();
+			return false;
+		}
+		const int restored = system->releaseSlots();
+		hdt::SkyrimPhysicsWorld::get()->addSkinnedMeshSystem(system.get());
+		m_menuSystem = system;
+		m_menuModel = model;
+		m_menuMissing = 0;
+		m_menuBones.clear();
+		for (auto& b : system->getBones()) {
+			std::string n = b->m_name.c_str();
+			for (auto& c : n) c = (char)tolower((unsigned char)c);
+			m_menuBones[n] = static_cast<hdt::SkyrimBone*>(b.get())->m_node.get();
+		}
+		logger::info("[SMP] race menu: hair physics built ({} bones), {} skin slot(s) given back to the hair", system->getBones().size(), restored);
+		return true;
+	}
+
+	// Race hair in the race menu (see m_raceMenu), on whichever copy of the hair the scan found this frame, skinned here
+	// with the face sliders and the colour: its slots by name from the hair file's "SMP Bones", the ponytail's on the
+	// race menu's physics (m_menuSystem), the rest on the skeleton (its Bip01 Head: a fresh copy's slot still holds the
+	// hair file's own, at the world origin). Its skin is taken off (see g_menuSkins); nothing of it is held.
+	void ActorManager::skinMenuHair()
+	{
+		static const void* lastShape = nullptr;
+		static float lastSym[50], lastAsym[30];
+		static std::vector<RE::NiPoint3> morphed, out;
+		bool seen = false;
+		for (auto& h : m_menuHair) {
+			auto* g = hdt::castNiGeometry(h.shape);
+			if (!g || !g->data || !g->data->vertices || !h.npc || !g->parent) continue;
+			// A copy the race menu makes from a recycled shape comes with its skin never bound (no bones, its root itself), and
+			// the game never binds it: bound here as the game would, by the slot names in the hair file's "SMP Bones".
+			if (auto* sk = g->skinInstance; sk && (!sk->bones || !sk->boneCount) && !BindHairSkin(g, h.root, h.model)) continue;
+			// Physics for the player's hair: built on a copy the game bound to the head, and kept while the hair is shown.
+			const bool player = h.root == Game::Get3D(Game::Player());
+			if (player && m_menuSystem && m_menuModel != h.model) dropMenuSystem("another hair");
+			static unsigned lastTry = 0;
+			if (player && !m_menuSystem && (lastTry == 0 || m_frame - lastTry >= 60)) {
+				lastTry = m_frame;
+				if (buildMenuSystem(h.root, g, h.model)) lastTry = 0;
+			}
+			if (player && m_menuSystem) seen = true;
+
+			auto* skin = g->skinInstance;
+			if (skin) { g_menuSkins[g] = { skin, h.model }; g->skinInstance = nullptr; }
+			else if (auto it = g_menuSkins.find(g); it != g_menuSkins.end()) skin = it->second.skin;
+			if (!skin || !skin->skinData || !skin->skinData->boneData || !skin->skinData->boneCount) continue;
+			const RaceHairFile& f = RaceHair(h.model.c_str());
+			std::string lower = g->GetName();
+			for (auto& c : lower) c = (char)tolower((unsigned char)c);
+			auto base = f.base.find(lower);
+			auto list = f.lists.find(lower);
+			if (base == f.base.end() || list == f.lists.end() || base->second.size() != g->data->vertexCount) continue;
+			RE::NiAVObject* head = FindOutside(h.root, g->parent, "Bip01 Head");
+			if (!head) continue;
+
+			auto egm = HairEgm(h.model, f, lower);
+			float sym[50] = {}, asym[30] = {};
+			const bool faces = egm && egm->verts == base->second.size() && FaceValues(h.npc, 0, 0, sym, egm->sym) && FaceValues(h.npc, 1, 0, asym, egm->asym);
+			if (lastShape != g || memcmp(sym, lastSym, sizeof(sym)) != 0 || memcmp(asym, lastAsym, sizeof(asym)) != 0 || morphed.size() != base->second.size()) {
+				if (faces) Morph(base->second, *egm, sym, asym, morphed);
+				else morphed = base->second;
+				lastShape = g;
+				memcpy(lastSym, sym, sizeof(sym));
+				memcpy(lastAsym, asym, sizeof(asym));
+			}
+
+			// Each slot's node by name: the physics' (the player's, while it runs), else the skeleton's, else the head.
+			const auto* data = skin->skinData;
+			const std::vector<std::string> names = SlotNames(list->second);
+			const RE::NiTransform toShape = g->world.Invert();
+			out.assign(morphed.size(), RE::NiPoint3{});
+			for (uint32_t b = 0; b < data->boneCount; ++b) {
+				if (!data->boneData[b].vertData) continue;
+				RE::NiAVObject* node = nullptr;
+				const std::string name = b < names.size() ? names[b] : std::string();
+				if (player && m_menuSystem)
+					if (auto it = m_menuBones.find(name); it != m_menuBones.end()) node = it->second;
+				if (!node && !name.empty() && name.rfind("smp ", 0) != 0) node = FindOutside(h.root, g->parent, name.c_str());
+				// A ponytail bone without its physics (an NPC's hair, or before it is built): where it rests on the head.
+				const RE::NiTransform m = node ? toShape * (node->world * data->boneData[b].skinToBone)
+				                               : toShape * (head->world * data->boneData[0].skinToBone);
+				const auto* vw = data->boneData[b].vertData;
+				for (uint16_t k = 0; k < data->boneData[b].vertCount; ++k)
+					if (vw[k].vertex < out.size()) out[vw[k].vertex] = out[vw[k].vertex] + (m * morphed[vw[k].vertex]) * vw[k].weight;
+			}
+			RE::NiPoint3 lo{ FLT_MAX, FLT_MAX, FLT_MAX }, hi{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+			for (size_t v = 0; v < out.size(); ++v) {
+				g->data->vertices[v] = out[v];
+				lo = { std::min(lo.x, out[v].x), std::min(lo.y, out[v].y), std::min(lo.z, out[v].z) };
+				hi = { std::max(hi.x, out[v].x), std::max(hi.y, out[v].y), std::max(hi.z, out[v].z) };
+			}
+			g->data->bound.center = (lo + hi) * 0.5f;
+			g->data->bound.radius = (hi - g->data->bound.center).Length();
+			g->data->dirtyFlags |= 1;
+			if (uint8_t* p = ShadeProperty(g)) {
+				ShaderFlags(p) &= ~2u;   // the hair shader (with the colour), as in skinOnCpu
+				ShaderFlags(p) &= ~0x100u;   // and no Alpha_Texture, as the game leaves a hair it loads (see build)
+				const uint32_t c = *(uint32_t*)((uint8_t*)h.npc + 0x1D8);
+				float* tint = reinterpret_cast<float*>(p + 0x84);
+				tint[0] = (c & 0xFF) / 255.0f;
+				tint[1] = ((c >> 8) & 0xFF) / 255.0f;
+				tint[2] = ((c >> 16) & 0xFF) / 255.0f;
+			}
+		}
+		// The physics goes when its hair has not been seen for a while (the menu leaves frames with no hair as it rebuilds
+		// the head: those are not a change of hair).
+		if (m_menuSystem && !seen && ++m_menuMissing > 60) dropMenuSystem("its hair is gone");
+		if (seen) m_menuMissing = 0;
+		m_menuHair.clear();
+	}
+
+	void ActorManager::skinOnCpu()
+	{
+		skinMenuHair();
+		std::vector<RE::NiPoint3> out;
+		for (auto& [key, item] : m_items) {
+			if (!item.system) continue;
+			for (auto& s : item.cpuSkins) {
+				auto* g = hdt::castNiGeometry(s.shape.get());
+				auto* skin = s.skin.get();
+				if (!g || !g->data || !g->data->vertices || g->data->vertexCount != s.bind.size() || !skin->skinData || !skin->bones) continue;
+				const auto* data = skin->skinData;
+				// The game reshaped the hair (a face slider): its vertices are no longer the ones written last frame. They
+				// are the new shape, as the game makes it (unskinned, in the hair's own space).
+				if (s.written.size() == s.bind.size() && memcmp(s.written.data(), g->data->vertices, s.bind.size() * sizeof(RE::NiPoint3)) != 0) {
+					s.bind.assign(g->data->vertices, g->data->vertices + s.bind.size());
+					static int reported = 0;
+					if (reported++ < 10) logger::info("[SMP] {}: reshaped by the game (face sliders), taken as its new shape", g->GetName());
+				}
+				// The face sliders (see build): the NPC's values changed, the hair is morphed again from the file's vertices.
+				if (s.egm && item.npc) {
+					float sym[50], asym[30];
+					if (FaceValues(item.npc, 0, s.symWay, sym, s.egm->sym) && FaceValues(item.npc, 1, s.asymWay, asym, s.egm->asym) &&
+						(memcmp(sym, s.sym, s.egm->sym * sizeof(float)) != 0 || memcmp(asym, s.asym, s.egm->asym * sizeof(float)) != 0)) {
+						memcpy(s.sym, sym, sizeof(sym));
+						memcpy(s.asym, asym, sizeof(asym));
+						Morph(s.fileBase, *s.egm, sym, asym, s.bind);
+						static int reported = 0;
+						if (reported++ < 10) logger::info("[SMP] {}: face sliders changed, hair reshaped", g->GetName());
+					}
+				}
+				// The hair colour follows the NPC's (see build).
+				if (s.colourWay >= 0 && item.npc)
+					if (uint8_t* p = ShadeProperty(g)) {
+						const uint32_t c = *(uint32_t*)((uint8_t*)item.npc + 0x1D8);
+						float* tint = reinterpret_cast<float*>(p + 0x84);
+						const float r = (c & 0xFF) / 255.0f, gg = ((c >> 8) & 0xFF) / 255.0f, b = ((c >> 16) & 0xFF) / 255.0f;
+						tint[0] = s.colourWay == 0 ? r : b;
+						tint[1] = gg;
+						tint[2] = s.colourWay == 0 ? b : r;
+					}
+				// Each bone's skin-to-world, then into the shape's own space (where the game draws its vertices).
+				const RE::NiTransform toShape = g->world.Invert();
+				out.assign(s.bind.size(), RE::NiPoint3{});
+				for (uint32_t b = 0; b < data->boneCount; ++b) {
+					RE::NiAVObject* bone = skin->bones[b];
+					if (!bone || !data->boneData[b].vertData) continue;
+					const RE::NiTransform m = toShape * (bone->world * data->boneData[b].skinToBone);
+					const auto* vw = data->boneData[b].vertData;
+					for (uint16_t k = 0; k < data->boneData[b].vertCount; ++k) {
+						const uint16_t v = vw[k].vertex;
+						if (v >= out.size()) continue;
+						out[v] = out[v] + (m * s.bind[v]) * vw[k].weight;
+					}
+				}
+				RE::NiPoint3 lo{ FLT_MAX, FLT_MAX, FLT_MAX }, hi{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+				for (auto& p : out) { lo = { std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z) }; hi = { std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z) }; }
+				std::copy(out.begin(), out.end(), g->data->vertices);
+				s.written = out;
+				const RE::NiPoint3 c = (lo + hi) * 0.5f;
+				g->data->bound.center = c;
+				g->data->bound.radius = (hi - c).Length();
+				g->data->dirtyFlags |= 1;   // the vertices changed: packed again for the draw
+			}
+		}
 	}
 
 	void ActorManager::scan(RE::NiNode* root, RE::NiAVObject* obj, int depth)
@@ -314,22 +1112,128 @@ namespace nvsmp
 					return;   // one system per item: its shapes are part of it
 			}
 		}
+		// Race hair (see RaceHairFile): a FaceGen hair shape whose hair NIF has physics, drawn from that NIF (same vertex
+		// count), is an item under the node holding it.
+		if (m_scanRef && obj->m_name && !_strnicmp(obj->m_name, "FaceGenHair", 11) && obj->parent && hdt::castNiGeometry(obj)) {
+			if (const char* hair = HairModel(m_scanRef); hair && *hair) {
+				const RaceHairFile& f = RaceHair(hair);
+				// An old copy hidden here goes by another name (see below): it is judged by the name the game gave it. An entry
+				// whose object no longer carries the mark is stale (its address reused): dropped.
+				auto renamed = g_renamedHair.find(obj);
+				if (renamed != g_renamedHair.end() && !strstr(obj->m_name, kOldHairMark)) {
+					g_renamedHair.erase(renamed);
+					renamed = g_renamedHair.end();
+				}
+				std::string lower = renamed != g_renamedHair.end() ? renamed->second : obj->m_name;
+				for (auto& c : lower) c = (char)tolower((unsigned char)c);
+				auto* g = hdt::castNiGeometry(obj);
+				bool current = !f.physics.empty() && f.lists.count(lower) && g->data && f.verts.count(lower) && f.verts.at(lower) == g->data->vertexCount;
+				// An old copy of the hair chosen again, one known to draw: shown again (its name back) unless another copy known
+				// to draw already is. The game's new copy of that hair beside it (made from a recycled shape, it draws nothing)
+				// becomes the old copy instead: hidden and renamed, its skin back, not drawn here. Otherwise the old copy stays one.
+				if (renamed != g_renamedHair.end()) {
+					std::vector<RE::NiAVObject*> others;
+					bool shownDraws = false;
+					if (current && m_raceMenu && g_drawnHair.count(obj)) {
+						others = OtherCopies(obj, renamed->second.c_str(), g->data->vertexCount);
+						for (auto* o : others) shownDraws |= g_drawnHair.count(o) != 0;
+					}
+					if (current && m_raceMenu && g_drawnHair.count(obj) && !shownDraws) {
+						for (auto* o : others) {
+							auto* og = hdt::castNiGeometry(o);
+							if (auto it = g_menuSkins.find(o); it != g_menuSkins.end()) {
+								if (og && !og->skinInstance) og->skinInstance = it->second.skin;
+								g_menuSkins.erase(it);
+							}
+							m_menuHair.erase(std::remove_if(m_menuHair.begin(), m_menuHair.end(), [o](const MenuHair& h) { return h.shape == o; }), m_menuHair.end());
+							*reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(o) + 0x30) |= 1;
+							g_renamedHair[o] = o->m_name;
+							hdt::setName(o, (std::string(o->m_name) + kOldHairMark).c_str());
+							logger::info("[SMP] race menu: the game's new copy {:p} of {} set aside for the old one {:p}, which draws", (void*)o, renamed->second, (void*)obj);
+						}
+						hdt::setName(obj, renamed->second.c_str());
+						*reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(obj) + 0x30) &= ~1u;
+						g_renamedHair.erase(renamed);
+						renamed = g_renamedHair.end();
+					} else {
+						current = false;
+						// Kept hidden every frame: the game sets the hidden flag of the shapes under the head's FaceGen nodes again
+						// (seen clearing it once the race menu closed), and an old copy shown draws as a ghost of the old hair.
+						*reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(obj) + 0x30) |= 1;
+					}
+				}
+				// A copy the race menu skinned here that is no longer the SMP hair shown (another hair chosen): its skin back,
+				// and hidden (app-culled) as it was out of sight before it was placed here (the race menu keeps old copies; drawn
+				// with their own slots they come out torn). The hair shown when the menu closes only gets its skin back.
+				// Hidden, it is also renamed: the game never removes it (its race menu clears only the biped hair node) but finds
+				// hair by name, and its hat swap (0x6062E0), finding this copy first, would show it again (torn, its shadow on
+				// the body) and never swap the hair actually shown to its Hat version. It stays in the scene: the game shows
+				// it again when its hair is chosen again (taken out, that hair came back invisible).
+				if (!g->skinInstance && (!current || !m_raceMenu))
+					if (auto it = g_menuSkins.find(obj); it != g_menuSkins.end()) {
+						g->skinInstance = it->second.skin;
+						g_menuSkins.erase(it);
+						if (!current) {
+							*reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(obj) + 0x30) |= 1;
+							if (renamed == g_renamedHair.end()) {
+								g_renamedHair[obj] = obj->m_name;
+								hdt::setName(obj, (std::string(obj->m_name) + kOldHairMark).c_str());
+							}
+						}
+					}
+				if (current) {
+					// Outside the race menu, only a hair the game has bound (its head slot on the skeleton's live Bip01 Head),
+					// or the one skinned here (its skin taken off): the race menu leaves fresh, unbound copies behind it.
+					auto* sk = g->skinInstance;
+					const bool bound = !sk || (sk->bones && sk->boneCount && sk->bones[0] && IsLiveBone(sk->bones[0], root, obj->parent));
+					if (m_raceMenu)
+						m_menuHair.push_back({ obj, root, NpcOf(m_scanRef), hair });
+					else if (bound)
+						found(root, obj->parent, f.physics.c_str(), &f.names, &f.lists, obj);
+				}
+			}
+		}
 		if (auto* node = obj->AsNode()) {
 			for (uint16_t i = 0; i < node->ChildEnd(); ++i)
 				scan(root, node->children[i], depth + 1);
 		}
 	}
 
-	void ActorManager::scanActor(RE::NiNode* root)
+	void ActorManager::scanActor(RE::NiNode* root, void* ref)
 	{
+		m_scanRef = ref;
 		if (root)
 			scan(root, root, 0);
+		m_scanRef = nullptr;
 	}
 
 	void ActorManager::update()
 	{
 		++m_frame;
 		const auto& s = gSettings;
+
+		// The race menu: race hair lets go of everything it held (see m_raceMenu), and is placed each frame instead.
+		m_menuHair.clear();
+		if (Game::RaceMenuOpen() != m_raceMenu) {
+			m_raceMenu = !m_raceMenu;
+			if (m_raceMenu) {
+				int released = 0;
+				for (auto it = m_items.begin(); it != m_items.end();) {
+					if (it->second.boneLists.empty()) { ++it; continue; }
+					if (it->second.system) {
+						ReleaseCpuSkins(it->second);
+						// It holds the player's skeleton: it goes (the menu builds its own on stand-ins, see m_menuSystem).
+						it->second.system->m_itemDetached = false;   // still attached: the skin slots go back to the game's
+						hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(it->second.system.get());
+						it->second.system = nullptr;
+					}
+					it = m_items.erase(it);
+					++released;
+				}
+				logger::info("[SMP] race menu: {} race hair item(s) let go; race hair drawn from the menu's own copies until it closes", released);
+			} else
+				dropMenuSystem("race menu closed");
+		}
 
 		// The player, then the nearest high-process actors up to the limit.
 		void* player = Game::Player();
@@ -339,23 +1243,45 @@ namespace nvsmp
 			KeepRadius(playerRoot, m_lastRootRadius);
 		if (RE::NiNode* firstPerson = player ? Game::PlayerFirstPerson3D(player) : nullptr; firstPerson && firstPerson != playerRoot)
 			SetProxiesHidden(firstPerson, true);
-		std::vector<std::pair<float, RE::NiNode*>> actors;
+		std::vector<std::tuple<float, RE::NiNode*, void*>> actors;
 		if (playerRoot)
-			actors.push_back({ 0.0f, playerRoot });
+			actors.push_back({ 0.0f, playerRoot, player });
 		RE::NiPoint3 playerPos = playerRoot ? playerRoot->world.translate : RE::NiPoint3{};
 		Game::ForEachHighProcessActor([&](void* ref) {
 			if (auto* root = Game::Get3D(ref)) {
 				float d = (root->world.translate - playerPos).Length();
 				if (d <= s.maxDistance)
-					actors.push_back({ d, root });
+					actors.push_back({ d, root, ref });
 			}
 		});
-		std::sort(actors.begin(), actors.end(), [](auto& a, auto& b) { return a.first < b.first; });
+		std::sort(actors.begin(), actors.end(), [](auto& a, auto& b) { return std::get<0>(a) < std::get<0>(b); });
 		if ((int)actors.size() > std::max(1, s.maxActors))
 			actors.resize(std::max(1, s.maxActors));
 
 		for (auto& a : actors)
-			scanActor(a.second);
+			scanActor(std::get<1>(a), std::get<2>(a));
+		if (!m_raceMenu && !g_menuSkins.empty()) {   // the menu closed: the hair that remains got its skin back in the scan; the rest went
+			logger::info("[SMP] race menu closed: {} hair skin(s) left with copies the menu threw away", g_menuSkins.size());
+			g_menuSkins.clear();
+		}
+		if (m_raceMenu != m_raceMenuWhenScanned) {
+			m_raceMenuWhenScanned = m_raceMenu;
+			if (!m_raceMenu && !g_renamedHair.empty())
+				logger::info("[SMP] race menu closed: {} old hair copy(ies) hidden and renamed", g_renamedHair.size());
+			if (!m_raceMenu) {
+				m_hatSwapAt = m_frame + kHatSwapDelay;
+				m_hatSwapAfterBuild = true;
+			}
+		}
+		// The game's hat swap (0x6062E0: NoHat or Hat shown by what is worn) once more, the frame after the race menu closed (and
+		// after the hair's in-game build, see build): the menu runs it while it rebuilds the head, before the SMP hair it is given
+		// is settled here (old copies set aside, a new one bound), and the hair then keeps the NoHat version under a hat until
+		// the hat is equipped again.
+		if (m_hatSwapAt && m_frame >= m_hatSwapAt && !m_raceMenu) {
+			m_hatSwapAt = 0;
+			if (void* player = Game::Player())
+				logger::info("[SMP] race menu closed: the game's hat swap run again for the player{}", RunHatSwap(player) ? "" : " (failed)");
+		}
 
 		// Items not seen this frame: unequipped, unloaded, or their actor left range.
 		int failed = 0;
@@ -364,6 +1290,7 @@ namespace nvsmp
 			if (it->second.frame != m_frame) {
 				if (it->second.system) {
 					it->second.system->m_itemDetached = true;   // unequipped, or its actor's 3D went
+					ReleaseCpuSkins(it->second);
 					hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(it->second.system.get());
 				}
 				SetProxiesHidden(it->second.model.get(), false);
@@ -378,6 +1305,9 @@ namespace nvsmp
 		stats.actors = (int)roots.size();
 		stats.systems = (int)hdt::SkyrimPhysicsWorld::get()->systemCount();
 		stats.failed = failed;
+
+		// The race menu's hair physics reads its stand-in skeleton before the world steps: the real one's places now.
+		if (m_menuSystem) refreshMenuProxies(playerRoot);
 	}
 
 	// A line in the log every couple of seconds saying whether the physics is doing anything visible:
@@ -411,9 +1341,9 @@ namespace nvsmp
 			int drawn = 0;
 			for (auto& s : item.system->m_boundSlots)
 				drawn += s.holds();
-			logger::info("[stats] {}: {} bones, {} simulated, off rigid avg {:.2f} max {:.2f} units; skin slots drawn from cloth bones {}/{}; step {:.2f} ms",
+			logger::info("[stats] {}: {} bones, {} simulated, off rigid avg {:.2f} max {:.2f} units; skin slots drawn from cloth bones {}/{}; step {:.2f} ms ({:.2f} on the game thread)",
 				item.model->GetName(), item.system->getBones().size(), simulated, simulated ? sumOffset / simulated : 0.0f, maxOffset,
-				drawn, item.system->m_boundSlots.size(), world->m_averageStepMs);
+				drawn, item.system->m_boundSlots.size(), world->m_averageStepMs, world->m_averageMainMs);
 			if (!most.empty())
 				logger::info("[stats]   furthest from rest: {}", most);
 		}
@@ -446,7 +1376,7 @@ namespace nvsmp
 	{
 		for (auto& [key, item] : m_items)
 			if (item.system)
-				hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(item.system.get());
+				{ ReleaseCpuSkins(item); hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(item.system.get()); }
 		m_items.clear();
 		stats = {};
 	}

@@ -42,6 +42,22 @@ namespace Game
 		return tes && At<void*>(tes, 0x34);
 	}
 
+	// Whether the race menu (ShowRaceMenu, RaceSexMenu 0x40C) is open: InterfaceManager (0x011D8A80) keeps the open
+	// menus' types at 0x114 (10 slots).
+	constexpr uint32_t kInterfaceManager = 0x011D8A80;
+	inline bool RaceMenuOpen()
+	{
+		__try {
+			void* im = *(void**)kInterfaceManager;
+			if (!im) return false;
+			for (int i = 0; i < 10; ++i)
+				if (At<uint32_t>(im, 0x114 + 4 * i) == 0x40C) return true;
+			return false;
+		} __except (1) {
+			return false;
+		}
+	}
+
 	inline RE::NiNode* Get3D(void* ref)
 	{
 		typedef RE::NiAVObject*(__thiscall * Get3D_t)(void*);

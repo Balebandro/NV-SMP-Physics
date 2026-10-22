@@ -1,10 +1,11 @@
 // Ported from FSMP (hdtSMP64, src/hdtSkyrimPhysicsWorld.cpp), GPL-3.0 with FSMP's modding
 // exception. The solver set-up and the substepping are FSMP's; the frame, pause, shutdown and
-// camera events become one synchronous doUpdate per game frame.
+// camera events become one update per game frame, its step optionally on a physics thread.
 #include "hdtSkyrimPhysicsWorld.h"
 #include "hdtSkyrimBone.h"
 
 #include <LinearMath/btQuickprof.h>
+#include <thread>
 
 namespace hdt
 {
@@ -34,16 +35,24 @@ namespace hdt
 		return &g_World;
 	}
 
-	void SkyrimPhysicsWorld::doUpdate(float interval)
+	static float MsSince(const LARGE_INTEGER& t0)
 	{
+		LARGE_INTEGER t1, freq;
+		QueryPerformanceCounter(&t1);
+		QueryPerformanceFrequency(&freq);
+		return (float)((t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart);
+	}
+
+	void SkyrimPhysicsWorld::beginUpdate(float interval, bool async)
+	{
+		waitForStep();   // finishUpdate normally did, unless the frame skipped it
+		m_pending = Pending::None;
 		if (disabled || m_systems.empty())
 			return;
 
 		_MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
-		std::lock_guard<std::mutex> l(m_lock);
-
-		LARGE_INTEGER t0, t1, freq;
-		QueryPerformanceCounter(&t0);
+		QueryPerformanceCounter(&m_beginTick);
+		std::unique_lock<std::mutex> l(m_lock);
 
 		// New Vegas: a fixed step, m_timeTick (1 / the rate setting), whatever the frame rate. FSMP stepped the frame
 		// time itself above its rate (and whole ticks plus a remainder below it), so the cloth behaved differently at
@@ -71,29 +80,133 @@ namespace hdt
 				SkyrimBone::s_kinematicFraction = 1;
 			}
 			m_resetPc -= m_resetPc > 0;
-
-			auto offset = applyTranslationOffset();
-			stepSimulation(remainingTimeStep, 0, tick * 1.0001f);   // a hair over: n - 1 whole steps and a last one of the same size
-			restoreTranslationOffset(offset);
 			m_accumulatedInterval -= remainingTimeStep;
+			m_pendingTime = remainingTimeStep;
+			m_pending = Pending::Stepped;
+			m_pendingAsync = async;
+			l.unlock();
+			m_readMs = MsSince(m_beginTick);
 
-			{
-				NVSMP_PROF(WriteTransform);
-				SkyrimBone::s_stepTime = remainingTimeStep;   // the jitter filter's step
-				SkyrimBone::s_boneByNode.clear();
-				for (auto& s : m_systems)
-					for (auto& b : s->getBones()) { auto* sb = static_cast<SkyrimBone*>(b.get()); SkyrimBone::s_boneByNode[sb->m_node.get()] = sb; }
-				writeTransform();
-			}
+			if (async) {
+				// The physics thread takes m_lock for the step: the game thread's changes to the world (systems added or
+				// removed) wait for it there, and finishUpdate waits for it before writing.
+				std::unique_lock<std::mutex> s(m_stepMutex);
+				if (!m_threadStarted) {
+					m_threadStarted = true;
+					std::thread([this] { stepThread(); }).detach();   // never stopped: it waits for the next step
+				}
+				m_stepRunning = true;
+				s.unlock();
+				m_stepStart.notify_one();
+			} else
+				runStepGuarded();
+		} else {
+			m_pending = Pending::Followed;
+			m_pendingAsync = false;
+			m_readMs = MsSince(m_beginTick);
+		}
+	}
+
+	void SkyrimPhysicsWorld::runStep()
+	{
+		LARGE_INTEGER t0;
+		QueryPerformanceCounter(&t0);
+		auto offset = applyTranslationOffset();
+		stepSimulation(m_pendingTime, 0, m_timeTick * 1.0001f);   // a hair over: n - 1 whole steps and a last one of the same size
+		restoreTranslationOffset(offset);
+		m_stepThreadMs = MsSince(t0);
+	}
+
+	static int KeepStepFault(EXCEPTION_POINTERS* info, char* out, size_t size)
+	{
+		snprintf(out, size, "code %08X at %p", (unsigned)info->ExceptionRecord->ExceptionCode, info->ExceptionRecord->ExceptionAddress);
+		return EXCEPTION_EXECUTE_HANDLER;
+	}
+
+	void SkyrimPhysicsWorld::runStepGuarded()
+	{
+		// No RAII lock: a fault (SEH) does not unwind C++ objects here, and m_lock must be let go of after one.
+		m_lock.lock();
+		__try {
+			runStep();
+		} __except (KeepStepFault(GetExceptionInformation(), m_stepFailure, sizeof(m_stepFailure))) {
+			disabled = true;
+			m_pending = Pending::None;
+		}
+		m_lock.unlock();
+	}
+
+	void SkyrimPhysicsWorld::stepThread()
+	{
+		_MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+		for (;;) {
+			std::unique_lock<std::mutex> s(m_stepMutex);
+			m_stepStart.wait(s, [this] { return m_stepRunning; });
+			s.unlock();
+			runStepGuarded();
+			s.lock();
+			m_stepRunning = false;
+			s.unlock();
+			m_stepDone.notify_all();
+		}
+	}
+
+	void SkyrimPhysicsWorld::waitForStep()
+	{
+		std::unique_lock<std::mutex> s(m_stepMutex);
+		m_stepDone.wait(s, [this] { return !m_stepRunning; });
+	}
+
+	std::string SkyrimPhysicsWorld::takeStepFailure()
+	{
+		std::string out = m_stepFailure;
+		m_stepFailure[0] = 0;
+		return out;
+	}
+
+	void SkyrimPhysicsWorld::finishUpdate()
+	{
+		if (m_pending == Pending::None)
+			return;
+		LARGE_INTEGER t0, t1;
+		QueryPerformanceCounter(&t0);
+		waitForStep();
+		const float waitMs = MsSince(t0);
+		if (m_pending == Pending::None)   // the step faulted
+			return;
+		QueryPerformanceCounter(&t1);
+		std::lock_guard<std::mutex> l(m_lock);
+		const bool stepped = m_pending == Pending::Stepped;
+		m_pending = Pending::None;
+		if (m_systems.empty())
+			return;
+
+		if (stepped) {
+			NVSMP_PROF(WriteTransform);
+			SkyrimBone::s_stepTime = m_pendingTime;   // the jitter filter's step
+			SkyrimBone::s_boneByNode.clear();
+			for (auto& s : m_systems)
+				for (auto& b : s->getBones()) {
+					auto* sb = static_cast<SkyrimBone*>(b.get());
+					SkyrimBone::s_boneByNode[sb->m_node.get()] = sb;
+					// A step from the physics thread is written a frame after its read, which was the last to put the
+					// animated extra bones (a chain's anchors) on their anchors: put them there as drawn now, or the chain
+					// hangs from where the body was a frame ago on every frame with a step (bones go root first).
+					if (m_pendingAsync && sb->m_anchor && sb->m_rig.isStaticOrKinematicObject())
+						sb->m_node->world = sb->m_anchor->world * sb->m_anchorToNode;
+				}
+			writeTransform();
 		} else {
 			NVSMP_PROF(WriteTransform);
 			followTransform();
 		}
 
-		QueryPerformanceCounter(&t1);
-		QueryPerformanceFrequency(&freq);
-		float ms = (float)((t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart);
-		m_averageStepMs += (ms - m_averageStepMs) * 0.1f;
+		// The whole work, and the game thread's share of it: with the step on the physics thread, only what it waited
+		// for the step (none if the step was done before the game came back) instead of the step itself.
+		const float writeMs = MsSince(t1);
+		const float stepMs = stepped ? m_stepThreadMs : 0.0f;
+		m_averageStepMs += (m_readMs + stepMs + writeMs - m_averageStepMs) * 0.1f;
+		m_averageMainMs += (m_readMs + (m_pendingAsync ? waitMs : stepMs) + writeMs - m_averageMainMs) * 0.1f;
 	}
 
 	// Bullet works relative to the centre of everything simulated: far from the world origin, single

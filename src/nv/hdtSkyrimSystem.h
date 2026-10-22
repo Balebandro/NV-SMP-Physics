@@ -11,6 +11,8 @@
 #include "hdtSkyrimBody.h"
 #include "hdtSkyrimBone.h"
 
+#include <array>
+
 namespace hdt
 {
 	class PerVertexShape;
@@ -62,9 +64,25 @@ namespace hdt
 		// slots are then left alone and the nodes retired (putting the slots back then left the item unbound on the
 		// next equip: the actor turned invisible). Not set (an item still worn: menu reset, settings): put back.
 		bool m_itemDetached = false;
+
+		// New Vegas: the skin slots put back as the game had them and let go of (no reference to the skin kept), the system
+		// running on: its bones are then only driven, not drawn by that skin (race hair in the race menu, which skins
+		// whichever copy of the hair it has on the CPU). Returns how many were put back.
+		int releaseSlots();
 	};
 
 	class XMLReader;
+
+	// New Vegas: a skinned mesh read from a NIF file rather than found in the scene, for a collision body (race hair: the
+	// game's hair loader drops its collision proxies). Vertices and triangles in its skin space, its bones by name.
+	struct FileMesh
+	{
+		struct Bone { std::string name; RE::NiTransform skinToBone; RE::NiPoint3 center; float radius = 0; };
+		std::vector<RE::NiPoint3> vertices;
+		std::vector<std::array<int, 3>> triangles;
+		std::vector<Bone> bones;
+		std::vector<std::vector<std::pair<int, float>>> weights;   // per vertex: (bone, weight)
+	};
 
 	class SkyrimSystemCreator
 	{
@@ -85,6 +103,17 @@ namespace hdt
 		// or lowered by the offset (game units).
 		bool m_ground = true;
 		float m_groundOffset = 0.0f;
+
+		// New Vegas: "SMP Bones" lists by shape name (lower case), for shapes the game stripped their extra data from
+		// (race hair: the FaceGen loader keeps only the geometry). A shape's own list comes first.
+		std::unordered_map<std::string, std::string> m_boneLists;
+
+		// New Vegas: the skeleton's nodes by name (lower case), in place of searching the skeleton passed in (race hair in
+		// the race menu runs on stand-ins of the skeleton's nodes, see ActorManager::m_menuProxies).
+		std::unordered_map<std::string, RE::NiNode*> m_skeletonNodes;
+
+		// New Vegas: meshes by name (lower case) for shapes the physics file names that are not in the item (see FileMesh).
+		std::unordered_map<std::string, FileMesh> m_fileMeshes;
 
 	protected:
 		struct PooledStringHash

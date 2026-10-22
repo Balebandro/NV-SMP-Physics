@@ -222,6 +222,18 @@ namespace hdt
 			logger::info("[SMP] system removed: {} skin slot(s) put back, {} node(s) kept", restored, retired);
 	}
 
+	int SkyrimSystem::releaseSlots()
+	{
+		int restored = 0;
+		for (auto& s : m_boundSlots)
+			if (s.holds()) {
+				s.skin->bones[s.slot] = s.original;
+				++restored;
+			}
+		m_boundSlots.clear();
+		return restored;
+	}
+
 	bool SkyrimSystem::isRetiredNode(const RE::NiAVObject* node)
 	{
 		return g_retiredSet.count(node) != 0;
@@ -307,6 +319,10 @@ namespace hdt
 				return nullptr;
 			}
 		} search{ m_model };
+		if (!m_skeletonNodes.empty()) {
+			auto it = m_skeletonNodes.find(Lower(name.c_str()));
+			return it != m_skeletonNodes.end() ? it->second : nullptr;
+		}
 		return search.run(m_skeleton, name.c_str(), 0);
 	}
 
@@ -336,8 +352,11 @@ namespace hdt
 		if (!obj || depth > 64)
 			return;
 		if (auto* g = castNiGeometry(obj)) {
-			const std::string listed = g->SmpBonesList();
-			const char* list = g->FindStringExtra("SMP Bones") ? listed.c_str() : nullptr;
+			std::string listed = g->SmpBonesList();
+			bool has = g->FindStringExtra("SMP Bones") != nullptr;
+			if (!has)
+				if (auto it = m_boneLists.find(Lower(g->GetName())); it != m_boneLists.end()) { listed = it->second; has = true; }
+			const char* list = has ? listed.c_str() : nullptr;
 			if (list) {
 				++m_listedShapes;
 				if (!g->skinInstance || !g->skinInstance->boneCount)
@@ -1229,6 +1248,77 @@ namespace hdt
 
 		for (auto& meshName : *names) {
 			auto* g = castNiGeometry(findObject(m_model, meshName.c_str()));
+			// Not in the item, but read from its NIF (see FileMesh): its bones are the skeleton's, by name.
+			if (auto fm = g ? m_fileMeshes.end() : m_fileMeshes.find(Lower(meshName)); fm != m_fileMeshes.end()) {
+				const FileMesh& m = fm->second;
+				std::vector<int> localToBody(m.bones.size(), -1);
+				for (size_t b = 0; b < m.bones.size(); ++b) {
+					// A bone of this system (the physics file's own, or an item bone already made), else the skeleton's.
+					RE::BSFixedString boneName = m.bones[b].name.c_str();
+					auto bone = static_cast<SkinnedMeshBone*>(findBoneFromIndex(boneName));
+					RE::NiNode* node = bone ? nullptr : findObjectByName(boneName);
+					if (!bone && !node) {
+						logger::warn("Shape {} (from its NIF): bone {} neither in the physics nor in the skeleton, its vertices on it skipped", meshName.c_str(), m.bones[b].name);
+						continue;
+					}
+					if (!bone) {
+						auto defaultBoneInfo = getBoneTemplate("");
+						auto newBone = new SkyrimBone(boneName, node, this->m_skeleton, defaultBoneInfo);
+						m_mesh->m_bones.push_back(hdt::make_smart(newBone));
+						indexBone(newBone);
+						bone = newBone;
+					}
+					localToBody[b] = body->addBone(bone, convertNi(m.bones[b].skinToBone), BoundingSphere(convertNi(m.bones[b].center), m.bones[b].radius));
+				}
+				const int vertexCount = (int)m.vertices.size();
+				body->m_vertices.resize(vertexStart + vertexCount);
+				for (int j = 0; j < vertexCount; ++j) {
+					auto& v = body->m_vertices[j + vertexStart];
+					v.m_skinPos = convertNi(m.vertices[j]);
+					auto w = m.weights[j];
+					std::sort(w.begin(), w.end(), [](auto& a, auto& b) { return a.second > b.second; });
+					float total = 0.0f;
+					int n = 0;
+					for (auto& [slot, weight] : w) {
+						if (n == 4) break;
+						if (slot < 0 || slot >= (int)localToBody.size() || localToBody[slot] < 0) continue;
+						v.m_weight[n] = weight;
+						v.m_boneIdx[n] = localToBody[slot];
+						total += weight;
+						++n;
+					}
+					for (int k = 0; k < n; ++k) v.m_weight[k] /= total > 0.0f ? total : 1.0f;
+					for (int k = n; k < 4; ++k) { v.m_weight[k] = 0.0f; v.m_boneIdx[k] = n ? v.m_boneIdx[0] : 0; }
+				}
+				// Where it is now (its vertices skinned through the bones as they stand), relative to the skeleton's head:
+				// a mesh from the NIF placed wrong, or two of them overlapping at rest, shows here.
+				{
+					RE::NiPoint3 lo{ 1e30f, 1e30f, 1e30f }, hi{ -1e30f, -1e30f, -1e30f };
+					RE::NiNode* head = findObjectByName("Bip01 Head");
+					const RE::NiPoint3 headAt = head ? head->world.translate : RE::NiPoint3{};
+					for (int j = 0; j < vertexCount; ++j) {
+						RE::NiPoint3 p{};
+						float total = 0;
+						for (auto& [slot, weight] : m.weights[j]) {
+							if (slot < 0 || slot >= (int)localToBody.size() || localToBody[slot] < 0) continue;
+							auto* sb = static_cast<SkyrimBone*>(body->m_skinnedBones[localToBody[slot]].ptr);
+							if (!sb || !sb->m_node) continue;
+							p = p + (sb->m_node->world * m.bones[slot].skinToBone) * m.vertices[j] * weight;
+							total += weight;
+						}
+						if (total <= 0) continue;
+						p = p * (1.0f / total) - headAt;
+						lo = { std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z) };
+						hi = { std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z) };
+					}
+					logger::info("Shape {}: read from its NIF ({} vertices, {} triangles, {} bones), now at ({:.1f} {:.1f} {:.1f})..({:.1f} {:.1f} {:.1f}) from the head{}",
+						meshName.c_str(), vertexCount, m.triangles.size(), m.bones.size(), lo.x, lo.y, lo.z, hi.x, hi.y, hi.z, head ? "" : " (no head found: from the world origin)");
+				}
+				vertexOffsetMap.insert({ meshName, vertexStart });
+				boneStart = static_cast<int>(body->m_skinnedBones.size());
+				vertexStart = static_cast<int>(body->m_vertices.size());
+				continue;
+			}
 			if (!g) {
 				logger::warn("Shape {} not found in the item, skipped", meshName.c_str());
 				continue;
@@ -1315,6 +1405,27 @@ namespace hdt
 					v.m_weight[k] = 0.0f;
 					v.m_boneIdx[k] = n ? v.m_boneIdx[0] : 0;
 				}
+			}
+
+			// A proxy's place now, as for one read from the NIF above (for comparing the two).
+			if (_strnicmp(meshName.c_str(), "SMP Proxy:", 10) == 0) {
+				RE::NiPoint3 lo{ 1e30f, 1e30f, 1e30f }, hi{ -1e30f, -1e30f, -1e30f };
+				RE::NiNode* head = findObjectByName("Bip01 Head");
+				const RE::NiPoint3 headAt = head ? head->world.translate : RE::NiPoint3{};
+				for (int j = 0; j < vertexCount; ++j) {
+					RE::NiPoint3 p{};
+					float total = 0;
+					for (auto& [slot, weight] : weights[j]) {
+						if (slot < 0 || slot >= (int)boneCount || !skin->bones[slot]) continue;
+						p = p + (skin->bones[slot]->world * skinData->boneData[slot].skinToBone) * g->data->vertices[j] * weight;
+						total += weight;
+					}
+					if (total <= 0) continue;
+					p = p * (1.0f / total) - headAt;
+					lo = { std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z) };
+					hi = { std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z) };
+				}
+				logger::info("Shape {}: in the item ({} vertices), now at ({:.1f} {:.1f} {:.1f})..({:.1f} {:.1f} {:.1f}) from the head", meshName.c_str(), vertexCount, lo.x, lo.y, lo.z, hi.x, hi.y, hi.z);
 			}
 
 			vertexOffsetMap.insert({ meshName, vertexStart });
@@ -1426,6 +1537,9 @@ namespace hdt
 		for (auto entry : vertexOffsetMap) {
 			auto* g = castNiGeometry(findObject(m_model, entry.first.c_str()));
 			if (!g) {
+				if (auto fm = m_fileMeshes.find(Lower(entry.first)); fm != m_fileMeshes.end())   // read from its NIF
+					for (auto& t : fm->second.triangles)
+						shape->addTriangle(t[0] + entry.second, t[1] + entry.second, t[2] + entry.second);
 				continue;
 			}
 			if (g->skinInstance) {

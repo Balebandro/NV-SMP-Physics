@@ -399,6 +399,7 @@ static void ApplyWorldSettings()
 static xmledit::Doc gXml;
 static std::string gXmlPath;
 static bool gOpenValues = false;   // --values: the panel starts open (for screenshots)
+static bool gAsyncStep = false;    // --async: the step on the physics thread, as the plugin's bAsyncStep (testing)
 
 // The XML's collision meshes (per-triangle-shape) the NIF has no low-poly stand-in for ("SMP Proxy:<name>", smpdress
 // --proxy): skinned in full for every contact, they cost far more in game. Names as the NIF has them.
@@ -424,11 +425,78 @@ static std::vector<std::string> MissingProxies(const std::string& xmlText)
 	return out;
 }
 
+// The NIF's proxies ("SMP Proxy:<name>") the XML's collision shapes do not use, each paired with the XML name it stands
+// in for when that is clear: the full mesh it was made from ("NoHat" for "SMP Proxy:NoHat"), a proxy name the NIF no
+// longer has that it starts with or that starts with it ("SMP Proxy:Head" for "SMP Proxy:HeadM"), or the last ones
+// left on each side. Unpaired proxies come back with an empty XML name.
+static std::vector<std::pair<std::string, std::string>> gProxyRenames;   // { XML name, NIF proxy }
+static std::regex ShapeNameRegex() { return std::regex("(<per-(?:vertex|triangle)-shape[^>]*\\bname\\s*=\\s*\")([^\"]+)(\")", std::regex::icase); }
+
+static std::vector<std::pair<std::string, std::string>> UnusedProxies(const std::string& xmlText)
+{
+	auto same = [](const std::string& a, const std::string& b) { return _stricmp(a.c_str(), b.c_str()) == 0; };
+	auto isProxy = [](const std::string& n) { return _strnicmp(n.c_str(), "SMP Proxy:", 10) == 0; };
+	std::vector<std::string> xmlNames, nifNames;
+	const std::regex re = ShapeNameRegex();
+	for (std::sregex_iterator it(xmlText.begin(), xmlText.end(), re), end; it != end; ++it) xmlNames.push_back((*it)[2].str());
+	for (auto& s : gItem.shapes) if (s.info.geometry->m_name) nifNames.push_back(s.info.geometry->m_name);
+	auto in = [&](const std::vector<std::string>& v, const std::string& n) { for (auto& m : v) if (same(m, n)) return true; return false; };
+
+	std::vector<std::string> unused, stale;   // proxies the XML does not name; proxy names in the XML the NIF does not have
+	for (auto& n : nifNames) if (isProxy(n) && !in(xmlNames, n) && !in(unused, n)) unused.push_back(n);
+	for (auto& n : xmlNames) if (isProxy(n) && !in(nifNames, n) && !in(stale, n)) stale.push_back(n);
+
+	std::vector<std::pair<std::string, std::string>> out;
+	auto take = [&](std::vector<std::string>& v, const std::string& n) { for (auto it = v.begin(); it != v.end(); ++it) if (same(*it, n)) { v.erase(it); return; } };
+	for (auto& p : std::vector<std::string>(unused)) {
+		const std::string full = p.substr(10);
+		if (in(xmlNames, full)) { out.push_back({ full, p }); take(unused, p); continue; }
+		std::string match;
+		int matches = 0;
+		for (auto& s : stale) {
+			const std::string a = s.substr(10);
+			if (_strnicmp(a.c_str(), full.c_str(), std::min(a.size(), full.size())) == 0) { match = s; ++matches; }
+		}
+		if (matches == 1) { out.push_back({ match, p }); take(unused, p); take(stale, match); }
+	}
+	if (unused.size() == 1 && stale.size() == 1) { out.push_back({ stale[0], unused[0] }); unused.clear(); }
+	for (auto& p : unused) out.push_back({ std::string(), p });
+	return out;
+}
+
+// Points the XML's collision shapes at the NIF's proxies (gProxyRenames), keeping the file as it was in .bak.
+static void BuildSystem();
+static void UseProxiesInXml()
+{
+	std::string text = datafiles::ReadFile(gItem.xmlPath), out;
+	const std::regex re = ShapeNameRegex();
+	size_t last = 0;
+	int renamed = 0;
+	for (std::sregex_iterator it(text.begin(), text.end(), re), end; it != end; ++it) {
+		std::string name = (*it)[2].str();
+		for (auto& [from, to] : gProxyRenames)
+			if (!from.empty() && _stricmp(name.c_str(), from.c_str()) == 0) { name = to; ++renamed; break; }
+		out += text.substr(last, it->position() - last) + (*it)[1].str() + name + (*it)[3].str();
+		last = it->position() + it->length();
+	}
+	out += text.substr(last);
+	if (!renamed) return;
+	std::string bak = gItem.xmlPath + ".bak";
+	if (!fs::exists(bak)) { std::error_code ec; fs::copy_file(gItem.xmlPath, bak, ec); }
+	std::ofstream o(gItem.xmlPath, std::ios::binary);
+	o << out;
+	if (!o) { AddLog(4, "could not write " + gItem.xmlPath); return; }
+	o.close();
+	AddLog(2, "pointed " + std::to_string(renamed) + " collision shape(s) in " + gItem.xmlPath + " at the NIF's proxies (the file as it was: " + bak + ")");
+	BuildSystem();
+}
+
 // Builds (or rebuilds) the physics for the loaded item from its XML.
 static void BuildSystem()
 {
 	auto* world = hdt::SkyrimPhysicsWorld::get();
 	gMissingProxies.clear();
+	gProxyRenames.clear();
 	if (gItem.system) {
 		world->removeSkinnedMeshSystem(gItem.system.get());
 		gItem.system = nullptr;   // gives the skin slots back
@@ -476,6 +544,9 @@ static void BuildSystem()
 		for (auto& m : gMissingProxies) l += (l.empty() ? "" : ", ") + m;
 		AddLog(3, "collision against the full meshes (no low-poly proxies): " + l);
 	}
+	gProxyRenames = UnusedProxies(datafiles::ReadFile(xml));
+	for (auto& [from, to] : gProxyRenames)
+		AddLog(3, "proxy '" + to + "' is not used by the XML" + (from.empty() ? std::string(" (nothing in it to point at it)") : ": it names '" + from + "' instead"));
 
 	hdt::DefaultBBP::PhysicsFile_t file{ gItem.xmlNamed, {} };
 	hdt::SkyrimSystemCreator creator;
@@ -1509,6 +1580,22 @@ static void Panels(float fps)
 			Help(gXmlArchived ? "The XML is inside a BSA archive: extract it to a mod folder first (it is rewritten)."
 			                  : "Adds a hidden low-poly stand-in for each of these meshes to the NIF (smpdress --proxy 3) and points the XML's collision at them: far cheaper in game, about the same collisions. Both files are kept first; then it reloads.");
 		}
+		if (!gProxyRenames.empty()) {
+			bool fixable = false;
+			ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "Collision proxies the XML does not use:");
+			for (auto& [from, to] : gProxyRenames) {
+				if (from.empty()) ImGui::TextDisabled("  %s (nothing in the XML to point at it)", to.c_str());
+				else ImGui::TextDisabled("  %s  ->  %s", from.c_str(), to.c_str());
+				fixable |= !from.empty();
+			}
+			if (fixable) {
+				ImGui::BeginDisabled(maker::gM.running || gXmlArchived);
+				if (ImGui::Button("Point the XML at them")) UseProxiesInXml();
+				ImGui::EndDisabled();
+				Help(gXmlArchived ? "The XML is inside a BSA archive: extract it to a mod folder first (it is rewritten)."
+				                  : "Renames those collision shapes in the XML to the NIF's proxies (the old file is kept as .bak) and rebuilds. Unsaved Bone values edits are dropped.");
+			}
+		}
 		if (gItem.system)
 			ImGui::Text("%zu bones (%d simulated), %d constraints, %zu bodies", gItem.system->getBones().size(), gItem.simulatedBones, gItem.constraintCount, gItem.system->meshes().size());
 		ImGui::Text("physics %.2f ms/step   %.0f fps", world->m_averageStepMs, fps);
@@ -2124,11 +2211,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		args.push_back(buf);
 	}
 	LocalFree(argv);
-	std::string start, shots, jitterOut, clipOut;   // --jitter / --clip file: how much the cloth shakes / clips (see below)
+	std::string start, shots, jitterOut, clipOut, logOut;   // --jitter / --clip file: how much the cloth shakes / clips (see below); --log file: the log, written on exit
 	std::string clipMeshOut;   // --clipmesh file: how much the cloth shapes sink into the body collision shapes (see below)
 	std::string recipe;   // --recipe file: the Make SMP window loads it (with --maker-build: and builds it, for testing)
 	bool addBoneLists = false;
-	bool genProxies = false;
+	bool genProxies = false, useProxies = false;
 	std::vector<std::string> proxyShapes;   // --proxy-shape: the Shapes list's Generate proxies button, for these, pressed once
 	float stroke[4] = { -1, 0, 0, 0 };   // --paint-stroke x0 y0 x1 y1 (window fractions): a simulated brush drag from frame 60 to 120, for testing
 	bool buildAfterStroke = false;
@@ -2166,12 +2253,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--stance") gAnim.stance = std::clamp(atoi(next().c_str()), 0, IM_ARRAYSIZE(kStances) - 1);
 		else if (a == "--kf") { gAnim.customPath = next(); gS.preset = kCustom; }
 		else if (a == "--exit") exitAfter = true;
+		else if (a == "--log") logOut = next();   // testing: the log, written to this file on exit
 		else if (a == "--maker") maker::gM.open = true;
 		else if (a == "--recipe") recipe = next();
 		else if (a == "--maker-build") maker::gM.buildOnOpen = true;
 		else if (a == "--add-bone-lists") addBoneLists = true;   // testing: the Add SMP Bones list button, pressed once
 		else if (a == "--gen-proxies") genProxies = true;   // testing: the Generate collision proxies button, pressed once
 		else if (a == "--proxy-shape") proxyShapes.push_back(next());   // testing: Generate proxies for the picked shapes
+		else if (a == "--use-proxies") useProxies = true;   // testing: the Point the XML at them button, pressed once
+		else if (a == "--async") gAsyncStep = true;
 		else if (a == "--paint-stroke") for (int k = 0; k < 4; k++) stroke[k] = (float)atof(next().c_str());
 		else if (a == "--show") {
 			std::string s = next();
@@ -2187,6 +2277,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	if (!start.empty() && fs::exists(start)) LoadItem(start);
 	if (!recipe.empty()) { maker::gM.open = true; maker::LoadRecipe(recipe); }
 	if (addBoneLists && !gMissingBoneLists.empty()) maker::AddBoneLists(gItem.nifPath, gAnim.skeletonPath);
+	if (useProxies && gItem.loaded) UseProxiesInXml();
 	if (genProxies && !gMissingProxies.empty()) maker::GenerateProxies(gItem.nifPath, gItem.xmlPath, gMissingProxies, 3.0f);
 	if (!proxyShapes.empty() && gItem.loaded) maker::GenerateProxies(gItem.nifPath, gItem.xmlPath, proxyShapes, 1.0f, 1000);
 	if (stroke[0] >= 0) { maker::gM.open = true; buildAfterStroke = maker::gM.buildOnOpen; maker::gM.buildOnOpen = false; }
@@ -2234,7 +2325,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 			const bool painting = maker::Painting();   // the body holds still under the brush
 			UpdateMotion(painting ? 0.0f : simDt);
 			UpdateWind(wallTime);
-			if (gS.physics && gItem.system && !painting) hdt::SkyrimPhysicsWorld::get()->doUpdate(simDt);
+			if (gAsyncStep) {
+				// As the plugin does with bAsyncStep: last frame's step written on the pose as it is now, this frame's
+				// step started on the physics thread while the frame is drawn.
+				hdt::SkyrimPhysicsWorld::get()->finishUpdate();
+				if (gS.physics && gItem.system && !painting) hdt::SkyrimPhysicsWorld::get()->beginUpdate(simDt, true);
+			} else if (gS.physics && gItem.system && !painting) hdt::SkyrimPhysicsWorld::get()->doUpdate(simDt);
 
 			// --jitter: the simulated bones' frame-to-frame shake in the actor's frame, as the second difference
 			// of their positions (smooth swinging leaves it near 0; fighting contacts make it large), over 4 s
@@ -2547,7 +2643,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 					FILE* f = fopen(jitterOut.c_str(), "w");
 					if (f) {
 						fprintf(f, "shake: average %.4f units per frame over %d bones\n", count ? total / count : 0.0, count);
-						fprintf(f, "  physics %.3f ms per frame\n", hdt::SkyrimPhysicsWorld::get()->m_averageStepMs);
+						fprintf(f, "  physics %.3f ms per frame (%.3f ms on the frame's thread)\n", hdt::SkyrimPhysicsWorld::get()->m_averageStepMs, hdt::SkyrimPhysicsWorld::get()->m_averageMainMs);
 #ifdef NVSMP_PROFILE
 						// A profiling build: where the physics' time went over the measured frames.
 						for (int s = 0; s < nvsmp::prof::Count; s++) fprintf(f, "  prof %-24s %8.1f ms total\n", nvsmp::prof::kNames[s], nvsmp::prof::gTotal[s]);
@@ -2717,7 +2813,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 			char p[1024];
 			snprintf(p, sizeof p, "%s%02d.bmp", shots.c_str(), shotsTaken++);
 			SaveScreenshot(p);
-			if (shotsTaken == shotCount && exitAfter) done = true;
+			if (shotsTaken == shotCount && exitAfter) {
+				done = true;
+				if (!logOut.empty())
+					if (FILE* lf = fopen(logOut.c_str(), "w")) {
+						for (auto& e : gLog) fprintf(lf, "%s\n", e.text.c_str());
+						fclose(lf);
+					}
+			}
 		}
 		HRESULT hr = gDev->Present(nullptr, nullptr, nullptr, nullptr);
 		if (hr == D3DERR_DEVICELOST && gDev->TestCooperativeLevel() == D3DERR_DEVICENOTRESET) ResetDevice();
