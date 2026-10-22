@@ -610,6 +610,8 @@ namespace nvsmp
 		return true;
 	}
 
+	static uint32_t HeadSlot(const std::string& list);
+
 	// The game attaches an item over several frames (the model, then its skin re-pointed at the
 	// skeleton), so an item is built once it has been there kSettleFrames, and built again if the build
 	// found the item's own bones missing, up to kMaxBuilds times; the last try is kept as it is.
@@ -629,6 +631,50 @@ namespace nvsmp
 		m_builtWaistCollision = gSettings.waistCollision;
 		m_builtGround = gSettings.ground;
 		logger::info("[SMP] building '{}' for {} on '{}' (try {})", file, model->GetName(), root->GetName(), item.builds);
+		// Race hair: its Bip01 Head slot on the skeleton's head. The game binds it by name and may take the hair NIF's own node
+		// of that name: the file's root bone in a hair rigged on its root (it lands on the head), but a bone deep in a whole
+		// skeleton copied into the NIF lands off the head and never moves (the hair floats away, stretched to its strands).
+		if (!item.hairModel.empty())
+			if (auto* node = model->AsNode())
+				if (RE::NiAVObject* head = FindOutside(root, model, "Bip01 Head"))
+					for (uint16_t i = 0; i < node->ChildEnd(); ++i) {
+						auto* g = hdt::castNiGeometry(node->children[i]);
+						if (!g || !g->skinInstance || !g->skinInstance->bones) continue;
+						std::string lower = g->GetName();
+						for (auto& c : lower) c = (char)tolower((unsigned char)c);
+						auto list = item.boneLists.find(lower);
+						if (list == item.boneLists.end()) continue;
+						const uint32_t slot = HeadSlot(list->second);
+						RE::NiAVObject* was = slot < g->skinInstance->boneCount ? g->skinInstance->bones[slot] : nullptr;
+						if (!was || was == head) continue;
+						logger::warn("[SMP] {}: its Bip01 Head slot {} held {:p} '{}' at {:.1f} {:.1f} {:.1f}, not the skeleton's head {:p} at {:.1f} {:.1f} {:.1f}: "
+						             "put on the skeleton's head", g->GetName(), slot, (void*)was, was->m_name ? was->m_name : "", was->world.translate.x,
+							was->world.translate.y, was->world.translate.z, (void*)head, head->world.translate.x, head->world.translate.y, head->world.translate.z);
+						g->skinInstance->bones[slot] = head;
+					}
+		// Race hair: the game does not reshape a skinned hair, so it holds the file's vertices. Unless it is an old copy brought
+		// back (another hair picked, then this one again), drawn by the race menu since: its vertices are then the menu's, already
+		// posed. The file's go back in before the build, which makes the hair's collision shapes from them (and the drawing
+		// starts from them too).
+		if (!item.hairModel.empty())
+			if (auto* node = model->AsNode()) {
+				const RaceHairFile& hairFile = RaceHair(item.hairModel.c_str());
+				for (uint16_t i = 0; i < node->ChildEnd(); ++i) {
+					auto* g = hdt::castNiGeometry(node->children[i]);
+					if (!g || !g->data || !g->data->vertices) continue;
+					std::string lower = g->GetName();
+					for (auto& c : lower) c = (char)tolower((unsigned char)c);
+					auto base = hairFile.base.find(lower);
+					if (base == hairFile.base.end() || base->second.size() != g->data->vertexCount) continue;
+					float off = 0.0f;
+					for (size_t v = 0; v < base->second.size(); ++v) off = std::max(off, (g->data->vertices[v] - base->second[v]).Length());
+					if (off <= 0.01f) continue;
+					logger::warn("[SMP] {}: its vertices are up to {:.2f} units off the hair file's (posed before, as by the race menu): the file's put back",
+						g->GetName(), off);
+					std::copy(base->second.begin(), base->second.end(), g->data->vertices);
+					g->data->dirtyFlags |= 1;
+				}
+			}
 		auto system = creator.createOrUpdateSystem(root, model, &physicsFile, {}, nullptr);
 		if (!system) {
 			item.failed = true;
@@ -659,7 +705,7 @@ namespace nvsmp
 					Item::CpuSkin s;
 					s.shape = g;
 					s.skin = g->skinInstance;
-					s.bind.assign(g->data->vertices, g->data->vertices + g->data->vertexCount);
+					s.bind.assign(g->data->vertices, g->data->vertices + g->data->vertexCount);   // the file's (see before the build)
 					// The hair's colour is applied by the game's hair shader; the Skinned flag (needed by the NIF's skin, now
 					// done here) sends the shape to the plain lighting shader instead, without it.
 					std::string shade = "no shader property";
@@ -839,6 +885,15 @@ namespace nvsmp
 		return out;
 	}
 
+	// The skin slot of a hair's Bip01 Head, by its "SMP Bones" list (not always the first: a hair rigged elsewhere lists it last).
+	static uint32_t HeadSlot(const std::string& list)
+	{
+		const auto names = SlotNames(list);
+		for (uint32_t i = 0; i < names.size(); ++i)
+			if (names[i] == "bip01 head") return i;
+		return 0;
+	}
+
 	// The stand-in skeleton (see m_menuRoot): a node of the plugin's own for each of the player's skeleton nodes (made the
 	// first time its name is seen, never released), given the real one's place; read fresh from the player's 3D each
 	// frame, nothing of it held.
@@ -913,10 +968,18 @@ namespace nvsmp
 			if (reattached) g->skinInstance = nullptr;
 			return false;
 		}
-		RE::NiAVObject* slot0 = skin->bones[0];
-		skin->bones[0] = head;
+		std::string lower = shape->GetName();
+		for (auto& c : lower) c = (char)tolower((unsigned char)c);
+		const auto list = f.lists.find(lower);
+		const uint32_t headSlot = list != f.lists.end() ? HeadSlot(list->second) : 0;
+		if (headSlot >= skin->boneCount) {
+			if (reattached) g->skinInstance = nullptr;
+			return false;
+		}
+		RE::NiAVObject* wasThere = skin->bones[headSlot];
+		skin->bones[headSlot] = head;
 		auto system = creator.createOrUpdateSystem(m_menuRoot.get(), shape->parent, &physicsFile, {}, nullptr);
-		skin->bones[0] = slot0;
+		skin->bones[headSlot] = wasThere;
 		if (reattached) g->skinInstance = nullptr;
 		if (!system || !creator.complete()) {
 			if (system) system->releaseSlots();
@@ -990,6 +1053,7 @@ namespace nvsmp
 			// Each slot's node by name: the physics' (the player's, while it runs), else the skeleton's, else the head.
 			const auto* data = skin->skinData;
 			const std::vector<std::string> names = SlotNames(list->second);
+			const uint32_t headSlot = std::min<uint32_t>(HeadSlot(list->second), data->boneCount - 1);
 			const RE::NiTransform toShape = g->world.Invert();
 			out.assign(morphed.size(), RE::NiPoint3{});
 			for (uint32_t b = 0; b < data->boneCount; ++b) {
@@ -1001,7 +1065,7 @@ namespace nvsmp
 				if (!node && !name.empty() && name.rfind("smp ", 0) != 0) node = FindOutside(h.root, g->parent, name.c_str());
 				// A ponytail bone without its physics (an NPC's hair, or before it is built): where it rests on the head.
 				const RE::NiTransform m = node ? toShape * (node->world * data->boneData[b].skinToBone)
-				                               : toShape * (head->world * data->boneData[0].skinToBone);
+				                               : toShape * (head->world * data->boneData[headSlot].skinToBone);
 				const auto* vw = data->boneData[b].vertData;
 				for (uint16_t k = 0; k < data->boneData[b].vertCount; ++k)
 					if (vw[k].vertex < out.size()) out[vw[k].vertex] = out[vw[k].vertex] + (m * morphed[vw[k].vertex]) * vw[k].weight;
@@ -1185,7 +1249,8 @@ namespace nvsmp
 					// Outside the race menu, only a hair the game has bound (its head slot on the skeleton's live Bip01 Head),
 					// or the one skinned here (its skin taken off): the race menu leaves fresh, unbound copies behind it.
 					auto* sk = g->skinInstance;
-					const bool bound = !sk || (sk->bones && sk->boneCount && sk->bones[0] && IsLiveBone(sk->bones[0], root, obj->parent));
+					const uint32_t headSlot = HeadSlot(f.lists.at(lower));
+					const bool bound = !sk || (sk->bones && headSlot < sk->boneCount && sk->bones[headSlot] && IsLiveBone(sk->bones[headSlot], root, obj->parent));
 					if (m_raceMenu)
 						m_menuHair.push_back({ obj, root, NpcOf(m_scanRef), hair });
 					else if (bound)

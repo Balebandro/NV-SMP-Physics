@@ -1,5 +1,5 @@
 @echo off
-rem Builds the content tools (build\smpify.exe, smpdress.exe, smprepair.exe, nifcheck.exe, nifdump.exe, NVSMPPrepare.exe)
+rem Builds the content tools (build\smpify.exe, smpdress.exe, smprepair.exe, nifcheck.exe, nifdump.exe, smpclean.exe, NVSMPPrepare.exe)
 rem and the offline test (build\systemtest.exe).
 rem Run build.bat first: the test links the plugin's physics code and build\bullet.lib.
 setlocal
@@ -15,6 +15,7 @@ cl /nologo /O2 /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4996 "%ROOT%tools\nifchec
 cl /nologo /O2 /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4996 "%ROOT%tools\smpdress.cpp" /Fe:smpdress.exe /Fo:smpdress.obj || (popd & exit /b 1)
 cl /nologo /O2 /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4996 "%ROOT%tools\smprepair.cpp" /Fe:smprepair.exe /Fo:smprepair.obj || (popd & exit /b 1)
 cl /nologo /O2 /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4996 "%ROOT%tools\nifdump.cpp" /Fe:nifdump.exe /Fo:nifdump.obj || (popd & exit /b 1)
+cl /nologo /O2 /EHsc /std:c++17 /W3 /wd4244 /wd4267 /wd4996 "%ROOT%tools\smpclean.cpp" /Fe:smpclean.exe /Fo:smpclean.obj || (popd & exit /b 1)
 rem NV SMP Prepare (a window program: pick NIFs, it adds what NV SMP Physics needs), with the previewer's Data folder search.
 if not exist prepobj mkdir prepobj
 cl /nologo /O2 /EHsc /MT /std:c++20 /W3 /wd4244 /wd4267 /wd4996 /DNOMINMAX /I"%ROOT%tools" "%ROOT%tools\smpprepare.cpp" "%ROOT%tools\previewer\datafiles.cpp" "%ROOT%tools\previewer\bsa.cpp" "%ROOT%tools\previewer\inflate.cpp" /Fe:NVSMPPrepare.exe /Fo:prepobj\ /link /SUBSYSTEM:WINDOWS user32.lib comdlg32.lib shell32.lib ole32.lib advapi32.lib d3d9.lib || (popd & exit /b 1)

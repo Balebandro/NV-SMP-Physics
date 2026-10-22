@@ -295,6 +295,18 @@ namespace hdt
 		};
 		std::unordered_map<std::string, std::vector<ExtraBone>> m_extraBones;   // by bone name (lower case)
 		std::unordered_map<std::string, RE::NiNode*> m_createdNodes;            // this build's extra-bone nodes
+		std::unordered_map<std::string, std::pair<RE::NiNode*, RE::NiTransform>> m_createdAnchors;   // and what each is carried on
+		// The skeleton bones the item's skins are bound to, by name (lower case): what the game skins them with. Found by
+		// name before the scene is searched, which can hold other nodes of that name (a hair NIF's own copy of the skeleton).
+		std::unordered_map<std::string, RE::NiNode*> m_boundNodes;
+		// A bone the item lists with a parent: its own (not the skeleton's), so always a node made here.
+		bool isItemBone(const std::string& name) const
+		{
+			std::string key = name;
+			for (auto& c : key) c = (char)tolower((unsigned char)c);
+			auto it = m_extraBones.find(key);
+			return it != m_extraBones.end() && !it->second.empty() && !it->second.front().parent.empty();
+		}
 		int m_listedShapes = 0;                                                 // shapes with "SMP Bones"
 		int m_staleSlots = 0;                                                   // item-bone slots that held a pointer other than the skeleton root
 		void collectExtraBones(RE::NiAVObject* obj, int depth = 0);

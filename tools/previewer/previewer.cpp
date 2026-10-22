@@ -11,6 +11,8 @@
 #include "kf.h"
 #include "scene.h"
 #include "xmledit.h"
+#include "backup.h"
+#include "nifclean.h"
 
 #include "hdtSkinnedMesh/hdtSkinnedMeshShape.h"
 #include "hdtSkyrimBone.h"
@@ -410,6 +412,7 @@ static bool gAsyncStep = false;    // --async: the step on the physics thread, a
 // --proxy): skinned in full for every contact, they cost far more in game. Names as the NIF has them.
 static std::vector<std::string> gMissingProxies;
 static bool gXmlArchived = false;   // the XML was found inside a BSA (it cannot be rewritten in place)
+static std::string gXmlFixPath;     // the NIF names an XML the game will not find, one is next to the NIF: its path from Data
 
 static std::vector<std::string> MissingProxies(const std::string& xmlText)
 {
@@ -513,6 +516,7 @@ static void BuildSystem()
 		return;
 	}
 	gItem.xmlNamed = gItem.scene.physicsFile;
+	gXmlFixPath.clear();
 	{
 		std::string source;
 		gItem.xmlPath = datafiles::Resolve(gItem.roots, gItem.xmlNamed, &source);
@@ -526,9 +530,19 @@ static void BuildSystem()
 		auto next = fs::path(gItem.nifPath).parent_path() / base;
 		if (fs::exists(next)) {
 			gItem.xmlPath = next.string();
-			// The game only looks where the NIF says (Data folders and archives), not next to the NIF.
+			// The game only looks where the NIF says (Data folders and archives), not next to the NIF. When the NIF is under a
+			// Meshes folder (a Data folder or a mod's), the path it should name is known: offered as a fix (FixXmlPath).
+			for (fs::path p = fs::absolute(gItem.nifPath).parent_path(); p.has_parent_path() && p != p.parent_path(); p = p.parent_path())
+				if (_stricmp(p.filename().string().c_str(), "meshes") == 0) {
+					gXmlFixPath = fs::relative(next, p.parent_path()).string();
+					std::string named = gItem.xmlNamed;
+					for (auto& c : named) if (c == '/') c = '\\';
+					if (_stricmp(named.c_str(), gXmlFixPath.c_str()) == 0) gXmlFixPath.clear();   // already right (a folder outside the game's Data)
+					break;
+				}
 			AddLog(3, "physics file '" + gItem.xmlNamed + "' is not in any Data folder: using the one next to the NIF. "
-			          "The game will NOT find it there: install it at Data\\" + gItem.xmlNamed + " or change the NIF's path.");
+			          "The game will NOT find it there: " + (gXmlFixPath.empty() ? "install it at Data\\" + gItem.xmlNamed + " or change the NIF's path."
+			          : "'Point the NIF at this XML' changes the NIF's path to " + gXmlFixPath + "."));
 		}
 	}
 	gItem.xmlTime = TimeOf(gItem.xmlPath);
@@ -1011,6 +1025,56 @@ static std::vector<std::string> MissingBoneLists(const std::string& path, const 
 }
 static std::vector<std::string> gMissingBoneLists;
 
+// A copy of the game's skeleton in the NIF (nifclean.h): what cleaning it would take out and move onto the root.
+static nifclean::Report gCopiedSkeleton;
+
+static std::set<std::string> XmlBoneNames()
+{
+	if (gItem.xmlPath.empty()) return {};
+	return nifclean::xmlBoneNames(datafiles::ReadFile(gItem.xmlPath));
+}
+
+static void CheckCopiedSkeleton()
+{
+	gCopiedSkeleton = nifclean::Report();
+	if (gAnim.skeletonPath.empty() || !gItem.loaded) return;
+	try {
+		nif::File f;
+		f.load(gItem.nifPath);
+		gCopiedSkeleton = nifclean::clean(f, nifclean::skeletonNames(gAnim.skeletonPath), true, XmlBoneNames());
+		if (!gCopiedSkeleton.ok) AddLog(3, "copied skeleton check: " + gCopiedSkeleton.error);
+		else if (!gCopiedSkeleton.removed.empty())
+			AddLog(3, "the NIF carries " + std::to_string(gCopiedSkeleton.removed.size()) + " node(s) of a copied skeleton (in game they can catch the "
+			          "item's bones and draw it off the body): 'Remove the copied skeleton' takes them out");
+	} catch (const std::exception& e) {
+		AddLog(3, std::string("copied skeleton check: ") + e.what());
+	}
+}
+
+// Takes the copied skeleton out of the NIF (nifclean.h), keeping the old one as .bak, and reloads.
+static void LoadItem(const std::string& path);
+static void RemoveCopiedSkeleton()
+{
+	try {
+		nif::File f;
+		f.load(gItem.nifPath);
+		auto rep = nifclean::clean(f, nifclean::skeletonNames(gAnim.skeletonPath), false, XmlBoneNames());
+		if (!rep.ok) { AddLog(4, "could not clean the NIF: " + rep.error); return; }
+		if (!rep.changes()) { AddLog(2, "nothing to clean"); return; }
+		std::string err;
+		std::string kept = backup::keep(gItem.nifPath, &err);
+		if (!err.empty()) { AddLog(4, "could not back up " + gItem.nifPath + ": " + err + " (not cleaned)"); return; }
+		f.save(gItem.nifPath);
+		AddLog(2, "removed " + std::to_string(rep.removed.size()) + " node(s) of a copied skeleton, moved " + std::to_string(rep.flattened.size()) +
+		          " skeleton bone(s) the skins use onto the root (" + std::to_string(rep.blocksBefore) + " blocks -> " + std::to_string(rep.blocksAfter) +
+		          "); the NIF as it was: " + kept);
+	} catch (const std::exception& e) {
+		AddLog(4, std::string("could not clean the NIF: ") + e.what());
+		return;
+	}
+	LoadItem(gItem.nifPath);
+}
+
 static void LoadItem(const std::string& path)
 {
 	auto* world = hdt::SkyrimPhysicsWorld::get();
@@ -1104,6 +1168,7 @@ static void LoadItem(const std::string& path)
 	AddLog(2, r.gameData.empty() ? std::string("game: not found") : "game: " + r.gameData + " (" + r.gameHow + ")");
 	for (auto& n : r.notes) AddLog(3, n);
 	BuildSystem();
+	CheckCopiedSkeleton();
 }
 
 static void OpenDialog()
@@ -1536,6 +1601,25 @@ static bool Undo(const char* id, T& v, const T& was)
 
 #include "maker.h"
 
+// Rewrites the physics path the NIF names (on its root and any shape) to gXmlFixPath, keeping the NIF first, and reloads.
+static void FixXmlPath()
+{
+	try {
+		nif::File f;
+		f.load(gItem.nifPath);
+		int n = 0;
+		for (auto& s : f.strings) if (_stricmp(s.c_str(), gItem.xmlNamed.c_str()) == 0) { s = gXmlFixPath; ++n; }
+		if (!n) { AddLog(4, "the NIF's physics path '" + gItem.xmlNamed + "' was not found in it"); return; }
+		maker::Backup(gItem.nifPath);
+		f.save(gItem.nifPath);
+		AddLog(2, "the NIF now names its physics file " + gXmlFixPath + " (was " + gItem.xmlNamed + ")");
+	} catch (std::exception& e) {
+		AddLog(4, std::string("could not change the NIF's physics path: ") + e.what());
+		return;
+	}
+	LoadItem(gItem.nifPath);
+}
+
 static void Panels(float fps)
 {
 	gHighlightBones.clear();   // set again below while a chain is hovered, dragged or pinned
@@ -1566,6 +1650,26 @@ static void Panels(float fps)
 		ImGui::TextWrapped("NIF: %s", gItem.nifPath.c_str());
 		if (gItem.xmlPath.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "XML: %s (not found)", gItem.xmlNamed.empty() ? "none named" : gItem.xmlNamed.c_str());
 		else ImGui::TextWrapped("XML: %s", gItem.xmlPath.c_str());
+		if (!gXmlFixPath.empty()) {
+			ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "The NIF names %s, which the game will not find", gItem.xmlNamed.c_str());
+			ImGui::BeginDisabled(maker::gM.running);
+			if (ImGui::Button("Point the NIF at this XML")) FixXmlPath();
+			ImGui::EndDisabled();
+			Help("Changes the physics path the NIF names to the XML next to it, as the game sees it from Data (the folder holding Meshes, or the mod folder in Mod Organizer). The old NIF is kept as .bak; then it reloads.");
+		}
+		if (gCopiedSkeleton.ok && !gCopiedSkeleton.removed.empty()) {
+			ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "The NIF carries a copied skeleton (%zu node(s) nothing uses)", gCopiedSkeleton.removed.size());
+			std::string l;
+			for (size_t i = 0; i < gCopiedSkeleton.removed.size() && i < 8; i++) l += (i ? ", " : "") + gCopiedSkeleton.removed[i];
+			if (gCopiedSkeleton.removed.size() > 8) l += ", ...";
+			ImGui::TextDisabled("  %s", l.c_str());
+			ImGui::BeginDisabled(maker::gM.running);
+			if (ImGui::Button("Remove the copied skeleton")) RemoveCopiedSkeleton();
+			ImGui::EndDisabled();
+			Help("Takes out the skeleton nodes nothing in the item uses (in game they end up in the actor beside the real skeleton, can catch the "
+			     "item's bones by name and draw it off the body). The skeleton bones the skins use stay, moved onto the NIF's root at their place; "
+			     "the item's own bones, shapes and colliders stay as they are. The old NIF is kept as .bak; then it reloads.");
+		}
 		if (!gMissingBoneLists.empty()) {
 			ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "%zu shape(s) have bones the game drops (no SMP Bones list):", gMissingBoneLists.size());
 			for (auto& m : gMissingBoneLists) ImGui::TextDisabled("  %s", m.c_str());
@@ -2222,7 +2326,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	std::string clipMeshOut;   // --clipmesh file: how much the cloth shapes sink into the body collision shapes (see below)
 	std::string recipe;   // --recipe file: the Make SMP window loads it (with --maker-build: and builds it, for testing)
 	bool addBoneLists = false;
-	bool genProxies = false, useProxies = false;
+	bool genProxies = false, useProxies = false, fixXmlPath = false, removeSkeleton = false;
 	std::vector<std::string> proxyShapes;   // --proxy-shape: the Shapes list's Generate proxies button, for these, pressed once
 	float stroke[4] = { -1, 0, 0, 0 };   // --paint-stroke x0 y0 x1 y1 (window fractions): a simulated brush drag from frame 60 to 120, for testing
 	bool buildAfterStroke = false;
@@ -2270,6 +2374,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--gen-proxies") genProxies = true;   // testing: the Generate collision proxies button, pressed once
 		else if (a == "--proxy-shape") proxyShapes.push_back(next());   // testing: Generate proxies for the picked shapes
 		else if (a == "--use-proxies") useProxies = true;   // testing: the Point the XML at them button, pressed once
+		else if (a == "--fix-xml-path") fixXmlPath = true;   // testing: the Point the NIF at this XML button, pressed once
+		else if (a == "--remove-skeleton") removeSkeleton = true;   // testing: the Remove the copied skeleton button, pressed once
 		else if (a == "--async") gAsyncStep = true;
 		else if (a == "--paint-stroke") for (int k = 0; k < 4; k++) stroke[k] = (float)atof(next().c_str());
 		else if (a == "--show") {
@@ -2287,6 +2393,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	if (!recipe.empty()) { maker::gM.open = true; maker::LoadRecipe(recipe); }
 	if (addBoneLists && !gMissingBoneLists.empty()) maker::AddBoneLists(gItem.nifPath, gAnim.skeletonPath);
 	if (useProxies && gItem.loaded) UseProxiesInXml();
+	if (fixXmlPath && gItem.loaded && !gXmlFixPath.empty()) FixXmlPath();
+	if (removeSkeleton && gItem.loaded && gCopiedSkeleton.ok && !gCopiedSkeleton.removed.empty()) RemoveCopiedSkeleton();
 	if (genProxies && !gMissingProxies.empty()) maker::GenerateProxies(gItem.nifPath, gItem.xmlPath, gMissingProxies, 3.0f);
 	if (!proxyShapes.empty() && gItem.loaded) maker::GenerateProxies(gItem.nifPath, gItem.xmlPath, proxyShapes, 1.0f, 1000);
 	if (stroke[0] >= 0) { maker::gM.open = true; buildAfterStroke = maker::gM.buildOnOpen; maker::gM.buildOnOpen = false; }

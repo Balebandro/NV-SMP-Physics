@@ -323,7 +323,35 @@ namespace hdt
 			auto it = m_skeletonNodes.find(Lower(name.c_str()));
 			return it != m_skeletonNodes.end() ? it->second : nullptr;
 		}
-		return search.run(m_skeleton, name.c_str(), 0);
+		// Within the skeleton a bound bone belongs to first (its "Bip01"), then the whole actor.
+		RE::NiNode* found = nullptr;
+		for (auto& [key, bound] : m_boundNodes) {
+			for (RE::NiAVObject* p = bound; p; p = p->parent)
+				if (p->m_name && _stricmp(p->m_name, "Bip01") == 0) { found = search.run(p, name.c_str(), 0); break; }
+			break;
+		}
+		RE::NiNode* anywhere = search.run(m_skeleton, name.c_str(), 0);
+		if (!found)
+			found = anywhere;
+		else if (anywhere && anywhere != found) {
+			static int reported = 0;
+			if (reported++ < 20)
+				logger::warn("[SMP] {}: the actor has another node of that name ({:p} at {:.1f} {:.1f} {:.1f}) outside the skeleton the item's skin "
+				             "is bound to: the skeleton's ({:p} at {:.1f} {:.1f} {:.1f}) is used", name.c_str(), (void*)anywhere, anywhere->world.translate.x,
+					anywhere->world.translate.y, anywhere->world.translate.z, (void*)found, found->world.translate.x, found->world.translate.y, found->world.translate.z);
+		}
+		// The node the item's skin is bound to for this bone comes first: the physics must move what the skin draws with.
+		if (auto it = m_boundNodes.find(Lower(name.c_str())); it != m_boundNodes.end()) {
+			if (found && found != it->second) {
+				static int reported = 0;
+				if (reported++ < 20)
+					logger::warn("[SMP] {}: the scene has another node of that name ({:p} at {:.1f} {:.1f} {:.1f}) than the one the item's skin is bound to "
+					             "({:p} at {:.1f} {:.1f} {:.1f}): the skin's is used", name.c_str(), (void*)found, found->world.translate.x, found->world.translate.y,
+						found->world.translate.z, (void*)it->second, it->second->world.translate.x, it->second->world.translate.y, it->second->world.translate.z);
+			}
+			return it->second;
+		}
+		return found;
 	}
 
 	SkyrimBone* SkyrimSystemCreator::getOrCreateBone(const RE::BSFixedString& name)
@@ -382,6 +410,10 @@ namespace hdt
 					std::string parent = bar == std::string::npos ? std::string() : entry.substr(bar + 1);
 					if (!name.empty())
 						m_extraBones[Lower(name)].push_back({ g, slot, name, parent });
+					// A skeleton bone ("name|") the game bound: the node the skin draws it with.
+					if (!name.empty() && parent.empty() && g->skinInstance->bones)
+						if (auto* bound = castNiNode(g->skinInstance->bones[slot]); bound && bound->m_name && _stricmp(bound->m_name, name.c_str()) == 0)
+							m_boundNodes.emplace(Lower(name), bound);
 					++slot;
 					if (!end)
 						break;
@@ -412,8 +444,11 @@ namespace hdt
 		auto it = m_extraBones.find(key);
 		if (it == m_extraBones.end() || it->second.empty())
 			return nullptr;
-		if (auto created = m_createdNodes.find(key); created != m_createdNodes.end())
+		if (auto created = m_createdNodes.find(key); created != m_createdNodes.end()) {
+			// Made earlier (as another bone's parent): what it is carried on too, for its physics bone.
+			if (auto a = m_createdAnchors.find(key); a != m_createdAnchors.end()) { anchor = a->second.first; anchorToNode = a->second.second; }
 			return created->second;
+		}
 
 		const ExtraBone& use = it->second.front();
 		auto* skin = use.geometry->skinInstance;
@@ -426,7 +461,9 @@ namespace hdt
 		int reference = -1;
 		RE::NiNode* parentNode = nullptr;
 		if (!use.parent.empty()) {
-			parentNode = findObjectByName(use.parent.c_str());
+			// One of the item's own bones as parent: always the node made here, never a node of that name found in the
+			// scene (a hair NIF's own copies of its bones, left where the file had them, would carry this bone off).
+			parentNode = isItemBone(use.parent) ? nullptr : findObjectByName(use.parent.c_str());
 			if (!parentNode) {
 				// The parent is one of the item's own bones: build it first.
 				RE::NiTransform dummy;
@@ -448,10 +485,12 @@ namespace hdt
 				reference = (int)s;
 		}
 		// A slot the game bound: its node carries the name the item lists for it. (An unbound slot
-		// points at the skeleton root, whatever that is called.)
+		// points at the skeleton root, whatever that is called.) Only a skeleton bone's: an item bone's slot can still hold
+		// the item NIF's own node of that name, left where the file had it (a hair rigged with its bones listed first).
 		for (uint32_t s = 0; s < data->boneCount && reference < 0; ++s) {
 			auto* b = skin->bones[s];
-			if (b && b->m_name && s != use.slot && _stricmp(b->m_name, skinSlotName(use.geometry, s).c_str()) == 0)
+			const std::string slotName = skinSlotName(use.geometry, s);
+			if (b && b->m_name && s != use.slot && _stricmp(b->m_name, slotName.c_str()) == 0 && !isItemBone(slotName))
 				reference = (int)s;
 		}
 		if (reference < 0) {
@@ -475,6 +514,7 @@ namespace hdt
 		node->local = anchorToNode;
 		node->world = nodeWorld;
 		m_createdNodes[key] = node;
+		m_createdAnchors[key] = { anchor, anchorToNode };
 
 		// Point every skin slot of this bone, on every shape of the item, at the node.
 		for (auto& u : it->second) {
@@ -527,6 +567,8 @@ namespace hdt
 		m_boneIndex.clear();
 		m_extraBones.clear();
 		m_createdNodes.clear();
+		m_createdAnchors.clear();
+		m_boundNodes.clear();
 		m_listedShapes = 0;
 		m_staleSlots = 0;
 		collectExtraBones(model);
@@ -884,6 +926,8 @@ namespace hdt
 		m_boneIndex.clear();
 		m_extraBones.clear();
 		m_createdNodes.clear();
+		m_createdAnchors.clear();
+		m_boundNodes.clear();
 		m_listedShapes = 0;
 		m_staleSlots = 0;
 		collectExtraBones(model);
@@ -894,7 +938,7 @@ namespace hdt
 			auto it = m_extraBones.find(Lower(name.c_str()));
 			if (it == m_extraBones.end() || findBoneFromIndex(name.c_str()))
 				return;
-			if (!m_createdNodes.count(Lower(name.c_str())) && findObjectByName(name.c_str()))
+			if (!isItemBone(name) && !m_createdNodes.count(Lower(name.c_str())) && findObjectByName(name.c_str()))
 				return;   // the skeleton has it
 			create(it->second.front().parent);
 			createBoneFromNodeName(name.c_str());
@@ -1194,7 +1238,7 @@ namespace hdt
 		RE::NiNode* anchor = nullptr;
 		RE::NiTransform anchorToNode;
 		RE::NiNode* node = nullptr;
-		bool extra = m_extraBones.count(Lower(bodyName.c_str())) && !findObjectByName(bodyName);
+		bool extra = isItemBone(bodyName.c_str()) || (m_extraBones.count(Lower(bodyName.c_str())) && !findObjectByName(bodyName));
 		if (extra)
 			node = createExtraBoneNode(bodyName.c_str(), anchorToNode, anchor);
 		else
