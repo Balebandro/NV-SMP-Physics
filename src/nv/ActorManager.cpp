@@ -70,11 +70,14 @@ namespace nvsmp
 		}
 	}
 
-	// Whether the node is a live skeleton bone: under `actor`, outside `model` (the item's subtree). Under SEH.
+	// Whether the node is a live skeleton bone: under `actor`, outside `model` (the item's subtree). Under SEH, and at
+	// most 256 parents up: a stale slot can point at reused memory whose parent chain loops, which hung the main thread
+	// here on a save load (2026-10-23, three stack snapshots in this loop); such a slot is not a live bone.
 	static bool IsLiveBone(RE::NiAVObject* node, RE::NiAVObject* actor, RE::NiAVObject* model)
 	{
 		__try {
-			for (RE::NiAVObject* p = node; p; p = p->parent) {
+			int depth = 0;
+			for (RE::NiAVObject* p = node; p && depth < 256; p = p->parent, ++depth) {
 				if (p == model) return false;
 				if (p == actor) return true;
 			}
