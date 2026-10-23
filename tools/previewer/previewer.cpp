@@ -1918,7 +1918,6 @@ static void Panels(float fps)
 		if (ImGui::Button("Reset pose")) world->resetSystems();
 		Help("Only puts the cloth back at rest, keeping the physics as built.");
 		ImGui::Checkbox("Simulate", &gS.physics);
-		Undo("simulate", gS.physics, kDefaults.physics);
 		ImGui::PushItemWidth(-ImGui::GetFontSize() * 13);   // room for the labels and the undo buttons
 		changed |= ImGui::SliderFloat("Gravity", &gS.gravity, 0.0f, 3.0f, "%.2f x");
 		changed |= Undo("gravity", gS.gravity, kDefaults.gravity);
@@ -1930,11 +1929,8 @@ static void Panels(float fps)
 		changed |= ImGui::SliderInt("Solver iterations", &gS.solverIterations, 1, 64);
 		changed |= Undo("iterations", gS.solverIterations, kDefaults.solverIterations);
 		changed |= ImGui::Checkbox("Collisions", &gS.collisions);
-		changed |= Undo("collisions", gS.collisions, kDefaults.collisions);
 		changed |= ImGui::Checkbox("Collide once per frame", &gS.collideOncePerFrame);
-		changed |= Undo("collideonce", gS.collideOncePerFrame, kDefaults.collideOncePerFrame);
 		bool rebuild = ImGui::Checkbox("Ground collision", &gS.ground);
-		rebuild |= Undo("ground", gS.ground, kDefaults.ground);
 		Help("As the game's F7 menu: a ground plane at the feet the cloth rests on when crouching or sitting (the floor grid is at its height).");
 		ImGui::SliderFloat("Waist collision", &gS.waistCollision, 0.0f, 1.0f, "%.2f");
 		rebuild |= ImGui::IsItemDeactivatedAfterEdit();
@@ -1942,21 +1938,18 @@ static void Panels(float fps)
 		Help("As in the game's F7 menu: the rows the physics file keeps out of collision. 0 = they follow the body, 1 = they collide. Rebuilds on release.");
 		if (rebuild && gItem.loaded) BuildSystem();
 		changed |= ImGui::Checkbox("Jitter filter", &gS.jitterFilter);
-		changed |= Undo("filter", gS.jitterFilter, kDefaults.jitterFilter);
 		Help("As in the game's F7 menu: smooths the small fast shaking of the cloth (what is drawn, not the physics). The Chains readouts in Bone values show the jitter left.");
 		if (gS.jitterFilter) {
 			changed |= ImGui::SliderFloat("Jitter smoothing", &gS.jitterSmoothing, 0.0f, 1.0f, "%.2f");
 			changed |= Undo("smoothing", gS.jitterSmoothing, kDefaults.jitterSmoothing);
 		}
 		changed |= ImGui::Checkbox("Wind", &gS.wind);
-		changed |= Undo("wind", gS.wind, kDefaults.wind);
 		if (gS.wind) {
 			changed |= ImGui::SliderFloat("Wind strength", &gS.windStrength, 0.0f, 10.0f, "%.2f");
 			changed |= Undo("windstrength", gS.windStrength, kDefaults.windStrength);
 			ImGui::SliderFloat("Wind from", &gS.windDirection, -180.0f, 180.0f, "%.0f deg");
 			Undo("winddir", gS.windDirection, kDefaults.windDirection);
 			ImGui::Checkbox("Gusts", &gS.windGusts);
-			Undo("gusts", gS.windGusts, kDefaults.windGusts);
 		}
 		ImGui::PopItemWidth();
 		if (changed) ApplyWorldSettings();
@@ -2203,19 +2196,18 @@ static void Panels(float fps)
 	}
 
 	if (ImGui::CollapsingHeader("Display", gOpenValues ? 0 : ImGuiTreeNodeFlags_DefaultOpen)) {
-		// Two toggles a line, each with its undo.
-		auto toggle = [](const char* label, bool& v, const bool& was, bool sameLine) {
+		// Two toggles a line.
+		auto toggle = [](const char* label, bool& v, bool sameLine) {
 			if (sameLine) ImGui::SameLine(ImGui::GetContentRegionMax().x * 0.5f);
 			ImGui::Checkbox(label, &v);
-			Undo(label, v, was);
 		};
-		toggle("Textures", gS.textures, kDefaults.textures, false);
-		toggle("Wireframe", gS.wireframe, kDefaults.wireframe, true);
-		toggle("Floor", gS.showFloor, kDefaults.showFloor, false);
-		toggle("Bones", gS.showBones, kDefaults.showBones, true);
-		toggle("Constraints", gS.showConstraints, kDefaults.showConstraints, false);
-		toggle("Collision", gS.showColliders, kDefaults.showColliders, true);
-		toggle("Proxies", gS.showProxies, kDefaults.showProxies, false);
+		toggle("Textures", gS.textures, false);
+		toggle("Wireframe", gS.wireframe, true);
+		toggle("Floor", gS.showFloor, false);
+		toggle("Bones", gS.showBones, true);
+		toggle("Constraints", gS.showConstraints, false);
+		toggle("Collision", gS.showColliders, true);
+		toggle("Proxies", gS.showProxies, false);
 		Help("Bones: orange simulated, grey animated. Constraints: the links between bones. Collision: orange = cloth (per-vertex), blue = body (per-triangle). Proxies: the hidden low-poly collision stand-ins ('SMP Proxy:'), magenta.");
 		ImGui::ColorEdit3("Background", gS.background, ImGuiColorEditFlags_NoInputs);
 		{
@@ -2300,7 +2292,6 @@ static void Panels(float fps)
 			}
 				if (s.collider) { ImGui::SameLine(); ImGui::TextColored(s.collider == 1 ? ImVec4(1, 0.62f, 0.15f, 1) : ImVec4(0.25f, 0.85f, 1, 1), s.collider == 1 ? "cloth" : "body"); }
 				if (!s.textureNote.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", s.info.diffuse.c_str(), s.textureNote.c_str());
-				{ bool shown = true; Undo("visible", s.visible, shown); }
 				ImGui::PopID();
 			}
 			if (confirmedDelete) { confirmedDelete = false; auto what = pendingDelete; pendingDelete = {}; if (!what.first.empty()) DeleteShapes({ what }); }
