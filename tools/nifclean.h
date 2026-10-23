@@ -429,21 +429,4 @@ namespace nifclean
 		rep.ok = true;
 		return rep;
 	}
-
-	// Renames a shape (a new string; others sharing the old one keep it). False when the shape is not there.
-	inline bool renameShape(File& f, const std::string& name, int occurrence, const std::string& to)
-	{
-		int b = findShape(f, name, occurrence);
-		if (b < 0) return false;
-		AVObject o;
-		Reader r(f.blocks[b].data(), f.blocks[b].size());
-		o.read(r, false);
-		o.name = f.addString(to);
-		Writer w;
-		o.write(w);
-		Bytes& old = f.blocks[b];
-		w.raw(old.data() + o.tailPos, old.size() - o.tailPos);
-		f.blocks[b] = w.b;
-		return true;
-	}
 }

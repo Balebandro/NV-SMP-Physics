@@ -1161,44 +1161,6 @@ static void DeleteShapes(const std::vector<std::pair<std::string, int>>& targets
 	LoadItem(gItem.nifPath);
 }
 
-// Makes a shape collision only: renamed "SMP Proxy:<name>" (the plugin hides it in game and collides with it, as with an
-// smpdress proxy) and named in the XML's per-triangle-shapes (its entry renamed, or a new one like the XML's first).
-static void TagAsCollision(const std::string& name, int occurrence)
-{
-	const std::string proxy = "SMP Proxy:" + name;
-	try {
-		nif::File f;
-		f.load(gItem.nifPath);
-		if (nifclean::findShape(f, proxy, 0) >= 0) { AddLog(3, "the NIF has a " + proxy + " already: delete that one first"); return; }
-		if (!nifclean::renameShape(f, name, occurrence, proxy)) { AddLog(4, "no shape " + name + " in the NIF"); return; }
-		std::string err, kept = backup::keep(gItem.nifPath, &err);
-		if (!err.empty()) { AddLog(4, "could not back up " + gItem.nifPath + ": " + err + " (nothing changed)"); return; }
-		f.save(gItem.nifPath);
-		AddLog(2, name + " is collision only now (" + proxy + ": hidden in game); the NIF as it was: " + kept);
-		if (gItem.xmlPath.empty()) AddLog(3, "the item has no physics XML: name " + proxy + " in a per-triangle-shape there to collide with it");
-		else {
-			std::string text = ReadText(gItem.xmlPath);
-			if (RenameCollisionShape(text, name, proxy) == 0) {
-				// A new entry, made like the XML's first collision shape (or smpdress's defaults).
-				std::smatch first;
-				std::string body = "\n\t\t<margin>0.5</margin>\n\t\t<penetration>3</penetration>\n\t\t<tag>body</tag>\n\t\t<no-collide-with-tag>body</no-collide-with-tag>\n\t";
-				if (std::regex_search(text, first, std::regex("<per-triangle-shape[^>]*>([\\s\\S]*?)</per-triangle-shape>", std::regex::icase))) body = first[1].str();
-				size_t at = text.rfind("</system>");
-				if (at == std::string::npos) AddLog(4, "the XML has no </system>: add " + proxy + " to it by hand");
-				else {
-					std::string esc = std::regex_replace(proxy, std::regex("&"), "&amp;");
-					text.insert(at, "\t<per-triangle-shape name=\"" + esc + "\">" + body + "</per-triangle-shape>\n");
-				}
-			}
-			if (SaveXml(text)) AddLog(2, "the XML collides with " + proxy);
-		}
-	} catch (const std::exception& e) {
-		AddLog(4, std::string("could not tag: ") + e.what());
-		return;
-	}
-	LoadItem(gItem.nifPath);
-}
-
 static void LoadItem(const std::string& path)
 {
 	auto* world = hdt::SkyrimPhysicsWorld::get();
@@ -2257,8 +2219,8 @@ static void Panels(float fps)
 			static std::set<std::string> picked;
 			static int proxyMaxTris = 1000;
 			if (pickedFor != gItem.nifPath) { picked.clear(); pickedFor = gItem.nifPath; }
-			// Delete and Tag run after the list is drawn (they reload the item, which rebuilds gItem.shapes).
-			static std::pair<std::string, int> pendingDelete, pendingTag;
+			// Delete runs after the list is drawn (it reloads the item, which rebuilds gItem.shapes).
+			static std::pair<std::string, int> pendingDelete;
 			static bool confirmedDelete = false;
 			for (size_t i = 0; i < gItem.shapes.size(); i++) {
 				auto& s = gItem.shapes[i];
@@ -2275,11 +2237,6 @@ static void Panels(float fps)
 				ImGui::Checkbox(s.info.geometry->m_name ? s.info.geometry->m_name : "(unnamed)", &s.visible);
 			if (name) {
 				const bool isProxy = _strnicmp(name, "SMP Proxy:", 10) == 0;
-				if (!isProxy && s.info.geometry->skinInstance) {
-					ImGui::SameLine();
-					if (ImGui::SmallButton("Tag collision")) pendingTag = { name, ShapeOccurrence(i) };
-					if (ImGui::IsItemHovered()) ImGui::SetTooltip("Make this shape collision only: renamed SMP Proxy:%s, hidden in game, collided with (added to the XML)", name);
-				}
 				ImGui::SameLine();
 				if (ImGui::SmallButton("Delete")) { pendingDelete = { name, ShapeOccurrence(i) }; ImGui::OpenPopup("Delete shape"); }
 				if (ImGui::IsItemHovered()) ImGui::SetTooltip(isProxy ? "Delete this proxy (the XML collides with its full mesh again)" : "Delete this shape from the NIF");
@@ -2298,7 +2255,6 @@ static void Panels(float fps)
 				ImGui::PopID();
 			}
 			if (confirmedDelete) { confirmedDelete = false; auto what = pendingDelete; pendingDelete = {}; if (!what.first.empty()) DeleteShapes({ what }); }
-			if (!pendingTag.first.empty()) { auto what = pendingTag; pendingTag = {}; TagAsCollision(what.first, what.second); }
 			std::vector<std::string> shapes;
 			for (auto& s : gItem.shapes)
 				if (s.info.geometry->m_name && picked.count(s.info.geometry->m_name) &&
