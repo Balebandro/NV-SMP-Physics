@@ -811,8 +811,9 @@ static void ApplyClips()
 	if (c && !c->accumRoot.empty())
 		if (auto* root = Bone(c->accumRoot.c_str())) root->local = RE::NiTransform();
 	// The game plays a weapon stance's aim or idle on the upper body while moving: the stance's walks often have no
-	// arm tracks (Enhanced Animations' 2hr / 2ha ones), which without it stay at rest (a T pose). Under the rest.
-	if (gAnim.current.key != "idle" && gAnim.current.key != "custom") apply(gAnim.base, 1.0f);
+	// arm tracks (Enhanced Animations' 2hr / 2ha ones), which without it stay at rest (a T pose). Under the rest, the
+	// idle too: a move crossfading into the idle has no arms either, and the idle would fade in from the T pose.
+	if (gAnim.current.key != "custom") apply(gAnim.base, 1.0f);
 	if (gAnim.blend < 1 && gAnim.previous.clip) apply(gAnim.previous, 1.0f);
 	apply(gAnim.current, gAnim.blend < 1 && gAnim.previous.clip ? gAnim.blend : 1.0f);
 	for (auto& [n, p] : pose) {
