@@ -769,6 +769,39 @@ namespace maker
 
 	// The paint of a chain at a vertex (0 where it is not painted).
 	static float PaintAt(const PaintChain& c, int v) { auto it = c.paint.find(v); return it == c.paint.end() ? 0.0f : it->second; }
+	// Each vertex's weight on the chain's point k as smpdress will build it: its paint, split between the two links it lies
+	// between (by where it projects onto the stroke, or onto the line through the bones once a point is moved).
+	static std::vector<float> PointWeights(const ShapeDraw& s, const PaintChain& c, int k)
+	{
+		std::vector<float> out(s.verts.size(), 0.0f);
+		const int n = c.links;
+		std::vector<V3> line;
+		for (int v : c.path) { V3 p = VertexAt(s, v); if (line.empty() || Dot(p - line.back(), p - line.back()) > 0.0025f) line.push_back(p); }
+		const std::vector<V3> bones = PlannedBones(s, c);
+		if (line.size() < 2 || (int)bones.size() != n + 1) return out;
+		std::vector<float> at(line.size(), 0.0f);
+		for (size_t i = 1; i < line.size(); i++) { V3 d = line[i] - line[i - 1]; at[i] = at[i - 1] + std::sqrt(Dot(d, d)); }
+		const float step = std::max(at.back() / n, 1e-6f);
+		const bool moved = !c.points.empty();
+		const std::vector<V3>& poly = moved ? bones : line;
+		for (auto& [v, paint] : c.paint) {
+			if (v < 0 || v >= (int)out.size()) continue;
+			V3 p = VertexAt(s, v);
+			float best = 1e30f, u = 0;
+			for (size_t i = 1; i < poly.size(); i++) {
+				V3 d = poly[i] - poly[i - 1], q = p - poly[i - 1];
+				float t = std::clamp(Dot(q, d) / std::max(Dot(d, d), 1e-9f), 0.0f, 1.0f);
+				V3 r = q - d * t;
+				float e = Dot(r, r);
+				if (e < best) { best = e; u = moved ? (i - 1) + t : (at[i - 1] + t * (at[i] - at[i - 1])) / step; }
+			}
+			u = std::clamp(u, 0.0f, (float)n);
+			int k0 = std::min((int)u, n - 1);
+			float fk = u - k0, w = k == k0 ? 1 - fk : k == k0 + 1 ? fk : 0.0f;
+			out[v] = std::clamp(paint, 0.0f, 1.0f) * w;
+		}
+		return out;
+	}
 	static bool Masked(const std::string& shape, int v) { auto it = gM.masks.find(shape); return it != gM.masks.end() && it->second.count(v); }
 	// Every paint edit goes through here: a masked vertex keeps what it has.
 	static void SetPaint(PaintChain& c, int v, float p) { if (Masked(c.shape, v)) return; if (p < 0.03f) c.paint.erase(v); else c.paint[v] = std::min(p, 1.0f); }
@@ -895,8 +928,15 @@ namespace maker
 		// A moved point: point 2 two units along x in skin space; the planned bone follows, the paint file names it.
 		if (points.size() > 2) {
 			auto before2 = PlannedBones(s, gM.chains[0])[2];
+			auto weightsBefore = PointWeights(s, gM.chains[0], 2);
 			RE::NiPoint3 p = SkinToWorld(s).Invert() * RE::NiPoint3{ before2.x, before2.y, before2.z };
 			gM.chains[0].points[2] = V3(p.x + 2, p.y, p.z);
+			auto weightsAfter = PointWeights(s, gM.chains[0], 2);
+			float sumB = 0, sumA = 0, diff = 0;
+			for (size_t v = 0; v < weightsBefore.size(); v++) { sumB += weightsBefore[v]; sumA += weightsAfter[v]; diff += std::fabs(weightsAfter[v] - weightsBefore[v]); }
+			char wb[200];
+			snprintf(wb, sizeof wb, "weights test, point 2's weights: %.2f before the move, %.2f after, %.2f changed", sumB, sumA, diff);
+			AddLog(2, wb);
 			auto after2 = PlannedBones(s, gM.chains[0])[2];
 			V3 d = after2 - before2;
 			char b[200];
@@ -1071,9 +1111,12 @@ namespace maker
 		// yellow half, red all), masked vertices dark grey. Other shapes, or no chain selected: each chain in its colour.
 		const bool heat = gM.selected >= 0 && gM.selected < (int)gM.chains.size() && gM.chains[gM.selected].shape == name;
 		if (heat) {
+			// With a point selected: that point's own weights (what moving it changes), redone every frame.
 			const PaintChain& c = gM.chains[gM.selected];
+			const bool one = gM.point >= 0 && gM.point <= c.links;
+			const std::vector<float> pw = one ? PointWeights(s, c, gM.point) : std::vector<float>();
 			for (size_t v = 0; v < s.verts.size(); v++) {
-				D3DCOLOR col = Heat(PaintAt(c, (int)v));
+				D3DCOLOR col = Heat(one ? pw[v] : PaintAt(c, (int)v));
 				r[v] = ((col >> 16) & 255) / 255.0f; g[v] = ((col >> 8) & 255) / 255.0f; b[v] = (col & 255) / 255.0f;
 			}
 			if (auto it = gM.masks.find(name); it != gM.masks.end())
@@ -1242,7 +1285,8 @@ namespace maker
 				// Weights: how much of the mesh follows the chain (the paint), evened out or grown and faded by its points.
 				ImGui::SeparatorText("Weights");
 				{
-					// The heat map's scale (the shape shows this chain's paint in it while the chain is selected).
+					// The heat map's scale (the shape shows this chain's paint in it while the chain is selected, or the
+					// selected point's weights).
 					ImDrawList* dl = ImGui::GetWindowDrawList();
 					ImVec2 p = ImGui::GetCursorScreenPos();
 					const float w = ImGui::GetContentRegionAvail().x, h = 8;
@@ -1252,6 +1296,7 @@ namespace maker
 					}
 					ImGui::Dummy(ImVec2(w, h));
 					ImGui::TextDisabled("none   little (blue)   half (yellow)   all (red)");
+					ImGui::TextDisabled(gM.point >= 0 ? "Showing the selected point's weights." : "Showing the chain's paint; select a point to see its weights.");
 				}
 				if (si >= 0 && ImGui::Button("Smooth the whole chain")) {
 					PushUndo();
