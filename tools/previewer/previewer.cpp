@@ -1211,6 +1211,43 @@ static void AddXmlCollision(bool perTriangle, const std::string& shape)
 	LoadItem(gItem.nifPath);
 }
 
+// A shape marked as a collision proxy ("SMP Proxy:<name>": the plugin hides it in game and collides with it) or back
+// (the prefix off): renamed in the NIF, not app-culled (a culled proxy never collides), and the XML's collision shapes
+// of the old name renamed with it when no other shape keeps that name. Both files kept first (backup.h); then it reloads.
+static void ToggleProxy(const std::string& name, int occurrence)
+{
+	const bool unmark = _strnicmp(name.c_str(), "SMP Proxy:", 10) == 0;
+	const std::string to = unmark ? name.substr(10) : "SMP Proxy:" + name;
+	try {
+		nif::File f;
+		f.load(gItem.nifPath);
+		const int blk = nifclean::findShape(f, name, occurrence);
+		if (blk < 0) { AddLog(4, "could not find " + name + " in the NIF"); return; }
+		if (nifclean::findShape(f, to, 0) >= 0) { AddLog(3, "the NIF has a shape named " + to + " already: nothing renamed"); return; }
+		nif::Geometry g;
+		g.read(f.blocks[blk]);
+		g.av.name = f.addString(to);
+		if (!unmark) g.av.flags &= ~1u;
+		f.blocks[blk] = g.write();
+		std::string err, kept = backup::keep(gItem.nifPath, &err);
+		if (!err.empty()) { AddLog(4, "could not back up " + gItem.nifPath + ": " + err + " (nothing renamed)"); return; }
+		f.save(gItem.nifPath);
+		AddLog(2, name + (unmark ? " is no longer a proxy: " : " marked as a proxy: ") + to + " (the NIF as it was: " + kept + ")");
+		if (!gItem.xmlPath.empty() && nifclean::findShape(f, name, 0) < 0) {
+			std::string text = ReadText(gItem.xmlPath);
+			auto list = XmlCollisions(text);
+			int renamed = 0;
+			for (auto it = list.rbegin(); it != list.rend(); ++it)
+				if (_stricmp(it->name.c_str(), name.c_str()) == 0) { text.replace(it->nameAt, it->nameLen, to); renamed++; }
+			if (renamed && SaveXml(text)) AddLog(2, "the XML's collision shapes follow it (" + std::to_string(renamed) + " renamed)");
+		}
+	} catch (const std::exception& e) {
+		AddLog(4, std::string("could not rename: ") + e.what());
+		return;
+	}
+	LoadItem(gItem.nifPath);
+}
+
 // Takes shapes out of the NIF (nifclean.h: what only they used goes too), keeping the old NIF (backup.h), and reloads.
 // A deleted proxy's collisions go back to its full mesh in the XML; another shape the XML names is reported.
 static void DeleteShapes(const std::vector<std::pair<std::string, int>>& targets)
@@ -2348,6 +2385,7 @@ static void Panels(float fps)
 			if (pickedFor != gItem.nifPath) { picked.clear(); pickedFor = gItem.nifPath; }
 			// Delete runs after the list is drawn (it reloads the item, which rebuilds gItem.shapes).
 			static std::pair<std::string, int> pendingDelete;
+			static std::pair<std::string, int> pendingProxy;   // Proxy / Unproxy, run after the list too
 			static bool confirmedDelete = false;
 			for (size_t i = 0; i < gItem.shapes.size(); i++) {
 				auto& s = gItem.shapes[i];
@@ -2375,12 +2413,18 @@ static void Panels(float fps)
 					if (ImGui::Button("Cancel")) { pendingDelete = {}; ImGui::CloseCurrentPopup(); }
 					ImGui::EndPopup();
 				}
+				ImGui::SameLine();
+				if (ImGui::SmallButton(isProxy ? "Unproxy" : "Proxy")) pendingProxy = { name, ShapeOccurrence(i) };
+				if (ImGui::IsItemHovered())
+					ImGui::SetTooltip(isProxy ? "Make this a normal shape again (the 'SMP Proxy:' prefix off; the XML's collisions follow)"
+					                          : "Mark this shape as a collision proxy ('SMP Proxy:' prefix): hidden in game, collided with (the XML's collisions follow)");
 			}
 				if (s.collider) { ImGui::SameLine(); ImGui::TextColored(s.collider == 1 ? ImVec4(1, 0.62f, 0.15f, 1) : ImVec4(0.25f, 0.85f, 1, 1), s.collider == 1 ? "cloth" : "body"); }
 				if (!s.textureNote.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", s.info.diffuse.c_str(), s.textureNote.c_str());
 				ImGui::PopID();
 			}
 			if (confirmedDelete) { confirmedDelete = false; auto what = pendingDelete; pendingDelete = {}; if (!what.first.empty()) DeleteShapes({ what }); }
+			if (!pendingProxy.first.empty()) { auto what = pendingProxy; pendingProxy = {}; ToggleProxy(what.first, what.second); }
 			// The XML's collision shapes: each taken out, or pointed at another of the NIF's shapes (run after the list,
 			// as Delete: the item reloads).
 			if (!gItem.xmlPath.empty() && !gXmlArchived) {
@@ -2638,7 +2682,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	bool addBoneLists = false;
 	bool genProxies = false, useProxies = false, fixXmlPath = false, removeSkeleton = false;
 	int xmlCollision = -1;          // --xml-collision k [shape]: the XML's collision shape k pointed at shape, or "-" deleted (testing)
-	std::string xmlCollisionTo, xmlAdd, xmlAddShape;
+	std::string xmlCollisionTo, xmlAdd, xmlAddShape, toggleProxy;
 	std::vector<std::string> proxyShapes;   // --proxy-shape: the Shapes list's Generate proxies button, for these, pressed once
 	float stroke[4] = { -1, 0, 0, 0 };   // --paint-stroke x0 y0 x1 y1 (window fractions): a simulated brush drag from frame 60 to 120, for testing
 	bool buildAfterStroke = false;
@@ -2693,6 +2737,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--fix-xml-path") fixXmlPath = true;   // testing: the Point the NIF at this XML button, pressed once
 		else if (a == "--remove-skeleton") removeSkeleton = true;   // testing: the Remove the copied skeleton button, pressed once
 		else if (a == "--xml-add") { xmlAdd = next(); xmlAddShape = next(); }   // testing: --xml-add body|cloth shape
+		else if (a == "--toggle-proxy") toggleProxy = next();   // testing: the shape's Proxy / Unproxy button, pressed once
 		else if (a == "--xml-collision") { xmlCollision = atoi(next().c_str()); xmlCollisionTo = next(); if (xmlCollisionTo == "-") xmlCollisionTo.clear(); }
 		else if (a == "--async") gAsyncStep = true;
 		else if (a == "--paint-stroke") for (int k = 0; k < 4; k++) stroke[k] = (float)atof(next().c_str());
@@ -2715,6 +2760,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	if (fixXmlPath && gItem.loaded && !gXmlFixPath.empty()) FixXmlPath();
 	if (removeSkeleton && gItem.loaded && gCopiedSkeleton.ok && !gCopiedSkeleton.removed.empty()) RemoveCopiedSkeleton();
 	if (!xmlAdd.empty() && gItem.loaded && !gItem.xmlPath.empty()) AddXmlCollision(xmlAdd == "body", xmlAddShape);
+	if (!toggleProxy.empty() && gItem.loaded) ToggleProxy(toggleProxy, 0);
 	if (xmlCollision >= 0 && gItem.loaded && !gItem.xmlPath.empty()) EditXmlCollision(xmlCollision, xmlCollisionTo);
 	if (genProxies && !gMissingProxies.empty()) maker::GenerateProxies(gItem.nifPath, gItem.xmlPath, gMissingProxies, 3.0f);
 	if (!proxyShapes.empty() && gItem.loaded) maker::GenerateProxies(gItem.nifPath, gItem.xmlPath, proxyShapes, 1.0f, 1000);
