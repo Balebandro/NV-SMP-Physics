@@ -32,7 +32,7 @@
 //   --painted "Shape" file.smppaint   chains painted on the shape in the NV SMP Maker: per chain its stroke (links laid
 //                     along it from where it is tied on), the painted vertices and their strength (a soft edge blends
 //                     into the shape's own weights), the bone it hangs from, links, stiffness and weight (each chain
-//                     gets its own templates from those two)
+//                     gets its own templates from those two), and any points moved off the stroke
 //   --collide "Shape" a shape of the same NIF everything above collides with (repeatable)
 //   --proxy cell      the colliders collide through low-poly stand-ins hidden in the NIF (vertices merged in cells of
 //                     this many units, about 2-4): far cheaper for the physics to skin and test than the render meshes.
@@ -144,6 +144,7 @@ struct PaintChain {
 	float stiffness = 0.4f, weight = 0.4f;   // 0..1 each
 	std::vector<int> path;
 	std::vector<std::pair<int, float>> paint;
+	std::map<int, Vec3> points;               // points moved in the Maker, by index (0 the tie-on): where that bone goes
 	int global = 0;                           // its number across the outfit (template names)
 };
 
@@ -169,7 +170,8 @@ struct Job {
 };
 
 // Reads the chains of one shape from a .smppaint file (written by the NV SMP Maker):
-//   chain "Shape" / anchor Bone / links n / stiffness s / weight w / path v v v... / paint v:s v:s... / end
+//   chain "Shape" / anchor Bone / links n / stiffness s / weight w / path v v v... / paint v:s v:s... / point k x y z
+//   (a moved point, any number, in the skin's space as the vertices are read here) / end
 static std::vector<PaintChain> readPaintFile(const std::string& path, const std::string& shape)
 {
 	std::ifstream in(path);
@@ -190,6 +192,7 @@ static std::vector<PaintChain> readPaintFile(const std::string& path, const std:
 		else if (key == "stiffness") cur.stiffness = std::clamp((float)atof(rest.c_str()), 0.0f, 1.0f);
 		else if (key == "weight") cur.weight = std::clamp((float)atof(rest.c_str()), 0.0f, 1.0f);
 		else if (key == "path") { std::istringstream s(rest); int v; while (s >> v) cur.path.push_back(v); }
+		else if (key == "point") { std::istringstream s(rest); int k; Vec3 p; if (s >> k >> p.x >> p.y >> p.z) cur.points[k] = p; }
 		else if (key == "paint") {
 			std::istringstream s(rest);
 			std::string t;
@@ -812,6 +815,23 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 			};
 			const int n = pc.links;
 			const float step = total / n;
+			// The bones' places: evenly along the stroke, or where the Maker moved them. With a point moved, a vertex goes
+			// onto the links by where it projects onto the line through the bones (the stroke no longer says where they are).
+			std::vector<Vec3> at3(n + 1);
+			for (int k = 0; k <= n; k++) { auto it = pc.points.find(k); at3[k] = it != pc.points.end() ? it->second : pointAt(k * step); }
+			auto projectBones = [&](Vec3 p) {   // in links (0..n) along the line through the bones, nearest p
+				float best = 1e30f, u = 0;
+				for (int i = 1; i <= n; i++) {
+					Vec3 d = at3[i] - at3[i - 1];
+					float dd = std::max(d.x * d.x + d.y * d.y + d.z * d.z, 1e-9f);
+					Vec3 q = p - at3[i - 1];
+					float t = std::clamp((q.x * d.x + q.y * d.y + q.z * d.z) / dd, 0.0f, 1.0f);
+					Vec3 r = q - d * t;
+					float e = r.x * r.x + r.y * r.y + r.z * r.z;
+					if (e < best) { best = e; u = (i - 1) + t; }
+				}
+				return u;
+			};
 			std::vector<int> slots;
 			std::vector<std::string> names;
 			for (int k = 0; k <= n; k++) {
@@ -823,7 +843,7 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 				char role[32];
 				snprintf(role, sizeof role, "paint%d", pc.global);
 				b.role = k == 0 ? "anchor" : role;
-				b.bind = pointAt(k * step);
+				b.bind = at3[k];
 				slots.push_back(addBone(b));
 				names.push_back(nm);
 				// The anchor and the first link sit where the chain is tied on: they stay out of collisions.
@@ -834,7 +854,7 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 			int moved = 0;
 			for (size_t v = 0; v < nv; v++) {
 				if (owner[v] != (int)c) continue;
-				float u = std::clamp(project(pos[v]) / std::max(step, 1e-6f), 0.0f, (float)n);
+				float u = std::clamp(pc.points.empty() ? project(pos[v]) / std::max(step, 1e-6f) : projectBones(pos[v]), 0.0f, (float)n);
 				int k0 = std::min((int)u, n - 1);
 				float fk = u - k0, s = std::clamp(strength[v], 0.0f, 1.0f);
 				Weights out;

@@ -64,6 +64,7 @@ namespace maker
 		std::string shape;
 		std::vector<int> path;
 		std::map<int, float> paint;
+		std::map<int, V3> points;           // points moved off the stroke (Move points), by index: their place in the skin's space (smpdress's)
 		std::string anchor;
 		int links = 4;
 		float stiffness = 0.4f, weight = 0.4f;
@@ -83,6 +84,7 @@ namespace maker
 		int selected = -1;
 		int point = -1;                     // the selected chain's selected point (0 where it is tied on), -1 none
 		float reach = 8, amount = 0.25f;    // grow / fade around the point: how far, how much per click
+		V3 dragPlane, dragNormal;           // Move points: the plane the dragged point moves in (facing the camera)
 		struct Snapshot { std::vector<PaintChain> chains; int selected, point; std::map<std::string, std::set<int>> masks; };
 		std::deque<Snapshot> undo;          // the chains before each edit, newest last (Ctrl+Z), at most kUndo
 		std::deque<Snapshot> redo;          // what Ctrl+Z took back, newest last (Ctrl+Y); a new edit clears it
@@ -172,6 +174,7 @@ namespace maker
 			for (int v : c.path) o << " " << v;
 			o << "\npaint";
 			for (auto& [v, s] : c.paint) o << " " << v << ":" << Num(s);
+			for (auto& [k, p] : c.points) o << "\npoint " << k << " " << Num(p.x) << " " << Num(p.y) << " " << Num(p.z);
 			o << "\nend\n";
 		}
 		return o.str();
@@ -196,6 +199,7 @@ namespace maker
 			else if (key == "links") cur.links = atoi(rest.c_str());
 			else if (key == "stiffness") cur.stiffness = (float)atof(rest.c_str());
 			else if (key == "weight") cur.weight = (float)atof(rest.c_str());
+			else if (key == "point") { std::istringstream s(rest); int k; V3 p; if (s >> k >> p.x >> p.y >> p.z) cur.points[k] = p; }
 			else if (key == "path") { std::istringstream s(rest); int v; while (s >> v) cur.path.push_back(v); }
 			else if (key == "paint") { std::istringstream s(rest); std::string t; while (s >> t) { size_t c = t.find(':'); if (c != std::string::npos) cur.paint[atoi(t.c_str())] = (float)atof(t.c_str() + c + 1); } }
 		}
@@ -689,7 +693,15 @@ namespace maker
 		return l;
 	}
 
-	// The chain's bones as they will be built: links + 1 points evenly along its stroke.
+	// smpdress's space for a shape (the skin's: NiSkinData's transform on the vertices) to the NIF pose the Maker shows.
+	static RE::NiTransform SkinToWorld(const ShapeDraw& s)
+	{
+		auto* g = s.info.geometry;
+		if (!g->skinInstance || !g->skinInstance->skinData) return g->world;
+		return NifPoseTransform(g) * g->skinInstance->skinData->rootParentToSkin.Invert();
+	}
+
+	// The chain's bones as they will be built: links + 1 points evenly along its stroke, or where they were moved to.
 	static std::vector<V3> PlannedBones(const ShapeDraw& s, const PaintChain& c)
 	{
 		std::vector<V3> line;
@@ -704,6 +716,11 @@ namespace maker
 			while (i + 1 < line.size() && at[i] < target) i++;
 			float t = std::clamp((target - at[i - 1]) / std::max(at[i] - at[i - 1], 1e-6f), 0.0f, 1.0f);
 			out.push_back(line[i - 1] + (line[i] - line[i - 1]) * t);
+		}
+		if (!c.points.empty()) {
+			const RE::NiTransform toWorld = SkinToWorld(s);
+			for (auto& [k, p] : c.points)
+				if (k >= 0 && k < (int)out.size()) { RE::NiPoint3 w = toWorld * RE::NiPoint3{ p.x, p.y, p.z }; out[k] = V3(w.x, w.y, w.z); }
 		}
 		return out;
 	}
@@ -866,6 +883,17 @@ namespace maker
 		for (auto& [v, p] : was) changed += PaintAt(gM.chains[0], v) != p;
 		AddLog(2, "weights test, masked grow: " + std::to_string(changed) + " masked vertices changed (0 expected), " + std::to_string(gM.chains[0].paint.size() - was.size()) + " unmasked taken in");
 		gM.masks.clear();
+		// A moved point: point 2 two units along x in skin space; the planned bone follows, the paint file names it.
+		if (points.size() > 2) {
+			auto before2 = PlannedBones(s, gM.chains[0])[2];
+			RE::NiPoint3 p = SkinToWorld(s).Invert() * RE::NiPoint3{ before2.x, before2.y, before2.z };
+			gM.chains[0].points[2] = V3(p.x + 2, p.y, p.z);
+			auto after2 = PlannedBones(s, gM.chains[0])[2];
+			V3 d = after2 - before2;
+			char b[200];
+			snprintf(b, sizeof b, "weights test, moved point 2: bone moved %.2f units, paint file has it: %d", std::sqrt(Dot(d, d)), PaintText().find("\npoint 2 ") != std::string::npos);
+			AddLog(2, b);
+		}
 	}
 
 	static void Brush(PaintChain& c, const ShapeDraw& s, V3 at, bool erase)
@@ -886,6 +914,57 @@ namespace maker
 		}
 	}
 
+	// Move points: a click near a chain's point (the selected chain's first) picks it up; dragging moves it in the plane
+	// through it facing the camera. Only the bone moves: the mesh stays, and the build weights it to the bones where
+	// they are. On the NIF's pose only (what the build reads).
+	static void MovePoints(V3 eye, V3 dir, bool overUi, int forced)
+	{
+		ImGuiIO& io = ImGui::GetIO();
+		bool down = forced >= 0 ? forced == 1 : ImGui::IsMouseDown(ImGuiMouseButton_Left) && !io.KeyCtrl;
+		bool clicked = forced >= 0 ? forced == 1 : ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+		if (gM.stroking) {
+			if (!down || gM.selected < 0 || gM.point < 0) { gM.stroking = false; return; }
+			PaintChain& c = gM.chains[gM.selected];
+			int si = ShapeIndex(c.shape);
+			if (si < 0) { gM.stroking = false; return; }
+			float dn = Dot(dir, gM.dragNormal);
+			if (std::fabs(dn) < 1e-6f) return;
+			float along = Dot(gM.dragPlane - eye, gM.dragNormal) / dn;
+			if (along <= 0) return;
+			V3 w = eye + dir * along;
+			RE::NiPoint3 p = SkinToWorld(gItem.shapes[si]).Invert() * RE::NiPoint3{ w.x, w.y, w.z };
+			c.points[gM.point] = V3(p.x, p.y, p.z);
+			return;
+		}
+		if (overUi || !down || !clicked) return;
+		if (!gM.nifPose) { AddLog(3, "moving points works on the NIF's pose: turn on Show the NIF's pose"); return; }
+		float best = 1e30f;
+		int bc = -1, bk = -1;
+		V3 bp;
+		for (size_t ci = 0; ci < gM.chains.size(); ci++) {
+			int si = ShapeIndex(gM.chains[ci].shape);
+			if (si < 0) continue;
+			auto pts = PlannedBones(gItem.shapes[si], gM.chains[ci]);
+			for (size_t k = 0; k < pts.size(); k++) {
+				V3 q = pts[k] - eye;
+				float along = Dot(q, dir);
+				if (along <= 0) continue;
+				V3 perp = q - dir * along;
+				float tol = std::max(0.8f, along * 0.02f), d = std::sqrt(Dot(perp, perp));
+				if (d > tol) continue;
+				float score = d / tol + ((int)ci == gM.selected ? 0.0f : 0.5f);
+				if (score < best) { best = score; bc = (int)ci; bk = (int)k; bp = pts[k]; }
+			}
+		}
+		if (bc < 0) return;
+		PushUndo();
+		gM.selected = bc;
+		gM.point = bk;
+		gM.dragPlane = bp;
+		gM.dragNormal = Norm(eye - bp);
+		gM.stroking = true;
+	}
+
 	// Each frame, with the camera's eye and the ray under the mouse: the brush.
 	// forced: -1 the real mouse; 0 or 1 a simulated button (--paint-stroke, for testing), pressed on the first 1.
 	static void Mouse(V3 eye, V3 dir, int forced = -1)
@@ -899,6 +978,7 @@ namespace maker
 		}
 		ImGuiIO& io = ImGui::GetIO();
 		bool overUi = io.WantCaptureMouse && !gM.stroking && forced < 0;
+		if (gM.tool == 6) { MovePoints(eye, dir, overUi, forced); return; }
 		int only = -1;
 		if (gM.stroking && gM.tool >= 4) only = ShapeIndex(gM.maskShape);
 		else if (gM.stroking && gM.selected >= 0) only = ShapeIndex(gM.chains[gM.selected].shape);
@@ -1041,7 +1121,7 @@ namespace maker
 			D3DCOLOR col = (int)ci == gM.selected ? D3DCOLOR_ARGB(255, 255, 255, 255) : ChainColor(ci);
 			auto bones = PlannedBones(s, c);
 			for (size_t k = 0; k < bones.size(); k++) {
-				points.push_back({ bones[k].x, bones[k].y, bones[k].z, k == 0 ? D3DCOLOR_ARGB(255, 150, 160, 180) : col });
+				points.push_back({ bones[k].x, bones[k].y, bones[k].z, c.points.count((int)k) ? D3DCOLOR_ARGB(255, 90, 255, 255) : k == 0 ? D3DCOLOR_ARGB(255, 150, 160, 180) : col });
 				if (k) { lines.push_back({ bones[k - 1].x, bones[k - 1].y, bones[k - 1].z, col }); lines.push_back({ bones[k].x, bones[k].y, bones[k].z, col }); }
 			}
 			// The selected point: a yellow cross and its reach as a ring facing the camera.
@@ -1097,6 +1177,7 @@ namespace maker
 		ImGui::RadioButton("Smooth", &gM.tool, 3);
 		ImGui::RadioButton("Mask", &gM.tool, 4); ImGui::SameLine();
 		ImGui::RadioButton("Unmask", &gM.tool, 5); ImGui::SameLine();
+		ImGui::RadioButton("Move points", &gM.tool, 6); ImGui::SameLine();
 		ImGui::BeginDisabled(gM.masks.empty());
 		if (ImGui::SmallButton("Clear mask")) { PushUndo(); gM.masks.clear(); }
 		ImGui::EndDisabled();
@@ -1112,7 +1193,7 @@ namespace maker
 			if (m.empty()) gM.masks.erase(invertOn);
 		}
 		ImGui::EndDisabled();
-		Help("Mask: brush over vertices to protect them (dark blue): no brush, smoothing or grow / fade changes their paint. Unmask frees them. Invert: on the selected chain's shape (or the last one under the brush), masks what is free and frees what is masked, to work only on a part.");
+		Help("Mask: brush over vertices to protect them (dark blue): no brush, smoothing or grow / fade changes their paint. Unmask frees them. Invert: on the selected chain's shape (or the last one under the brush), masks what is free and frees what is masked, to work only on a part. Move points: drag a chain's point (its bone) to where it should be; the mesh stays, and builds weighted to the bones where they are (moved points show cyan).");
 		Help("New chain: each stroke is a new chain, laid along the stroke. Add: paints more of the mesh onto the selected chain (its bones stay). Erase: takes paint off the selected chain. Smooth: evens out the selected chain's paint under the brush (hard edges blend, spots fill in).");
 		ImGui::BeginDisabled(gM.undo.empty());
 		if (ImGui::Button("Undo")) Undo();
@@ -1141,7 +1222,7 @@ namespace maker
 				std::vector<std::string> anchors = gM.skeleton;
 				BoneCombo("Hangs from", c.anchor, anchors);
 				Help("The bone the chain is tied to. Picked from what the start of the stroke was weighted to; change it if the chain should follow another part of the body.");
-				ImGui::SliderInt("Links", &c.links, 1, 12);
+				if (ImGui::SliderInt("Links", &c.links, 1, 12)) c.points.clear();   // other points now: moved ones go back on the stroke
 				if (si >= 0) { ImGui::SameLine(); ImGui::TextDisabled("%.1f units each", PathLength(gItem.shapes[si], c.path) / std::max(1, c.links)); }
 				Help("Bones along the stroke. More bends more smoothly; about one per 6-10 units.");
 				ImGui::SliderFloat("Stiffness", &c.stiffness, 0, 1, "%.2f");
@@ -1179,6 +1260,15 @@ namespace maker
 					if (ImGui::RadioButton(pl, gM.point == k)) gM.point = gM.point == k ? -1 : k;
 				}
 				Help("Pick one of the chain's points (drawn yellow on the mesh, its reach as a ring), then grow or fade how much of the mesh around it follows the chain.");
+				if (!c.points.empty()) {
+					ImGui::BeginDisabled(gM.point < 0 || !c.points.count(gM.point));
+					if (ImGui::SmallButton("Reset point")) { PushUndo(); c.points.erase(gM.point); }
+					ImGui::EndDisabled();
+					ImGui::SameLine();
+					if (ImGui::SmallButton("Reset all points")) { PushUndo(); c.points.clear(); }
+					ImGui::SameLine();
+					ImGui::TextDisabled("%zu moved", c.points.size());
+				}
 				ImGui::SliderFloat("Reach", &gM.reach, 1, 40, "%.1f units");
 				ImGui::SliderFloat("Amount", &gM.amount, 0.05f, 1, "%.2f");
 				Help("Reach: how far from the point it works, fading to nothing at the edge. Amount: how much each click does at the point itself.");
