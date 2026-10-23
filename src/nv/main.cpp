@@ -197,7 +197,8 @@ namespace nvsmp
 
 		float dt = Game::FrameTime();
 		// 0 while paused: the bones keep their last simulated pose. The race menu pauses the game too, but shows the
-		// character turning and changing: there the physics runs on real time.
+		// character turning and changing, and in dialogue the speaker keeps animating (both menu mode, frame time 0):
+		// there the physics runs on real time.
 		static LARGE_INTEGER lastTick{};
 		LARGE_INTEGER now, freq;
 		QueryPerformanceCounter(&now);
@@ -209,7 +210,12 @@ namespace nvsmp
 			raceMenu = !raceMenu;
 			logger::info("[SMP] race menu {}", raceMenu ? "open: physics on real time" : "closed");
 		}
-		if (dt <= FLT_EPSILON && raceMenu)
+		static bool dialogMenu = false;
+		if (Game::DialogMenuOpen() != dialogMenu) {
+			dialogMenu = !dialogMenu;
+			logger::info("[SMP] dialogue {}", dialogMenu ? "open: physics on real time" : "closed");
+		}
+		if (dt <= FLT_EPSILON && (raceMenu || dialogMenu))
 			dt = std::min(real, 0.05f);
 
 		// Every 120 frames (by count, so it shows even if the frame time reads 0): what the physics is doing. Before the

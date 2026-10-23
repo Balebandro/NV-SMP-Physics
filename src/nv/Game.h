@@ -45,18 +45,22 @@ namespace Game
 	// Whether the race menu (ShowRaceMenu, RaceSexMenu 0x40C) is open: InterfaceManager (0x011D8A80) keeps the open
 	// menus' types at 0x114 (10 slots).
 	constexpr uint32_t kInterfaceManager = 0x011D8A80;
-	inline bool RaceMenuOpen()
+	inline bool MenuOpen(uint32_t type)
 	{
 		__try {
 			void* im = *(void**)kInterfaceManager;
 			if (!im) return false;
 			for (int i = 0; i < 10; ++i)
-				if (At<uint32_t>(im, 0x114 + 4 * i) == 0x40C) return true;
+				if (At<uint32_t>(im, 0x114 + 4 * i) == type) return true;
 			return false;
 		} __except (1) {
 			return false;
 		}
 	}
+	inline bool RaceMenuOpen() { return MenuOpen(0x40C); }
+	// The dialogue menu (DialogMenu 0x3F1): menu mode, so fFrameAnimTime is 0 (TESMain sets it to 0 whenever
+	// bInMenuMode), but the speaker keeps animating on the dialogue camera.
+	inline bool DialogMenuOpen() { return MenuOpen(0x3F1); }
 
 	inline RE::NiNode* Get3D(void* ref)
 	{
