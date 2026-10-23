@@ -10,6 +10,7 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <deque>
 #include <functional>
 #include <thread>
 #include <tuple>
@@ -80,6 +81,8 @@ namespace maker
 		int selected = -1;
 		int point = -1;                     // the selected chain's selected point (0 where it is tied on), -1 none
 		float reach = 8, amount = 0.25f;    // grow / fade around the point: how far, how much per click
+		struct Snapshot { std::vector<PaintChain> chains; int selected, point; };
+		std::deque<Snapshot> undo;          // the chains before each edit, newest last (Ctrl+Z), at most kUndo
 		bool stroking = false;
 		bool hit = false;
 		V3 hitPoint, hitNormal;
@@ -116,6 +119,24 @@ namespace maker
 		bool buildOnOpen = false;           // --maker-build (testing): build once the window has a source
 	};
 	static State gM;
+
+	// Undo: a copy of the chains before each edit (a brush stroke, smoothing, grow / fade, deleting, loading a recipe).
+	constexpr size_t kUndo = 50;
+	static void PushUndo()
+	{
+		gM.undo.push_back({ gM.chains, gM.selected, gM.point });
+		if (gM.undo.size() > kUndo) gM.undo.pop_front();
+	}
+	static void Undo()
+	{
+		if (gM.undo.empty()) { AddLog(3, "nothing to undo"); return; }
+		auto& s = gM.undo.back();
+		gM.chains = std::move(s.chains);
+		gM.selected = s.selected < (int)gM.chains.size() ? s.selected : -1;
+		gM.point = s.point;
+		gM.undo.pop_back();
+		AddLog(2, "undone (" + std::to_string(gM.undo.size()) + " more to undo)");
+	}
 
 	static const D3DCOLOR kChainColors[] = { D3DCOLOR_ARGB(255, 255, 120, 40), D3DCOLOR_ARGB(255, 60, 200, 255), D3DCOLOR_ARGB(255, 120, 230, 90),
 		D3DCOLOR_ARGB(255, 240, 80, 200), D3DCOLOR_ARGB(255, 250, 220, 60), D3DCOLOR_ARGB(255, 150, 120, 255), D3DCOLOR_ARGB(255, 80, 240, 200), D3DCOLOR_ARGB(255, 255, 80, 80) };
@@ -188,7 +209,7 @@ namespace maker
 	{
 		std::vector<ShapeRow> old = std::move(gM.shapes);
 		gM.shapes.clear();
-		if (gItem.nifPath != gM.source) { gM.chains.clear(); gM.selected = -1; }
+		if (gItem.nifPath != gM.source) { gM.chains.clear(); gM.selected = -1; gM.point = -1; gM.undo.clear(); }   // another NIF: its chains and their history go
 		gM.source = gItem.nifPath;
 		gM.sourceHasPhysics = !gItem.scene.physicsFile.empty();
 		for (auto& s : gItem.shapes) {
@@ -290,6 +311,7 @@ namespace maker
 			else if (k == "coattop") gM.coatTop = (float)atof(v.c_str());
 			else if (k == "coatangle") gM.coatAngle = (float)atof(v.c_str());
 		}
+		PushUndo();   // the chains before the recipe replaced them
 		gM.chains.clear();
 		gM.selected = -1;
 		for (auto& [k, v] : top) if (k == "paint") ReadPaint(v);
@@ -773,6 +795,7 @@ namespace maker
 		if (si < 0) { AddLog(4, "weights test: the chain's shape is gone"); return; }
 		const ShapeDraw& s = gItem.shapes[si];
 		auto report = [&](const char* what) {
+			const PaintChain& c = gM.chains[0];   // fresh: Undo replaces the chains
 			const auto& nb = Neighbours(s);
 			float total = 0, step = 0;
 			for (auto& [v, p] : c.paint) {
@@ -784,16 +807,19 @@ namespace maker
 			AddLog(2, b);
 		};
 		report("painted");
-		for (int i = 0; i < 3; i++) SmoothChain(c, s);
+		const size_t before = gM.undo.size();
+		for (int i = 0; i < 3; i++) { PushUndo(); SmoothChain(gM.chains[0], s); }
 		report("smoothed x3");
 		auto points = PlannedBones(s, c);
 		if (points.size() > 2) {
 			gM.reach = 8; gM.amount = 0.5f;
-			GrowAround(c, s, points[2], true);
+			PushUndo(); GrowAround(gM.chains[0], s, points[2], true);
 			report("grown at point 2");
-			GrowAround(c, s, points[2], false);
+			PushUndo(); GrowAround(gM.chains[0], s, points[2], false);
 			report("faded at point 2");
 		}
+		while (gM.undo.size() > before) Undo();
+		report("all undone");
 	}
 
 	static void Brush(PaintChain& c, const ShapeDraw& s, V3 at, bool erase)
@@ -823,6 +849,8 @@ namespace maker
 	{
 		gM.hit = false;
 		if (!Painting()) { gM.stroking = false; return; }
+		// Ctrl+Z: the last edit undone (not mid-stroke, nor while typing in a field).
+		if (forced < 0 && !gM.stroking && ImGui::GetIO().KeyCtrl && !ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Z, true)) Undo();
 		ImGuiIO& io = ImGui::GetIO();
 		bool overUi = io.WantCaptureMouse && !gM.stroking && forced < 0;
 		int only = -1;
@@ -836,6 +864,7 @@ namespace maker
 			if (!down || !clicked || !gM.hit) return;
 			std::string name = gItem.shapes[shape].info.geometry->m_name ? gItem.shapes[shape].info.geometry->m_name : "";
 			if (gM.tool == 0) {
+				PushUndo();
 				PaintChain c;
 				c.shape = name;
 				gM.chains.push_back(c);
@@ -844,7 +873,7 @@ namespace maker
 			} else if (gM.selected < 0 || gM.chains[gM.selected].shape != name) {
 				AddLog(3, gM.selected < 0 ? "select a chain to add to or erase from" : "the selected chain is on " + gM.chains[gM.selected].shape + ": paint on that shape");
 				return;
-			}
+			} else PushUndo();
 			gM.stroking = true;
 		}
 		PaintChain& c = gM.chains[gM.selected];
@@ -869,6 +898,7 @@ namespace maker
 				if (c.path.size() < 2 || c.paint.empty()) {
 					gM.chains.erase(gM.chains.begin() + gM.selected);
 					gM.selected = gM.chains.empty() ? -1 : (int)gM.chains.size() - 1;
+					if (!gM.undo.empty()) gM.undo.pop_back();   // nothing was made: no step to undo
 					AddLog(3, "the stroke was too short for a chain: drag along it, from where it is tied on to its end");
 					return;
 				}
@@ -992,6 +1022,12 @@ namespace maker
 		ImGui::RadioButton("Erase", &gM.tool, 2); ImGui::SameLine();
 		ImGui::RadioButton("Smooth", &gM.tool, 3);
 		Help("New chain: each stroke is a new chain, laid along the stroke. Add: paints more of the mesh onto the selected chain (its bones stay). Erase: takes paint off the selected chain. Smooth: evens out the selected chain's paint under the brush (hard edges blend, spots fill in).");
+		ImGui::BeginDisabled(gM.undo.empty());
+		if (ImGui::Button("Undo")) Undo();
+		ImGui::EndDisabled();
+		ImGui::SameLine();
+		ImGui::TextDisabled("Ctrl+Z (%zu of %zu steps kept)", gM.undo.size(), kUndo);
+		Help("Undoes the last stroke, smoothing, grow or fade, deleted chain or loaded recipe; the last 50 are kept.");
 		ImGui::SliderFloat("Brush size", &gM.radius, 0.5f, 30, "%.1f units");
 		ImGui::SliderFloat("Brush strength", &gM.strength, 0.05f, 1, "%.2f");
 		Help("Below 1 the paint only partly follows the chain: a softer blend into the mesh's own weights.");
@@ -1024,6 +1060,7 @@ namespace maker
 				// Weights: how much of the mesh follows the chain (the paint), evened out or grown and faded by its points.
 				ImGui::SeparatorText("Weights");
 				if (si >= 0 && ImGui::Button("Smooth the whole chain")) {
+					PushUndo();
 					SmoothChain(c, gItem.shapes[si]);
 					AddLog(2, "chain " + std::to_string(i + 1) + " smoothed: " + std::to_string(c.paint.size()) + " vertices");
 				}
@@ -1047,6 +1084,7 @@ namespace maker
 				const bool fade = ImGui::Button("Fade influence");
 				ImGui::EndDisabled();
 				if ((grow || fade) && si >= 0 && gM.point >= 0) {
+					PushUndo();
 					auto points = PlannedBones(gItem.shapes[si], c);
 					if (gM.point < (int)points.size()) {
 						GrowAround(c, gItem.shapes[si], points[gM.point], grow);
@@ -1055,12 +1093,12 @@ namespace maker
 					}
 				}
 				Help("Grow: more of the mesh around the point follows the chain (vertices not painted yet are taken in). Fade: less of it does, blending back into the mesh's own weights.");
-				if (ImGui::Button("Delete chain")) { gM.chains.erase(gM.chains.begin() + i); gM.selected = -1; ImGui::Unindent(); ImGui::PopID(); break; }
+				if (ImGui::Button("Delete chain")) { PushUndo(); gM.chains.erase(gM.chains.begin() + i); gM.selected = -1; ImGui::Unindent(); ImGui::PopID(); break; }
 				ImGui::Unindent();
 			}
 			ImGui::PopID();
 		}
-		if (!gM.chains.empty() && ImGui::SmallButton("Delete all chains")) { gM.chains.clear(); gM.selected = -1; }
+		if (!gM.chains.empty() && ImGui::SmallButton("Delete all chains")) { PushUndo(); gM.chains.clear(); gM.selected = -1; }
 
 		ImGui::SeparatorText("Collides with");
 		std::set<std::string> painted;
