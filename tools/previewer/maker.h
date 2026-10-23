@@ -767,6 +767,20 @@ namespace maker
 		return out;
 	}
 
+	// Point k (not the tie-on) taken out of the chain, one link fewer: the others keep their places, as moved points
+	// (left to the stroke they would be spread out again).
+	static void DeletePoint(PaintChain& c, const ShapeDraw& s, int k)
+	{
+		if (k < 1 || k > c.links || c.links < 2) return;
+		std::vector<V3> bones = PlannedBones(s, c);
+		if ((int)bones.size() != c.links + 1) return;
+		bones.erase(bones.begin() + k);
+		const RE::NiTransform toSkin = SkinToWorld(s).Invert();
+		c.links--;
+		c.points.clear();
+		for (int j = 1; j <= c.links; j++) { RE::NiPoint3 p = toSkin * RE::NiPoint3{ bones[j].x, bones[j].y, bones[j].z }; c.points[j] = V3(p.x, p.y, p.z); }
+	}
+
 	// The paint of a chain at a vertex (0 where it is not painted).
 	static float PaintAt(const PaintChain& c, int v) { auto it = c.paint.find(v); return it == c.paint.end() ? 0.0f : it->second; }
 	// Each vertex's weight on the chain's point k as smpdress will build it: its paint, split between the two links it lies
@@ -941,6 +955,15 @@ namespace maker
 			V3 d = after2 - before2;
 			char b[200];
 			snprintf(b, sizeof b, "weights test, moved point 2: bone moved %.2f units, paint file has it: %d", std::sqrt(Dot(d, d)), PaintText().find("\npoint 2 ") != std::string::npos);
+			AddLog(2, b);
+			// Point 1 deleted: a link fewer, the old point 2 now point 1 where it was; undone, both back.
+			const int links = gM.chains[0].links;
+			PushUndo(); DeletePoint(gM.chains[0], s, 1);
+			V3 e = PlannedBones(s, gM.chains[0])[1] - after2;
+			snprintf(b, sizeof b, "weights test, deleted point 1: links %d -> %d, old point 2 off by %.3f", links, gM.chains[0].links, std::sqrt(Dot(e, e)));
+			AddLog(2, b);
+			Undo();
+			snprintf(b, sizeof b, "weights test, delete undone: links %d", gM.chains[0].links);
 			AddLog(2, b);
 		}
 	}
@@ -1314,6 +1337,10 @@ namespace maker
 					if (ImGui::RadioButton(pl, gM.point == k)) gM.point = gM.point == k ? -1 : k;
 				}
 				Help("Pick one of the chain's points (drawn yellow on the mesh, its reach as a ring), then grow or fade how much of the mesh around it follows the chain.");
+				ImGui::BeginDisabled(si < 0 || gM.point < 1 || c.links < 2);
+				if (ImGui::SmallButton("Delete point")) { PushUndo(); DeletePoint(c, gItem.shapes[si], gM.point); gM.point = -1; }
+				ImGui::EndDisabled();
+				Help("Takes the selected point (and its bone) out of the chain: one link fewer. The other points stay where they are, so they count as moved. Not the tie-on, nor the last link.");
 				if (!c.points.empty()) {
 					ImGui::BeginDisabled(gM.point < 0 || !c.points.count(gM.point));
 					if (ImGui::SmallButton("Reset point")) { PushUndo(); c.points.erase(gM.point); }
