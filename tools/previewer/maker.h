@@ -75,13 +75,15 @@ namespace maker
 		// painting
 		bool paintTab = true, paintOn = true;
 		bool nifPose = true;                // painting shows the NIF's own pose, not the animation's frame
-		int tool = 0;                       // 0 new chain, 1 add to the selected one, 2 erase from it, 3 smooth it
+		int tool = 0;                       // 0 new chain, 1 add to the selected one, 2 erase from it, 3 smooth it, 4 mask, 5 unmask
+		std::map<std::string, std::set<int>> masks;   // per shape, the vertices no brush, smoothing or grow / fade changes
+		std::string maskShape;              // the shape a mask stroke is on
 		float radius = 6, strength = 1;
 		std::vector<PaintChain> chains;
 		int selected = -1;
 		int point = -1;                     // the selected chain's selected point (0 where it is tied on), -1 none
 		float reach = 8, amount = 0.25f;    // grow / fade around the point: how far, how much per click
-		struct Snapshot { std::vector<PaintChain> chains; int selected, point; };
+		struct Snapshot { std::vector<PaintChain> chains; int selected, point; std::map<std::string, std::set<int>> masks; };
 		std::deque<Snapshot> undo;          // the chains before each edit, newest last (Ctrl+Z), at most kUndo
 		bool stroking = false;
 		bool hit = false;
@@ -124,7 +126,7 @@ namespace maker
 	constexpr size_t kUndo = 50;
 	static void PushUndo()
 	{
-		gM.undo.push_back({ gM.chains, gM.selected, gM.point });
+		gM.undo.push_back({ gM.chains, gM.selected, gM.point, gM.masks });
 		if (gM.undo.size() > kUndo) gM.undo.pop_front();
 	}
 	static void Undo()
@@ -134,6 +136,7 @@ namespace maker
 		gM.chains = std::move(s.chains);
 		gM.selected = s.selected < (int)gM.chains.size() ? s.selected : -1;
 		gM.point = s.point;
+		gM.masks = std::move(s.masks);
 		gM.undo.pop_back();
 		AddLog(2, "undone (" + std::to_string(gM.undo.size()) + " more to undo)");
 	}
@@ -209,7 +212,7 @@ namespace maker
 	{
 		std::vector<ShapeRow> old = std::move(gM.shapes);
 		gM.shapes.clear();
-		if (gItem.nifPath != gM.source) { gM.chains.clear(); gM.selected = -1; gM.point = -1; gM.undo.clear(); }   // another NIF: its chains and their history go
+		if (gItem.nifPath != gM.source) { gM.chains.clear(); gM.selected = -1; gM.point = -1; gM.masks.clear(); gM.undo.clear(); }   // another NIF: its chains, masks and history go
 		gM.source = gItem.nifPath;
 		gM.sourceHasPhysics = !gItem.scene.physicsFile.empty();
 		for (auto& s : gItem.shapes) {
@@ -723,7 +726,22 @@ namespace maker
 
 	// The paint of a chain at a vertex (0 where it is not painted).
 	static float PaintAt(const PaintChain& c, int v) { auto it = c.paint.find(v); return it == c.paint.end() ? 0.0f : it->second; }
-	static void SetPaint(PaintChain& c, int v, float p) { if (p < 0.03f) c.paint.erase(v); else c.paint[v] = std::min(p, 1.0f); }
+	static bool Masked(const std::string& shape, int v) { auto it = gM.masks.find(shape); return it != gM.masks.end() && it->second.count(v); }
+	// Every paint edit goes through here: a masked vertex keeps what it has.
+	static void SetPaint(PaintChain& c, int v, float p) { if (Masked(c.shape, v)) return; if (p < 0.03f) c.paint.erase(v); else c.paint[v] = std::min(p, 1.0f); }
+
+	// The mask brush: every vertex under it masked (or unmasked).
+	static void MaskBrush(const std::string& shape, const ShapeDraw& s, V3 at, bool unmask)
+	{
+		auto& m = gM.masks[shape];
+		float r2 = gM.radius * gM.radius;
+		for (int v = 0; v < (int)s.verts.size(); v++) {
+			V3 d = VertexAt(s, v) - at;
+			if (Dot(d, d) > r2) continue;
+			if (unmask) m.erase(v); else m.insert(v);
+		}
+		if (m.empty()) gM.masks.erase(shape);
+	}
 
 	// Smoothing: each vertex moves toward its neighbours' average (unpainted ones count as 0), by `f` (0..1) each.
 	static void SmoothVertices(PaintChain& c, const ShapeDraw& s, const std::vector<std::pair<int, float>>& verts)
@@ -820,6 +838,14 @@ namespace maker
 		}
 		while (gM.undo.size() > before) Undo();
 		report("all undone");
+		// Masked vertices keep their paint: every painted one masked, then a grow at point 2 (new vertices may still be taken in).
+		std::map<int, float> was = gM.chains[0].paint;
+		for (auto& [v, p] : was) gM.masks[gM.chains[0].shape].insert(v);
+		if (points.size() > 2) GrowAround(gM.chains[0], s, points[2], true);
+		int changed = 0;
+		for (auto& [v, p] : was) changed += PaintAt(gM.chains[0], v) != p;
+		AddLog(2, "weights test, masked grow: " + std::to_string(changed) + " masked vertices changed (0 expected), " + std::to_string(gM.chains[0].paint.size() - was.size()) + " unmasked taken in");
+		gM.masks.clear();
 	}
 
 	static void Brush(PaintChain& c, const ShapeDraw& s, V3 at, bool erase)
@@ -834,12 +860,9 @@ namespace maker
 			if (erase) {
 				auto it = c.paint.find(v);
 				if (it == c.paint.end()) continue;
-				it->second *= 1 - f;
-				if (it->second < 0.03f) c.paint.erase(it);
-			} else {
-				float& p = c.paint[v];
-				p = std::max(p, f);
-			}
+				SetPaint(c, v, it->second * (1 - f));
+			} else
+				SetPaint(c, v, std::max(PaintAt(c, v), f));
 		}
 	}
 
@@ -854,7 +877,8 @@ namespace maker
 		ImGuiIO& io = ImGui::GetIO();
 		bool overUi = io.WantCaptureMouse && !gM.stroking && forced < 0;
 		int only = -1;
-		if (gM.stroking && gM.selected >= 0) only = ShapeIndex(gM.chains[gM.selected].shape);
+		if (gM.stroking && gM.tool >= 4) only = ShapeIndex(gM.maskShape);
+		else if (gM.stroking && gM.selected >= 0) only = ShapeIndex(gM.chains[gM.selected].shape);
 		int shape, nearV;
 		V3 p, n;
 		if (!overUi && Raycast(eye, dir, only, shape, p, n, nearV)) { gM.hit = true; gM.hitPoint = p; gM.hitNormal = n; gM.hitShape = shape; }
@@ -863,7 +887,10 @@ namespace maker
 		if (!gM.stroking) {
 			if (!down || !clicked || !gM.hit) return;
 			std::string name = gItem.shapes[shape].info.geometry->m_name ? gItem.shapes[shape].info.geometry->m_name : "";
-			if (gM.tool == 0) {
+			if (gM.tool >= 4) {
+				PushUndo();
+				gM.maskShape = name;
+			} else if (gM.tool == 0) {
 				PushUndo();
 				PaintChain c;
 				c.shape = name;
@@ -875,6 +902,12 @@ namespace maker
 				return;
 			} else PushUndo();
 			gM.stroking = true;
+		}
+		if (gM.tool >= 4) {
+			int mi = ShapeIndex(gM.maskShape);
+			if (mi >= 0 && gM.hit) MaskBrush(gM.maskShape, gItem.shapes[mi], gM.hitPoint, gM.tool == 5);
+			if (!down || mi < 0) gM.stroking = false;
+			return;
 		}
 		PaintChain& c = gM.chains[gM.selected];
 		int si = ShapeIndex(c.shape);
@@ -918,6 +951,7 @@ namespace maker
 		bool hovered = !gHighlightShape.empty() && gHighlightShape == name;
 		bool any = hovered;
 		for (auto& c : gM.chains) if (c.shape == name) any = true;
+		if (gM.masks.count(name)) any = true;
 		if (!any && !(gM.paintTab && gM.paintOn)) return false;
 		std::vector<float> r(s.verts.size(), 0.62f), g(s.verts.size(), 0.62f), b(s.verts.size(), 0.64f);
 		if (hovered) std::fill(r.begin(), r.end(), 0.95f), std::fill(g.begin(), g.end(), 0.95f), std::fill(b.begin(), b.end(), 0.95f);
@@ -933,6 +967,9 @@ namespace maker
 				r[v] += (cr - r[v]) * t; g[v] += (cg - g[v]) * t; b[v] += (cb - b[v]) * t;
 			}
 		}
+		if (auto it = gM.masks.find(name); it != gM.masks.end())
+			for (int v : it->second)
+				if (v < (int)s.verts.size()) { r[v] = r[v] * 0.3f + 0.08f; g[v] = g[v] * 0.3f + 0.12f; b[v] = b[v] * 0.3f + 0.45f; }
 		V3 key = Norm(V3(0.35f, 0.6f, 0.7f));
 		std::vector<LineVertex> lv(s.verts.size());
 		for (size_t i = 0; i < s.verts.size(); i++) {
@@ -991,7 +1028,8 @@ namespace maker
 			V3 n = gM.hitNormal, view = Norm(eye - gM.hitPoint);
 			if (Dot(n, view) < 0) n = n * -1.0f;
 			V3 u = Norm(Cross(n, std::fabs(n.z) < 0.9f ? V3(0, 0, 1) : V3(1, 0, 0))), w = Cross(n, u);
-			D3DCOLOR ring = gM.tool == 2 ? D3DCOLOR_ARGB(255, 255, 90, 90) : gM.tool == 3 ? D3DCOLOR_ARGB(255, 80, 220, 255) : D3DCOLOR_ARGB(255, 255, 255, 255);
+			D3DCOLOR ring = gM.tool == 2 ? D3DCOLOR_ARGB(255, 255, 90, 90) : gM.tool == 3 ? D3DCOLOR_ARGB(255, 80, 220, 255) :
+			                gM.tool == 4 ? D3DCOLOR_ARGB(255, 70, 110, 255) : gM.tool == 5 ? D3DCOLOR_ARGB(255, 190, 190, 190) : D3DCOLOR_ARGB(255, 255, 255, 255);
 			const int seg = 32;
 			for (int i = 0; i < seg; i++) {
 				float a0 = 6.2831853f * i / seg, a1 = 6.2831853f * (i + 1) / seg;
@@ -1021,6 +1059,24 @@ namespace maker
 		ImGui::RadioButton("Add to selected", &gM.tool, 1); ImGui::SameLine();
 		ImGui::RadioButton("Erase", &gM.tool, 2); ImGui::SameLine();
 		ImGui::RadioButton("Smooth", &gM.tool, 3);
+		ImGui::RadioButton("Mask", &gM.tool, 4); ImGui::SameLine();
+		ImGui::RadioButton("Unmask", &gM.tool, 5); ImGui::SameLine();
+		ImGui::BeginDisabled(gM.masks.empty());
+		if (ImGui::SmallButton("Clear mask")) { PushUndo(); gM.masks.clear(); }
+		ImGui::EndDisabled();
+		ImGui::SameLine();
+		const std::string invertOn = gM.selected >= 0 ? gM.chains[gM.selected].shape : gM.hitShape >= 0 && gM.hitShape < (int)gItem.shapes.size() && gItem.shapes[gM.hitShape].info.geometry->m_name ? gItem.shapes[gM.hitShape].info.geometry->m_name : "";
+		ImGui::BeginDisabled(invertOn.empty() || ShapeIndex(invertOn) < 0);
+		if (ImGui::SmallButton("Invert mask")) {
+			PushUndo();
+			auto& m = gM.masks[invertOn];
+			std::set<int> inv;
+			for (int v = 0; v < (int)gItem.shapes[ShapeIndex(invertOn)].verts.size(); v++) if (!m.count(v)) inv.insert(v);
+			m = std::move(inv);
+			if (m.empty()) gM.masks.erase(invertOn);
+		}
+		ImGui::EndDisabled();
+		Help("Mask: brush over vertices to protect them (dark blue): no brush, smoothing or grow / fade changes their paint. Unmask frees them. Invert: on the selected chain's shape (or the last one under the brush), masks what is free and frees what is masked, to work only on a part.");
 		Help("New chain: each stroke is a new chain, laid along the stroke. Add: paints more of the mesh onto the selected chain (its bones stay). Erase: takes paint off the selected chain. Smooth: evens out the selected chain's paint under the brush (hard edges blend, spots fill in).");
 		ImGui::BeginDisabled(gM.undo.empty());
 		if (ImGui::Button("Undo")) Undo();

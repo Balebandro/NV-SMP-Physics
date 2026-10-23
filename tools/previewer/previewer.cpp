@@ -1075,6 +1075,130 @@ static void RemoveCopiedSkeleton()
 	LoadItem(gItem.nifPath);
 }
 
+// --- deleting and tagging shapes (the Shapes list) ----------------------------------------------------------------
+
+// Which of the shapes sharing shape i's name it is, counting in list order (tree order, as nifclean finds them).
+static int ShapeOccurrence(size_t i)
+{
+	const char* name = gItem.shapes[i].info.geometry->m_name;
+	int k = 0;
+	for (size_t j = 0; j < i; j++) {
+		const char* other = gItem.shapes[j].info.geometry->m_name;
+		if (name && other && _stricmp(name, other) == 0) k++;
+	}
+	return k;
+}
+
+static std::string ReadText(const std::string& path)
+{
+	std::ifstream in(path, std::ios::binary);
+	return std::string((std::istreambuf_iterator<char>(in)), {});
+}
+
+// The XML's per-triangle-shape entries named `from` (case aside, as the plugin matches) renamed to `to`; how many.
+static int RenameCollisionShape(std::string& text, const std::string& from, const std::string& to)
+{
+	std::regex re("(<per-triangle-shape[^>]*\\bname\\s*=\\s*\")([^\"]+)(\")", std::regex::icase);
+	std::string out;
+	int renamed = 0;
+	auto begin = text.cbegin();
+	for (std::sregex_iterator it(text.begin(), text.end(), re), end; it != end; ++it) {
+		out.append(begin, (*it)[0].first);
+		if (_stricmp((*it)[2].str().c_str(), from.c_str()) == 0) { out += (*it)[1].str() + to + (*it)[3].str(); renamed++; }
+		else out += (*it)[0].str();
+		begin = (*it)[0].second;
+	}
+	out.append(begin, text.cend());
+	text = out;
+	return renamed;
+}
+
+// Writes the XML's new text, keeping the old one (backup.h). False (logged) when it could not.
+static bool SaveXml(const std::string& text)
+{
+	std::string err;
+	backup::keep(gItem.xmlPath, &err);
+	if (!err.empty()) { AddLog(4, "could not back up " + gItem.xmlPath + ": " + err + " (the XML is left as it was)"); return false; }
+	std::ofstream o(gItem.xmlPath, std::ios::binary);
+	o << text;
+	if (!o) { AddLog(4, "could not write " + gItem.xmlPath); return false; }
+	return true;
+}
+
+// Takes shapes out of the NIF (nifclean.h: what only they used goes too), keeping the old NIF (backup.h), and reloads.
+// A deleted proxy's collisions go back to its full mesh in the XML; another shape the XML names is reported.
+static void DeleteShapes(const std::vector<std::pair<std::string, int>>& targets)
+{
+	try {
+		nif::File f;
+		f.load(gItem.nifPath);
+		auto rep = nifclean::removeShapes(f, targets);
+		if (!rep.ok) { AddLog(4, "could not delete: " + rep.error); return; }
+		std::string err, kept = backup::keep(gItem.nifPath, &err);
+		if (!err.empty()) { AddLog(4, "could not back up " + gItem.nifPath + ": " + err + " (nothing deleted)"); return; }
+		f.save(gItem.nifPath);
+		std::string names;
+		for (auto& [name, k] : targets) names += (names.empty() ? "" : ", ") + name;
+		AddLog(2, "deleted " + names + " (" + std::to_string(rep.blocksBefore) + " blocks -> " + std::to_string(rep.blocksAfter) + "); the NIF as it was: " + kept);
+		if (!gItem.xmlPath.empty()) {
+			std::string text = ReadText(gItem.xmlPath);
+			int back = 0;
+			for (auto& [name, k] : targets) {
+				if (_strnicmp(name.c_str(), "SMP Proxy:", 10) == 0) {
+					std::string mesh = name.substr(10);
+					if (nifclean::findShape(f, mesh, 0) >= 0) { back += RenameCollisionShape(text, name, mesh); continue; }
+				}
+				std::string quoted = "\"" + name + "\"";
+				if (nifclean::lower(text).find(nifclean::lower(quoted)) != std::string::npos)
+					AddLog(3, "the XML still names " + name + ": edit it there (its physics or collisions find no shape now)");
+			}
+			if (back && SaveXml(text)) AddLog(2, "the XML collides with the full mesh again where a deleted proxy stood in (" + std::to_string(back) + " collision shape(s))");
+		}
+	} catch (const std::exception& e) {
+		AddLog(4, std::string("could not delete: ") + e.what());
+		return;
+	}
+	LoadItem(gItem.nifPath);
+}
+
+// Makes a shape collision only: renamed "SMP Proxy:<name>" (the plugin hides it in game and collides with it, as with an
+// smpdress proxy) and named in the XML's per-triangle-shapes (its entry renamed, or a new one like the XML's first).
+static void TagAsCollision(const std::string& name, int occurrence)
+{
+	const std::string proxy = "SMP Proxy:" + name;
+	try {
+		nif::File f;
+		f.load(gItem.nifPath);
+		if (nifclean::findShape(f, proxy, 0) >= 0) { AddLog(3, "the NIF has a " + proxy + " already: delete that one first"); return; }
+		if (!nifclean::renameShape(f, name, occurrence, proxy)) { AddLog(4, "no shape " + name + " in the NIF"); return; }
+		std::string err, kept = backup::keep(gItem.nifPath, &err);
+		if (!err.empty()) { AddLog(4, "could not back up " + gItem.nifPath + ": " + err + " (nothing changed)"); return; }
+		f.save(gItem.nifPath);
+		AddLog(2, name + " is collision only now (" + proxy + ": hidden in game); the NIF as it was: " + kept);
+		if (gItem.xmlPath.empty()) AddLog(3, "the item has no physics XML: name " + proxy + " in a per-triangle-shape there to collide with it");
+		else {
+			std::string text = ReadText(gItem.xmlPath);
+			if (RenameCollisionShape(text, name, proxy) == 0) {
+				// A new entry, made like the XML's first collision shape (or smpdress's defaults).
+				std::smatch first;
+				std::string body = "\n\t\t<margin>0.5</margin>\n\t\t<penetration>3</penetration>\n\t\t<tag>body</tag>\n\t\t<no-collide-with-tag>body</no-collide-with-tag>\n\t";
+				if (std::regex_search(text, first, std::regex("<per-triangle-shape[^>]*>([\\s\\S]*?)</per-triangle-shape>", std::regex::icase))) body = first[1].str();
+				size_t at = text.rfind("</system>");
+				if (at == std::string::npos) AddLog(4, "the XML has no </system>: add " + proxy + " to it by hand");
+				else {
+					std::string esc = std::regex_replace(proxy, std::regex("&"), "&amp;");
+					text.insert(at, "\t<per-triangle-shape name=\"" + esc + "\">" + body + "</per-triangle-shape>\n");
+				}
+			}
+			if (SaveXml(text)) AddLog(2, "the XML collides with " + proxy);
+		}
+	} catch (const std::exception& e) {
+		AddLog(4, std::string("could not tag: ") + e.what());
+		return;
+	}
+	LoadItem(gItem.nifPath);
+}
+
 static void LoadItem(const std::string& path)
 {
 	auto* world = hdt::SkyrimPhysicsWorld::get();
@@ -2133,6 +2257,9 @@ static void Panels(float fps)
 			static std::set<std::string> picked;
 			static int proxyMaxTris = 1000;
 			if (pickedFor != gItem.nifPath) { picked.clear(); pickedFor = gItem.nifPath; }
+			// Delete and Tag run after the list is drawn (they reload the item, which rebuilds gItem.shapes).
+			static std::pair<std::string, int> pendingDelete, pendingTag;
+			static bool confirmedDelete = false;
 			for (size_t i = 0; i < gItem.shapes.size(); i++) {
 				auto& s = gItem.shapes[i];
 				ImGui::PushID((int)i);   // shapes can share a name
@@ -2146,11 +2273,32 @@ static void Panels(float fps)
 					ImGui::SameLine();
 				}
 				ImGui::Checkbox(s.info.geometry->m_name ? s.info.geometry->m_name : "(unnamed)", &s.visible);
+			if (name) {
+				const bool isProxy = _strnicmp(name, "SMP Proxy:", 10) == 0;
+				if (!isProxy && s.info.geometry->skinInstance) {
+					ImGui::SameLine();
+					if (ImGui::SmallButton("Tag collision")) pendingTag = { name, ShapeOccurrence(i) };
+					if (ImGui::IsItemHovered()) ImGui::SetTooltip("Make this shape collision only: renamed SMP Proxy:%s, hidden in game, collided with (added to the XML)", name);
+				}
+				ImGui::SameLine();
+				if (ImGui::SmallButton("Delete")) { pendingDelete = { name, ShapeOccurrence(i) }; ImGui::OpenPopup("Delete shape"); }
+				if (ImGui::IsItemHovered()) ImGui::SetTooltip(isProxy ? "Delete this proxy (the XML collides with its full mesh again)" : "Delete this shape from the NIF");
+				if (ImGui::BeginPopupModal("Delete shape", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+					ImGui::Text("Delete %s from the NIF?", pendingDelete.first.c_str());
+					ImGui::TextDisabled("The NIF as it is now is kept as a .bak.");
+					if (ImGui::Button("Delete")) { confirmedDelete = true; ImGui::CloseCurrentPopup(); }
+					ImGui::SameLine();
+					if (ImGui::Button("Cancel")) { pendingDelete = {}; ImGui::CloseCurrentPopup(); }
+					ImGui::EndPopup();
+				}
+			}
 				if (s.collider) { ImGui::SameLine(); ImGui::TextColored(s.collider == 1 ? ImVec4(1, 0.62f, 0.15f, 1) : ImVec4(0.25f, 0.85f, 1, 1), s.collider == 1 ? "cloth" : "body"); }
 				if (!s.textureNote.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", s.info.diffuse.c_str(), s.textureNote.c_str());
 				{ bool shown = true; Undo("visible", s.visible, shown); }
 				ImGui::PopID();
 			}
+			if (confirmedDelete) { confirmedDelete = false; auto what = pendingDelete; pendingDelete = {}; if (!what.first.empty()) DeleteShapes({ what }); }
+			if (!pendingTag.first.empty()) { auto what = pendingTag; pendingTag = {}; TagAsCollision(what.first, what.second); }
 			std::vector<std::string> shapes;
 			for (auto& s : gItem.shapes)
 				if (s.info.geometry->m_name && picked.count(s.info.geometry->m_name) &&

@@ -181,6 +181,8 @@ namespace nifclean
 		bool changes() const { return !removed.empty() || !flattened.empty(); }
 	};
 
+	inline bool compact(File& f, Report& rep, const std::vector<int>& kept);
+
 	// Cleans f in place (dryRun: only says what it would do). xmlNames: the bone names the physics XML uses (lower case), if
 	// it is at hand; the "SMP Bones" lists in the file are read here.
 	inline Report clean(File& f, const std::set<std::string>& skeleton, bool dryRun, const std::set<std::string>& xmlNames = {})
@@ -308,7 +310,18 @@ namespace nifclean
 				f.blocks[b] = w.b;
 			}
 
-		// Every block reached from the root (and the footer's other roots) through known references; the rest goes.
+		std::vector<int> kept;
+		for (int b : order) if (keep.count(b)) kept.push_back(b);
+		if (!compact(f, rep, kept)) return rep;
+		rep.ok = true;
+		return rep;
+	}
+
+	// Every block reached from the root (and the footer's other roots) through known references stays, renumbered; the rest
+	// goes. `kept`: blocks that must still be reached (a kept object that is not means something is wrong: nothing changes).
+	// False (rep.error set, f untouched) on a block type whose references are not known here.
+	inline bool compact(File& f, Report& rep, const std::vector<int>& kept)
+	{
 		std::vector<Refs> refs(f.blocks.size());
 		std::vector<char> reached(f.blocks.size(), 0);
 		std::vector<int> stack;
@@ -317,18 +330,18 @@ namespace nifclean
 			int b = stack.back();
 			stack.pop_back();
 			if (b < 0 || b >= (int)f.blocks.size() || reached[b]) continue;
-			if (!refsOf(f, b, refs[b])) { rep.error = "block " + std::to_string(b) + " is a " + f.typeOf(b) + ", which this cleaner does not know: nothing changed"; return rep; }
+			if (!refsOf(f, b, refs[b])) { rep.error = "block " + std::to_string(b) + " is a " + f.typeOf(b) + ", which this cleaner does not know: nothing changed"; return false; }
 			reached[b] = 1;
 			for (size_t p : refs[b].at) {
 				int32_t x = refAt(f.blocks[b], p);
 				if (x >= 0 && x < (int)f.blocks.size()) stack.push_back(x);
 			}
 		}
-		for (int b : order) if (keep.count(b) && !reached[b]) { rep.error = "a kept object was not reached: nothing changed"; return rep; }
+		for (int b : kept) if (!reached[b]) { rep.error = "a kept object was not reached: nothing changed"; return false; }
 		for (size_t b = 0; b < f.blocks.size(); b++)
 			if (reached[b] && (f.typeOf(b) == "NiTriShapeData" || f.typeOf(b) == "NiTriStripsData") && refAt(f.blocks[b], refs[b].at.back()) >= 0) {
 				rep.error = "a shape has additional geometry data, which this cleaner does not handle: nothing changed";
-				return rep;
+				return false;
 			}
 
 		std::vector<int32_t> to(f.blocks.size(), -1);
@@ -349,7 +362,88 @@ namespace nifclean
 		for (int r : f.roots) if (r >= 0 && reached[r]) out.roots.push_back(to[r]);
 		f = std::move(out);
 		rep.blocksAfter = f.blocks.size();
+		return true;
+	}
+
+	// The shapes (NiTriShape / NiTriStrips) in tree order from the root, as the previewer lists them, with their parents.
+	inline std::vector<std::pair<int, int>> shapesInTree(const File& f)
+	{
+		std::vector<std::pair<int, int>> out;   // shape block, parent node block
+		std::set<int> seen;
+		std::function<void(int)> walk = [&](int b) {
+			if (b < 0 || b >= (int)f.blocks.size() || !seen.insert(b).second || !isNodeType(f.typeOf(b))) return;
+			AVObject o;
+			Reader r(f.blocks[b].data(), f.blocks[b].size());
+			o.read(r, true);
+			for (int c : o.children) {
+				if (c < 0 || c >= (int)f.blocks.size()) continue;
+				const std::string& t = f.typeOf(c);
+				if (t == "NiTriShape" || t == "NiTriStrips") out.push_back({ c, b });
+				else walk(c);
+			}
+		};
+		if (!f.roots.empty()) walk(f.roots[0]);
+		return out;
+	}
+
+	// The shape block named `name` (its `occurrence`-th in tree order when several share the name), or -1.
+	inline int findShape(const File& f, const std::string& name, int occurrence, int* parent = nullptr)
+	{
+		int seen = 0;
+		for (auto& [b, p] : shapesInTree(f))
+			if (lower(nameOf(f, b)) == lower(name) && seen++ == occurrence) { if (parent) *parent = p; return b; }
+		return -1;
+	}
+
+	// Takes shapes out of the file: unlinked from their parents, then every block only they used goes (compact).
+	// targets: name and occurrence (see findShape).
+	inline Report removeShapes(File& f, const std::vector<std::pair<std::string, int>>& targets)
+	{
+		Report rep;
+		rep.blocksBefore = f.blocks.size();
+		std::map<int, std::set<int>> drop;   // parent node -> its shapes that go
+		for (auto& [name, occurrence] : targets) {
+			int parent = -1, b = findShape(f, name, occurrence, &parent);
+			if (b < 0) { rep.error = "no shape " + name + " in the NIF: nothing changed"; return rep; }
+			drop[parent].insert(b);
+			rep.removed.push_back(name);
+		}
+		File edited = f;
+		for (auto& [parent, shapes] : drop) {
+			AVObject o;
+			Reader r(edited.blocks[parent].data(), edited.blocks[parent].size());
+			o.read(r, true);
+			std::vector<int32_t> children;
+			for (int c : o.children) if (!shapes.count(c)) children.push_back(c);
+			o.children = children;
+			Writer w;
+			o.write(w);
+			const Bytes& old = edited.blocks[parent];
+			w.raw(old.data() + o.tailPos, old.size() - o.tailPos);
+			edited.blocks[parent] = w.b;
+		}
+		std::vector<int> kept;
+		for (auto& [b, p] : shapesInTree(edited)) kept.push_back(b);
+		if (!compact(edited, rep, kept)) return rep;
+		f = std::move(edited);
 		rep.ok = true;
 		return rep;
+	}
+
+	// Renames a shape (a new string; others sharing the old one keep it). False when the shape is not there.
+	inline bool renameShape(File& f, const std::string& name, int occurrence, const std::string& to)
+	{
+		int b = findShape(f, name, occurrence);
+		if (b < 0) return false;
+		AVObject o;
+		Reader r(f.blocks[b].data(), f.blocks[b].size());
+		o.read(r, false);
+		o.name = f.addString(to);
+		Writer w;
+		o.write(w);
+		Bytes& old = f.blocks[b];
+		w.raw(old.data() + o.tailPos, old.size() - o.tailPos);
+		f.blocks[b] = w.b;
+		return true;
 	}
 }
