@@ -1318,6 +1318,8 @@ static void LoadItem(const std::string& path)
 	}
 	AddLog(2, std::to_string(gItem.shapes.size()) + " shapes, skeleton of " + std::to_string(gItem.scene.skeleton.bones.size()) + " bones; " +
 		std::to_string(gItem.roots.folders.size()) + " Data folders and " + std::to_string(gItem.roots.archives.size()) + " archives searched");
+	if (gItem.scene.weapon)
+		AddLog(2, "a weapon: on the skeleton's Weapon node, as the game holds it (pick its stance under Motion)");
 	auto& r = gItem.roots;
 	AddLog(2, r.mo2Instance.empty() ? std::string("MO2: none found") : "MO2: " + r.mo2Instance + ", profile '" + r.mo2Profile + "' (" + r.mo2How + ")");
 	AddLog(2, r.gameData.empty() ? std::string("game: not found") : "game: " + r.gameData + " (" + r.gameHow + ")");

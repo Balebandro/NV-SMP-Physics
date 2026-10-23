@@ -1,5 +1,6 @@
 #include "scene.h"
 
+#include <algorithm>
 #include <fstream>
 
 // --- fake objects with the game's layout -------------------------------------------------------------
@@ -316,13 +317,35 @@ namespace scene
 		if (!skeletonPath.empty()) BuildSkeletonFromNif(skeletonPath, item.skeleton);
 		else BuildSkeleton(f, item.skeleton);
 
-		// The item's root under the actor, its shapes under it, as the game attaches armor.
+		// The item's root under the actor, its shapes under it, as the game attaches armor. A weapon (a ProjectileNode in
+		// it, or under a weapons folder) goes on the skeleton's Weapon node instead, at its root's transform, as the game
+		// attaches a weapon.
+		std::map<int, int> parentOf;
+		bool weapon = false;
+		for (size_t n = 0; n < f.blocks.size(); n++) {
+			if (!nif::isNodeType(f.typeOf(n))) continue;
+			nif::Reader r(f.blocks[n].data(), f.blocks[n].size());
+			nif::AVObject node;
+			node.read(r, true);
+			for (auto c : node.children) if (c >= 0) parentOf[c] = (int)n;
+			if (_stricmp(StrName(f, (int)n).c_str(), "ProjectileNode") == 0) weapon = true;
+		}
+		{
+			std::string lower = nifPath;
+			for (auto& c : lower) c = (char)tolower((unsigned char)c);
+			std::replace(lower.begin(), lower.end(), '/', '\\');
+			if (lower.find("\\weapons\\") != std::string::npos) weapon = true;
+		}
+		auto weaponNode = item.skeleton.bones.find("Weapon");
+		if (weaponNode == item.skeleton.bones.end()) weapon = false;
+		item.weapon = weapon;
 		item.model = NewNode("Scene Root");
-		AddChild(item.skeleton.actor, item.model);
+		AddChild(weapon ? weaponNode->second : item.skeleton.actor, item.model);
 		{
 			nif::AVObject root;
 			nif::Reader r(f.blocks[f.roots[0]].data(), f.blocks[f.roots[0]].size());
 			root.read(r, true);
+			if (weapon) item.model->local = ToRE(root.local);
 			for (int e : root.extraData) {
 				if (f.typeOf(e) != "NiStringExtraData") continue;
 				nif::Reader er(f.blocks[e].data(), f.blocks[e].size());
@@ -335,6 +358,20 @@ namespace scene
 			if (t != "NiTriShape" && t != "NiTriStrips") continue;
 			ShapeInfo info;
 			info.geometry = BuildShape(f, (int)blk, item.skeleton, info);
+			// An unskinned shape where the NIF places it: its own transform and its nodes' below the root (a skinned one
+			// goes where its bones put it).
+			if (!info.geometry->skinInstance) {
+				nif::Geometry g;
+				g.read(f.blocks[blk]);
+				nif::Transform t = g.av.local;
+				for (int p = parentOf.count((int)blk) ? parentOf[(int)blk] : -1; p >= 0 && p != f.roots[0]; p = parentOf.count(p) ? parentOf[p] : -1) {
+					nif::Reader r(f.blocks[p].data(), f.blocks[p].size());
+					nif::AVObject node;
+					node.read(r, true);
+					t = node.local * t;
+				}
+				info.geometry->local = ToRE(t);
+			}
 			AddChild(item.model, info.geometry);
 			item.byName[info.geometry->m_name] = info.geometry;
 			item.shapes.push_back(std::move(info));

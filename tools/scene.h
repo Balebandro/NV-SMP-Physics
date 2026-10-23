@@ -38,6 +38,7 @@ namespace scene
 		std::vector<ShapeInfo> shapes;         // in file order
 		std::map<std::string, RE::NiGeometry*> byName;
 		std::string physicsFile;               // what the root's "HDT Skinned Mesh Physics Object" names
+		bool weapon = false;                   // on the skeleton's Weapon node (a weapon NIF), not the actor
 	};
 
 	// Loads the NIF into a new Item (never freed: the objects are leaked on reload, a few MB at most).
