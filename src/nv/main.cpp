@@ -217,6 +217,14 @@ namespace nvsmp
 		}
 		if (dt <= FLT_EPSILON && (raceMenu || dialogMenu))
 			dt = std::min(real, 0.05f);
+		// "tfc 1" freezes the world but not the frame time: the physics holds too (bones keep their pose).
+		static bool frozen = false;
+		if (Game::TimeFrozen() != frozen) {
+			frozen = !frozen;
+			logger::info("[SMP] time {}", frozen ? "frozen (tfc 1): physics held" : "unfrozen");
+		}
+		if (frozen)
+			dt = 0.0f;
 
 		// Every 120 frames (by count, so it shows even if the frame time reads 0): what the physics is doing. Before the
 		// step starts: the report reads the bodies.

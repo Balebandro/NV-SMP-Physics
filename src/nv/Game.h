@@ -62,6 +62,19 @@ namespace Game
 	// bInMenuMode), but the speaker keeps animating on the dialogue camera.
 	inline bool DialogMenuOpen() { return MenuOpen(0x3F1); }
 
+	// "tfc 1" (ToggleFlyCam with freeze): PlayerCharacter::ToggleFlyCam (0x961E30) calls TESMain::SetFreezeTime
+	// (0x961F50), which sets TESMain::bFreezeTime (TESMain* at 0x011DEA0C, +0x7). The frame time keeps running.
+	constexpr uint32_t kTESMain = 0x011DEA0C;
+	inline bool TimeFrozen()
+	{
+		__try {
+			void* main = *(void**)kTESMain;
+			return main && At<uint8_t>(main, 0x7) != 0;
+		} __except (1) {
+			return false;
+		}
+	}
+
 	inline RE::NiNode* Get3D(void* ref)
 	{
 		typedef RE::NiAVObject*(__thiscall * Get3D_t)(void*);
