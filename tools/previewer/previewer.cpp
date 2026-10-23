@@ -633,6 +633,7 @@ struct Anim
 	bool wasAnimating = false;
 } gAnim;
 static bool gStanceForced = false;   // --stance: kept over a weapon's own (its folder's)
+static bool gFirstPerson = false;    // a weapon with physics on the first-person skeleton, seen from its Camera1st
 
 struct Motion
 {
@@ -688,7 +689,8 @@ static std::string FindAnimation(const std::string& action, const char* prefix)
 	bool top = action.rfind("jump", 0) == 0 || action == "aim" || std::string(prefix).rfind("sneak", 0) == 0;
 	std::error_code ec;
 	// Loose files, then the archives (datafiles::Resolve), the per-gender path first.
-	const std::string male = "meshes\\characters\\_male\\", loco = "meshes\\characters\\_male\\locomotion\\";
+	// First person: the _1stperson set (its stances' aims in the folder itself, the moves in its locomotion folder).
+	const std::string male = gFirstPerson ? "meshes\\characters\\_1stperson\\" : "meshes\\characters\\_male\\", loco = male + "locomotion\\";
 	const std::string& first = top ? male : loco;
 	const std::string& second = top ? loco : male;
 	for (const std::string& rel : { first + gender + "\\" + file, first + file, second + gender + "\\" + file, second + file })
@@ -697,7 +699,8 @@ static std::string FindAnimation(const std::string& action, const char* prefix)
 		fs::path over = fs::path(root) / "meshes" / "AnimGroupOverride";
 		if (!fs::is_directory(over, ec)) continue;
 		for (auto& d : fs::directory_iterator(over, ec)) {
-			fs::path p = top ? d.path() / "_male" / file : d.path() / "_male" / "locomotion" / file;
+			const char* set = gFirstPerson ? "_1stperson" : "_male";
+			fs::path p = top ? d.path() / set / file : d.path() / set / "locomotion" / file;
 			if (fs::exists(p, ec)) return p.string();
 		}
 	}
@@ -1257,7 +1260,7 @@ static void LoadItem(const std::string& path)
 		next.nifTime = TimeOf(path);
 		next.roots = datafiles::Discover(path, gSources);
 		// The game's skeleton, as the item will be on in game (and as the animations are made for).
-		gAnim.skeletonPath = datafiles::Resolve(next.roots, "meshes\\characters\\_male\\skeleton.nif");
+		gAnim.skeletonPath = datafiles::Resolve(next.roots, gFirstPerson ? "meshes\\characters\\_1stperson\\skeleton.nif" : "meshes\\characters\\_male\\skeleton.nif");
 		try {
 			next.scene = scene::Load(path, gAnim.skeletonPath);
 		} catch (const std::exception& e) {
@@ -1272,6 +1275,12 @@ static void LoadItem(const std::string& path)
 		AddLog(4, std::string("cannot read ") + path + ": " + e.what());
 		return;
 	}
+	// First person is for weapons with physics: anything else goes back to the third-person skeleton.
+	if (gFirstPerson && !(gItem.scene.weapon && !gItem.scene.physicsFile.empty())) {
+		gFirstPerson = false;
+		LoadItem(path);
+		return;
+	}
 	IniSet("LastFile", path);
 	// Only against the game's skeleton (without it the item's own bones make up the skeleton) and for an SMP item.
 	gMissingBoneLists.clear();
@@ -1280,7 +1289,7 @@ static void LoadItem(const std::string& path)
 		for (auto& m : gMissingBoneLists) AddLog(3, "no SMP Bones list, so the game drops these bones: " + m);
 	}
 	gMotion = Motion();
-	gAnim.current = gAnim.previous = ClipPlay();
+	gAnim.current = gAnim.previous = gAnim.base = ClipPlay();   // their nodes are the old skeleton's
 	gAnim.wasAnimating = false;
 	gAnim.rest.clear();
 	for (auto& [name, node] : gItem.scene.skeleton.bones) gAnim.rest[name] = node->local;
@@ -1461,8 +1470,27 @@ static void UpdateCamera(float dt)
 	if (!io.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_F)) { gCam.pan = V3(); gCam.dist = 250.0f; }
 }
 
+// First person: the eye at the skeleton's Camera1st (it bobs with the moves), looking the way the actor faces (+y).
+static RE::NiNode* FirstPersonCamera()
+{
+	if (!gFirstPerson || !gItem.loaded) return nullptr;
+	auto it = gItem.scene.skeleton.bones.find("Camera1st");
+	return it == gItem.scene.skeleton.bones.end() ? nullptr : it->second;
+}
+
+static V3 CameraAt()
+{
+	if (auto* c = FirstPersonCamera()) {
+		auto* actor = gItem.scene.skeleton.actor;
+		RE::NiPoint3 fwd = actor ? actor->world.rotate * RE::NiPoint3{ 0, 1, 0 } : RE::NiPoint3{ 0, 1, 0 };
+		return V3(c->world.translate) + V3(fwd) * 100.0f;
+	}
+	return gCam.target + gCam.pan;
+}
+
 static V3 CameraEye()
 {
+	if (auto* c = FirstPersonCamera()) return V3(c->world.translate);
 	V3 at = gCam.target + gCam.pan;
 	// yaw 0 looks at the body's front (+y): the eye sits on +y.
 	V3 dir(-std::sin(gCam.yaw) * std::cos(gCam.pitch), std::cos(gCam.yaw) * std::cos(gCam.pitch), std::sin(gCam.pitch));
@@ -1920,6 +1948,11 @@ static void Panels(float fps)
 		ImGui::BeginDisabled(!canAnimate);
 		ImGui::Checkbox("Game animations", &gAnim.use);
 		ImGui::EndDisabled();
+		if (gItem.scene.weapon && !gItem.scene.physicsFile.empty()) {
+			ImGui::SameLine();
+			if (ImGui::Checkbox("First person", &gFirstPerson)) LoadItem(gItem.nifPath);
+			Help("The weapon on the first-person skeleton (_1stperson\\skeleton.nif) with the first-person animations (_1stperson: the stance's aim, its locomotion folder's moves), seen from its Camera1st. The plugin does not run physics in first person yet: this shows how it would look.");
+		}
 		Help(canAnimate ? "The game's skeleton and the locomotion animations installed loose (MO2 mods, Data), as the game would pick them. Off: a procedural stride."
 		                : "No skeleton.nif found loose in the Data folders: the procedural stride is used.");
 		if (canAnimate && gAnim.use) {
@@ -2642,6 +2675,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--clip") clipOut = next();
 		else if (a == "--clipmesh") clipMeshOut = next();
 		else if (a == "--stance") { gAnim.stance = std::clamp(atoi(next().c_str()), 0, IM_ARRAYSIZE(kStances) - 1); gStanceForced = true; }
+		else if (a == "--first-person") gFirstPerson = true;   // testing: the First person box ticked (a weapon with physics)
 		else if (a == "--kf") { gAnim.customPath = next(); gS.preset = kCustom; }
 		else if (a == "--exit") exitAfter = true;
 		else if (a == "--log") logOut = next();   // testing: the log, written to this file on exit
@@ -3148,14 +3182,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		RECT rc;
 		GetClientRect(gWnd, &rc);
 		float aspect = (float)std::max(1L, rc.right) / (float)std::max(1L, rc.bottom);
-		M4 view = LookAtRH(CameraEye(), gCam.target + gCam.pan, V3(0, 0, 1));
-		M4 proj = PerspectiveRH(0.75f, aspect, 2.0f, 20000.0f);
+		M4 view = LookAtRH(CameraEye(), CameraAt(), V3(0, 0, 1));
+		M4 proj = PerspectiveRH(0.75f, aspect, gFirstPerson ? 0.5f : 2.0f, 20000.0f);   // first person: the weapon is close
 		M4 viewProj = Mul(view, proj);
 
 		// The Make SMP brush: the ray under the mouse (the camera's frame, as LookAtRH builds it; fov 0.75 rad).
 		{
 			ImGuiIO& io = ImGui::GetIO();
-			V3 eye = CameraEye(), at = gCam.target + gCam.pan;
+			V3 eye = CameraEye(), at = CameraAt();
 			V3 z = Norm(eye - at), x = Norm(Cross(V3(0, 0, 1), z)), y = Cross(z, x);
 			float th = std::tan(0.75f / 2);
 			float mx = io.MousePos.x / std::max(1L, rc.right), my = io.MousePos.y / std::max(1L, rc.bottom);
