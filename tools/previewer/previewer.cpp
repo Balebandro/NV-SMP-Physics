@@ -1470,7 +1470,10 @@ static void UpdateCamera(float dt)
 	if (!io.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_F)) { gCam.pan = V3(); gCam.dist = 250.0f; }
 }
 
-// First person: the eye at the skeleton's Camera1st (it bobs with the moves), looking the way the actor faces (+y).
+// First person: the eye at the skeleton's Camera1st (it bobs with the moves), looking the way the actor faces (+y),
+// lowered a little so the weapon sits above the log window.
+static const V3 kFirstPersonDrop(0, 0, -6.0f);
+
 static RE::NiNode* FirstPersonCamera()
 {
 	if (!gFirstPerson || !gItem.loaded) return nullptr;
@@ -1483,14 +1486,14 @@ static V3 CameraAt()
 	if (auto* c = FirstPersonCamera()) {
 		auto* actor = gItem.scene.skeleton.actor;
 		RE::NiPoint3 fwd = actor ? actor->world.rotate * RE::NiPoint3{ 0, 1, 0 } : RE::NiPoint3{ 0, 1, 0 };
-		return V3(c->world.translate) + V3(fwd) * 100.0f;
+		return V3(c->world.translate) + kFirstPersonDrop + V3(fwd) * 100.0f;
 	}
 	return gCam.target + gCam.pan;
 }
 
 static V3 CameraEye()
 {
-	if (auto* c = FirstPersonCamera()) return V3(c->world.translate);
+	if (auto* c = FirstPersonCamera()) return V3(c->world.translate) + kFirstPersonDrop;
 	V3 at = gCam.target + gCam.pan;
 	// yaw 0 looks at the body's front (+y): the eye sits on +y.
 	V3 dir(-std::sin(gCam.yaw) * std::cos(gCam.pitch), std::cos(gCam.yaw) * std::cos(gCam.pitch), std::sin(gCam.pitch));
