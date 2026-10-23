@@ -632,6 +632,7 @@ struct Anim
 	std::string customPath;
 	bool wasAnimating = false;
 } gAnim;
+static bool gStanceForced = false;   // --stance: kept over a weapon's own (its folder's)
 
 struct Motion
 {
@@ -1285,6 +1286,15 @@ static void LoadItem(const std::string& path)
 		std::string file = fs::path(path).stem().string();
 		for (auto& c : file) c = (char)tolower((unsigned char)c);
 		gAnim.female = file.size() > 2 && (file.compare(file.size() - 2, 2, "_f") == 0 || file.find("female") != std::string::npos);
+	}
+	// A weapon in one of the game's weapon-type folders: that type's stance (the plugin's record says the type; the
+	// folder is what the NIF has). Elsewhere the stance stays as it was.
+	if (gItem.scene.weapon && !gStanceForced) {
+		std::string lower = path;
+		for (auto& c : lower) c = (char)tolower((unsigned char)c);
+		const int stance = lower.find("1handpistol") != std::string::npos ? 1 : lower.find("2handrifle") != std::string::npos ? 2
+		                 : lower.find("2handautomatic") != std::string::npos ? 3 : -1;
+		if (stance >= 0) { gAnim.stance = stance; AddLog(2, std::string("weapon stance from its folder: ") + kStances[stance]); }
 	}
 	FindAnimations();
 	if (gAnim.skeletonPath.empty()) AddLog(3, "no skeleton.nif found loose in the Data folders: the procedural motion is used");
@@ -2622,7 +2632,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--jitter") jitterOut = next();
 		else if (a == "--clip") clipOut = next();
 		else if (a == "--clipmesh") clipMeshOut = next();
-		else if (a == "--stance") gAnim.stance = std::clamp(atoi(next().c_str()), 0, IM_ARRAYSIZE(kStances) - 1);
+		else if (a == "--stance") { gAnim.stance = std::clamp(atoi(next().c_str()), 0, IM_ARRAYSIZE(kStances) - 1); gStanceForced = true; }
 		else if (a == "--kf") { gAnim.customPath = next(); gS.preset = kCustom; }
 		else if (a == "--exit") exitAfter = true;
 		else if (a == "--log") logOut = next();   // testing: the log, written to this file on exit
