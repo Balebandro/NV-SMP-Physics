@@ -211,6 +211,8 @@ struct NewBone {
 	bool hasBox = false;   // a collision box around rigid pieces on this bone (skin space)
 	Vec3 boxMin{ 1e9f, 1e9f, 1e9f }, boxMax{ -1e9f, -1e9f, -1e9f };
 	std::vector<Vec3> piecePts;   // the rigid pieces' vertices (skin space), for their collision box
+	bool hasInertia = false;      // --pieces: its own inertia (small pieces swing as their size says, not as rope links)
+	Vec3 inertia;
 };
 
 // What a job leaves for the physics XML.
@@ -222,6 +224,9 @@ struct JobResult {
 	std::vector<std::pair<std::string, std::string>> weft;
 	std::vector<std::string> topBones;                // bones whose vertices do not collide (anchors and the first link)
 	std::vector<int> warpPaint;                       // per warp chain: its PaintChain::global, or -1 (cloth, rope)
+	// --pieces: the links' constraint frame (skin space): x along the surface it hangs on, y away from it, z up.
+	bool pieceFrame = false;
+	Vec3 frameX, frameY, frameZ;
 };
 
 // The connected pieces of a mesh (vertices at the same position joined: UV seams split them).
@@ -853,12 +858,17 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 		std::vector<int> used(list.size(), 0);
 		for (auto& g : groups) for (int k : g) if (used[k]++) throw std::runtime_error("--groups: piece " + std::to_string(k) + " is in two groups");
 		for (size_t k = 0; k < list.size(); k++) if (!used[k]) printf("  note: piece %zu is in no group: it stays on the anchor\n", k);
-		// A group's top: the centre of its vertices within 0.1 units of its highest point (where it hangs).
-		auto topOf = [&](const std::vector<int>& g) {
-			float hi = -1e9f;
-			for (int k : g) hi = std::max(hi, list[k].hi);
+		// Where a group hangs from the one above: where they touch (the vertices of each within 0.05 units of their
+		// closest approach), which is where a link passes through a ring or an eye. Turning about it keeps it there.
+		auto jointOf = [&](const std::vector<int>& parent, const std::vector<int>& child) {
+			std::vector<int> pv, cv;
+			for (int k : parent) pv.insert(pv.end(), list[k].verts.begin(), list[k].verts.end());
+			for (int k : child) cv.insert(cv.end(), list[k].verts.begin(), list[k].verts.end());
+			float best = 1e30f;
+			for (int a : pv) for (int b : cv) best = std::min(best, length(pos[a] - pos[b]));
+			const float reach = best + 0.05f;
 			Vec3 c{}; int n = 0;
-			for (int k : g) for (int v : list[k].verts) if (along(v) > hi - 0.1f) { c = c + pos[v]; n++; }
+			for (int a : pv) for (int b : cv) if (length(pos[a] - pos[b]) <= reach) { c = c + pos[a] + pos[b]; n += 2; }
 			return c * (1.0f / std::max(n, 1));
 		};
 		std::vector<std::string> names;
@@ -870,7 +880,23 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 				a.name = std::string(prefix) + " L0";
 				a.parent = job.anchor;
 				a.role = "anchor";
-				a.bind = topOf(groups[1]);
+				a.bind = jointOf(groups[0], groups[1]);
+				printf("  tied on at (%.2f %.2f %.2f)\n", a.bind.x, a.bind.y, a.bind.z);
+				// The surface it hangs against: from the tie-on toward the fixed pieces, across --up. The links swing
+				// freely along it and away from it, hardly into it (the thing it hangs on is not in the physics).
+				Vec3 c{}; int n = 0;
+				for (int k : groups[0]) for (int v : list[k].verts) { c = c + pos[v]; n++; }
+				Vec3 w = c * (1.0f / std::max(n, 1)) - a.bind;
+				w = w - job.up * dot(w, job.up);
+				if (length(w) > 1e-3f) {
+					// Turning about x (toward the surface) swings the links along it; about y (up x toward it) toward or
+					// away from it (a positive turn of the hanging end: away); about z (up) twists them.
+					res.pieceFrame = true;
+					res.frameX = normalize(w);
+					res.frameZ = job.up;
+					res.frameY = cross(res.frameZ, res.frameX);
+					printf("  hangs against a surface toward (%.2f %.2f %.2f)\n", res.frameX.x, res.frameX.y, res.frameX.z);
+				}
 				addBone(a);
 				names.push_back(a.name);
 				res.topBones.push_back(a.name);
@@ -879,7 +905,7 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 			b.name = std::string(prefix) + " L" + std::to_string(gi);
 			b.parent = names.back();
 			b.role = last ? "end" : "rope";
-			b.bind = last ? topOf(groups[gi]) : topOf(groups[gi + 1]);   // its lower end: the next body hangs there
+			b.bind = last ? jointOf(groups[gi - 1], groups[gi]) : jointOf(groups[gi], groups[gi + 1]);   // where the next body hangs from it
 			size_t nverts = 0;
 			for (int k : groups[gi]) for (int v : list[k].verts) { b.piecePts.push_back(pos[v]); nverts++; }
 			if (last) {   // the end's weight where its pieces are (a box around them, as rope ends have)
@@ -888,6 +914,17 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 					b.boxMax = { std::max(b.boxMax.x, p.x), std::max(b.boxMax.y, p.y), std::max(b.boxMax.z, p.z) };
 				}
 				b.hasBox = true;
+			}
+			{   // its inertia about its centre, its mass (the rope / end template's) spread as its vertices are
+				const float mass = last ? 0.1f : 0.05f;
+				Vec3 c{};
+				for (auto& p : b.piecePts) c = c + p;
+				c = c * (1.0f / b.piecePts.size());
+				Vec3 sq{};
+				for (auto& p : b.piecePts) { Vec3 d = p - c; sq = sq + Vec3{ d.x * d.x, d.y * d.y, d.z * d.z }; }
+				sq = sq * (1.0f / b.piecePts.size());
+				b.hasInertia = true;
+				b.inertia = Vec3{ sq.y + sq.z, sq.x + sq.z, sq.x + sq.y } * mass;
 			}
 			const int slot = addBone(b);
 			for (int k : groups[gi]) for (int v : list[k].verts) neww[v] = { { slot, 1.0f } };
@@ -1380,7 +1417,10 @@ int main(int argc, char** argv)
 			line("\t</bone-default>");
 		}
 		for (auto& r : results) for (auto& b : r.bones) {
-			if (!b.hasBox) { line("\t<bone name=\"" + xmlEscape(b.name) + "\" template=\"" + b.role + "\"/>"); continue; }
+			char inertia[160] = "";
+			if (b.hasInertia) snprintf(inertia, sizeof inertia, "\t\t<inertia x=\"%.6f\" y=\"%.6f\" z=\"%.6f\"/>", b.inertia.x, b.inertia.y, b.inertia.z);
+			if (!b.hasBox && !b.hasInertia) { line("\t<bone name=\"" + xmlEscape(b.name) + "\" template=\"" + b.role + "\"/>"); continue; }
+			if (!b.hasBox) { line("\t<bone name=\"" + xmlEscape(b.name) + "\" template=\"" + b.role + "\">"); line(inertia); line("\t</bone>"); continue; }
 			// The body centred on its rigid pieces (their weight where they are), with a box the size of their body:
 			// across, their mean distance from the upright axis through their centre (a broken bottle's jagged rim
 			// stays out, so pieces modelled touching do not start in contact); upright, 90% of their height. A
@@ -1400,6 +1440,7 @@ int main(int argc, char** argv)
 			snprintf(buf, sizeof buf, "\t\t<shape type=\"box\"><halfExtend x=\"%.3f\" y=\"%.3f\" z=\"%.3f\"/><margin>0.05</margin></shape>", half, half, halfZ);
 			line(buf);
 			line("\t\t<collision-filter>1</collision-filter>");
+			if (b.hasInertia) line(inertia);
 			line("\t</bone>");
 		}
 		line("");
@@ -1442,6 +1483,21 @@ int main(int argc, char** argv)
 		line("\t\t<angularStiffness x=\"0.6\" y=\"0.6\" z=\"0.6\"/>");
 		line("\t\t<angularDamping x=\"0.08\" y=\"0.08\" z=\"0.08\"/>");
 		line("\t</generic-constraint-default>");
+		bool pieceFrames = false;
+		for (auto& r : results) pieceFrames |= r.pieceFrame;
+		if (pieceFrames) {
+			line("\t<!-- Rigid pieces hanging against a surface (a charm on a weapon): the frame (set per constraint) has x toward the");
+			line("\t     surface, y across, z up. They swing freely along it and away from it, hardly into it; little twist. -->");
+			line("\t<generic-constraint-default name=\"piece\">");
+			line("\t\t<frameInB/>");
+			line("\t\t<linearLowerLimit x=\"0\" y=\"0\" z=\"0\"/>");
+			line("\t\t<linearUpperLimit x=\"0\" y=\"0\" z=\"0\"/>");
+			line("\t\t<angularLowerLimit x=\"-1.2\" y=\"-0.1\" z=\"-0.2\"/>");
+			line("\t\t<angularUpperLimit x=\"1.2\" y=\"1.2\" z=\"0.2\"/>");
+			line("\t\t<angularStiffness x=\"0.3\" y=\"0.3\" z=\"0.3\"/>");
+			line("\t\t<angularDamping x=\"0.1\" y=\"0.1\" z=\"0.1\"/>");
+			line("\t</generic-constraint-default>");
+		}
 		for (auto& [g, feel] : paintFeel) {
 			const float s = feel.stiffness;
 			line("\t<generic-constraint-default name=\"paintLink" + std::to_string(g) + "\">");
@@ -1464,9 +1520,23 @@ int main(int argc, char** argv)
 				auto& chain = r.warp[ci];
 				int paint = ci < r.warpPaint.size() ? r.warpPaint[ci] : -1;
 				line("\t<constraint-group>");
-				for (size_t k = 1; k < chain.size(); k++)
+				for (size_t k = 1; k < chain.size(); k++) {
+					if (r.pieceFrame) {
+						// The frame's axes (columns) as a quaternion, in the parent's space (the skin's: bones are not turned).
+						const float m[3][3] = { { r.frameX.x, r.frameY.x, r.frameZ.x }, { r.frameX.y, r.frameY.y, r.frameZ.y }, { r.frameX.z, r.frameY.z, r.frameZ.z } };
+						float qw, qx, qy, qz, tr = m[0][0] + m[1][1] + m[2][2];
+						if (tr > 0) { float s = std::sqrt(tr + 1) * 2; qw = s / 4; qx = (m[2][1] - m[1][2]) / s; qy = (m[0][2] - m[2][0]) / s; qz = (m[1][0] - m[0][1]) / s; }
+						else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) { float s = std::sqrt(1 + m[0][0] - m[1][1] - m[2][2]) * 2; qw = (m[2][1] - m[1][2]) / s; qx = s / 4; qy = (m[0][1] + m[1][0]) / s; qz = (m[0][2] + m[2][0]) / s; }
+						else if (m[1][1] > m[2][2]) { float s = std::sqrt(1 + m[1][1] - m[0][0] - m[2][2]) * 2; qw = (m[0][2] - m[2][0]) / s; qx = (m[0][1] + m[1][0]) / s; qy = s / 4; qz = (m[1][2] + m[2][1]) / s; }
+						else { float s = std::sqrt(1 + m[2][2] - m[0][0] - m[1][1]) * 2; qw = (m[1][0] - m[0][1]) / s; qx = (m[0][2] + m[2][0]) / s; qy = (m[1][2] + m[2][1]) / s; qz = s / 4; }
+						char buf[200];
+						snprintf(buf, sizeof buf, "<frameInB><basis x=\"%.5f\" y=\"%.5f\" z=\"%.5f\" w=\"%.5f\"/></frameInB>", qx, qy, qz, qw);
+						line("\t\t<generic-constraint bodyA=\"" + xmlEscape(chain[k]) + "\" bodyB=\"" + xmlEscape(chain[k - 1]) + "\" template=\"piece\">" + buf + "</generic-constraint>");
+						continue;
+					}
 					line("\t\t<generic-constraint bodyA=\"" + xmlEscape(chain[k]) + "\" bodyB=\"" + xmlEscape(chain[k - 1]) + "\" template=\"" +
 						(paint >= 0 ? "paintLink" + std::to_string(paint) : cloth ? (k == 1 ? "warpTop" : "warp") : "link") + "\"/>");
+				}
 				line("\t</constraint-group>");
 			}
 			if (weft && !r.weft.empty()) {

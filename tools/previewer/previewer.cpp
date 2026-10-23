@@ -1423,8 +1423,13 @@ struct Camera
 	bool init = false;
 } gCam;
 
+static std::string gFocusNode;   // --focus "Node": the camera follows that node (testing: a close look at a small part)
+static RE::NiPoint3 gFocusAt;    // --focus-at x y z: a point in that node's space instead of its origin
+
 static V3 FocusPoint()
 {
+	if (!gFocusNode.empty() && gItem.scene.skeleton.actor)
+		if (auto* n = hdt::findObject(gItem.scene.skeleton.actor, gFocusNode.c_str())) return V3(n->world * gFocusAt);
 	if (gItem.pelvis) return V3(gItem.pelvis->world.translate) - V3(0, 0, 22);
 	return V3(gItem.scene.skeleton.actor ? gItem.scene.skeleton.actor->world.translate : RE::NiPoint3{}) + V3(0, 0, 70);
 }
@@ -2614,6 +2619,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--pitch") gCam.pitch = (float)atof(next().c_str()) * 3.14159f / 180.0f;
 		else if (a == "--dist") gCam.dist = (float)atof(next().c_str());
 		else if (a == "--panz") gCam.pan = V3(0, 0, (float)atof(next().c_str()));
+		else if (a == "--focus") gFocusNode = next();
+		else if (a == "--focus-at") { gFocusAt.x = (float)atof(next().c_str()); gFocusAt.y = (float)atof(next().c_str()); gFocusAt.z = (float)atof(next().c_str()); }
 		else if (a == "--noui") noUi = true;
 		else if (a == "--values") gOpenValues = true;
 		else if (a == "--heat") gS.heatBone = next();
