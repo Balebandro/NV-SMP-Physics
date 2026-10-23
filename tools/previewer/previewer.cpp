@@ -1174,6 +1174,26 @@ static void EditXmlCollision(int index, const std::string& to)
 	LoadItem(gItem.nifPath);
 }
 
+// A new collision shape on the NIF shape `shape` at the end of the XML's <system>: body (per-triangle) or cloth
+// (per-vertex), with the tags and margins the Maker writes; the XML kept first, then the item reloads.
+static void AddXmlCollision(bool perTriangle, const std::string& shape)
+{
+	std::string text = ReadText(gItem.xmlPath);
+	size_t at = nifclean::lower(text).rfind("</system>");
+	if (at == std::string::npos) { AddLog(4, "no </system> in " + gItem.xmlPath + ": nothing added"); return; }
+	while (at > 0 && (text[at - 1] == ' ' || text[at - 1] == '\t')) at--;
+	const std::string nl = text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+	std::string e = perTriangle
+		? "\t<per-triangle-shape name=\"" + shape + "\">" + nl + "\t\t<margin>0.5</margin>" + nl + "\t\t<penetration>3</penetration>" + nl +
+		  "\t\t<tag>body</tag>" + nl + "\t\t<no-collide-with-tag>body</no-collide-with-tag>" + nl + "\t</per-triangle-shape>" + nl
+		: "\t<per-vertex-shape name=\"" + shape + "\">" + nl + "\t\t<margin>1</margin>" + nl +
+		  "\t\t<tag>cloth</tag>" + nl + "\t\t<no-collide-with-tag>cloth</no-collide-with-tag>" + nl + "\t</per-vertex-shape>" + nl;
+	text.insert(at, e);
+	if (!SaveXml(text)) return;
+	AddLog(2, std::string("added a ") + (perTriangle ? "body" : "cloth") + " collision shape on " + shape + " to " + gItem.xmlPath);
+	LoadItem(gItem.nifPath);
+}
+
 // Takes shapes out of the NIF (nifclean.h: what only they used goes too), keeping the old NIF (backup.h), and reloads.
 // A deleted proxy's collisions go back to its full mesh in the XML; another shape the XML names is reported.
 static void DeleteShapes(const std::vector<std::pair<std::string, int>>& targets)
@@ -2342,8 +2362,25 @@ static void Panels(float fps)
 					ImGui::PopID();
 				}
 				Help("The XML's per-vertex (cloth) and per-triangle (body) collision shapes. The box picks which of the NIF's shapes each one collides with; Delete takes it out of the XML. The XML is kept first; then it reloads.");
+				// Add: on the first NIF shape no collision uses yet (else the first), to be picked in its box after.
+				int add = 0;
+				ImGui::BeginDisabled(names.empty());
+				if (ImGui::SmallButton("Add body collision")) add = 2;
+				ImGui::SameLine();
+				if (ImGui::SmallButton("Add cloth collision")) add = 1;
+				ImGui::EndDisabled();
+				Help("Adds a collision shape to the XML: body (per-triangle: what the cloth rests against) or cloth (per-vertex: what moves). Then pick its shape in its box above.");
 				if (confirmedXml >= 0) { int k = confirmedXml; confirmedXml = pendingXml = -1; EditXmlCollision(k, ""); }
 				else if (pointIndex >= 0) EditXmlCollision(pointIndex, pointTo);
+				else if (add && !names.empty()) {
+					std::string shape = names[0];
+					for (auto& n : names) {
+						bool used = false;
+						for (auto& c : list) used |= _stricmp(n.c_str(), c.name.c_str()) == 0;
+						if (!used) { shape = n; break; }
+					}
+					AddXmlCollision(add == 2, shape);
+				}
 			}
 			std::vector<std::string> shapes;
 			for (auto& s : gItem.shapes)
@@ -2535,7 +2572,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	bool addBoneLists = false;
 	bool genProxies = false, useProxies = false, fixXmlPath = false, removeSkeleton = false;
 	int xmlCollision = -1;          // --xml-collision k [shape]: the XML's collision shape k pointed at shape, or "-" deleted (testing)
-	std::string xmlCollisionTo;
+	std::string xmlCollisionTo, xmlAdd, xmlAddShape;
 	std::vector<std::string> proxyShapes;   // --proxy-shape: the Shapes list's Generate proxies button, for these, pressed once
 	float stroke[4] = { -1, 0, 0, 0 };   // --paint-stroke x0 y0 x1 y1 (window fractions): a simulated brush drag from frame 60 to 120, for testing
 	bool buildAfterStroke = false;
@@ -2586,6 +2623,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--use-proxies") useProxies = true;   // testing: the Point the XML at them button, pressed once
 		else if (a == "--fix-xml-path") fixXmlPath = true;   // testing: the Point the NIF at this XML button, pressed once
 		else if (a == "--remove-skeleton") removeSkeleton = true;   // testing: the Remove the copied skeleton button, pressed once
+		else if (a == "--xml-add") { xmlAdd = next(); xmlAddShape = next(); }   // testing: --xml-add body|cloth shape
 		else if (a == "--xml-collision") { xmlCollision = atoi(next().c_str()); xmlCollisionTo = next(); if (xmlCollisionTo == "-") xmlCollisionTo.clear(); }
 		else if (a == "--async") gAsyncStep = true;
 		else if (a == "--paint-stroke") for (int k = 0; k < 4; k++) stroke[k] = (float)atof(next().c_str());
@@ -2607,6 +2645,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	if (useProxies && gItem.loaded) UseProxiesInXml();
 	if (fixXmlPath && gItem.loaded && !gXmlFixPath.empty()) FixXmlPath();
 	if (removeSkeleton && gItem.loaded && gCopiedSkeleton.ok && !gCopiedSkeleton.removed.empty()) RemoveCopiedSkeleton();
+	if (!xmlAdd.empty() && gItem.loaded && !gItem.xmlPath.empty()) AddXmlCollision(xmlAdd == "body", xmlAddShape);
 	if (xmlCollision >= 0 && gItem.loaded && !gItem.xmlPath.empty()) EditXmlCollision(xmlCollision, xmlCollisionTo);
 	if (genProxies && !gMissingProxies.empty()) maker::GenerateProxies(gItem.nifPath, gItem.xmlPath, gMissingProxies, 3.0f);
 	if (!proxyShapes.empty() && gItem.loaded) maker::GenerateProxies(gItem.nifPath, gItem.xmlPath, proxyShapes, 1.0f, 1000);
