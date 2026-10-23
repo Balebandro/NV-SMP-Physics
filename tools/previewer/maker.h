@@ -978,7 +978,20 @@ namespace maker
 		if (!any && !(gM.paintTab && gM.paintOn)) return false;
 		std::vector<float> r(s.verts.size(), 0.62f), g(s.verts.size(), 0.62f), b(s.verts.size(), 0.64f);
 		if (hovered) std::fill(r.begin(), r.end(), 0.95f), std::fill(g.begin(), g.end(), 0.95f), std::fill(b.begin(), b.end(), 0.95f);
-		for (size_t ci = 0; ci < gM.chains.size(); ci++) {
+		// The selected chain's shape: its paint as a weights heat map (as the rig previewer's: dark blue none, blue little,
+		// yellow half, red all), masked vertices dark grey. Other shapes, or no chain selected: each chain in its colour.
+		const bool heat = gM.selected >= 0 && gM.selected < (int)gM.chains.size() && gM.chains[gM.selected].shape == name;
+		if (heat) {
+			const PaintChain& c = gM.chains[gM.selected];
+			for (size_t v = 0; v < s.verts.size(); v++) {
+				D3DCOLOR col = Heat(PaintAt(c, (int)v));
+				r[v] = ((col >> 16) & 255) / 255.0f; g[v] = ((col >> 8) & 255) / 255.0f; b[v] = (col & 255) / 255.0f;
+			}
+			if (auto it = gM.masks.find(name); it != gM.masks.end())
+				for (int v : it->second)
+					if (v < (int)s.verts.size()) { r[v] = 0.22f; g[v] = 0.22f; b[v] = 0.22f; }
+		}
+		for (size_t ci = 0; ci < gM.chains.size() && !heat; ci++) {
 			auto& c = gM.chains[ci];
 			if (c.shape != name) continue;
 			D3DCOLOR col = ChainColor(ci);
@@ -990,7 +1003,7 @@ namespace maker
 				r[v] += (cr - r[v]) * t; g[v] += (cg - g[v]) * t; b[v] += (cb - b[v]) * t;
 			}
 		}
-		if (auto it = gM.masks.find(name); it != gM.masks.end())
+		if (auto it = gM.masks.find(name); !heat && it != gM.masks.end())
 			for (int v : it->second)
 				if (v < (int)s.verts.size()) { r[v] = r[v] * 0.3f + 0.08f; g[v] = g[v] * 0.3f + 0.12f; b[v] = b[v] * 0.3f + 0.45f; }
 		V3 key = Norm(V3(0.35f, 0.6f, 0.7f));
@@ -1138,6 +1151,18 @@ namespace maker
 
 				// Weights: how much of the mesh follows the chain (the paint), evened out or grown and faded by its points.
 				ImGui::SeparatorText("Weights");
+				{
+					// The heat map's scale (the shape shows this chain's paint in it while the chain is selected).
+					ImDrawList* dl = ImGui::GetWindowDrawList();
+					ImVec2 p = ImGui::GetCursorScreenPos();
+					const float w = ImGui::GetContentRegionAvail().x, h = 8;
+					for (int k = 0; k < 64; k++) {
+						D3DCOLOR col = Heat(k / 63.0f);
+						dl->AddRectFilled(ImVec2(p.x + w * k / 64, p.y), ImVec2(p.x + w * (k + 1) / 64 + 1, p.y + h), IM_COL32((col >> 16) & 255, (col >> 8) & 255, col & 255, 255));
+					}
+					ImGui::Dummy(ImVec2(w, h));
+					ImGui::TextDisabled("none   little (blue)   half (yellow)   all (red)");
+				}
 				if (si >= 0 && ImGui::Button("Smooth the whole chain")) {
 					PushUndo();
 					SmoothChain(c, gItem.shapes[si]);
