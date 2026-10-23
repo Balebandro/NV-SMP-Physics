@@ -1048,7 +1048,9 @@ static std::set<std::string> XmlBoneNames()
 static void CheckCopiedSkeleton()
 {
 	gCopiedSkeleton = nifclean::Report();
-	if (gAnim.skeletonPath.empty() || !gItem.loaded) return;
+	// Not on a weapon: its own nodes (ProjectileNode, ShellCasingNode, ##SightingNode...) look unused to the check
+	// but the game needs them.
+	if (gAnim.skeletonPath.empty() || !gItem.loaded || gItem.scene.weapon) return;
 	try {
 		nif::File f;
 		f.load(gItem.nifPath);
