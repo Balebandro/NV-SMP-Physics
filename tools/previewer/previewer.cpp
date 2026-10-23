@@ -627,6 +627,7 @@ struct Anim
 	std::map<std::string, std::string> found;         // action ("forward") -> file, for the current stance
 	std::set<std::string> borrowed;                   // actions the stance lacks, played from unarmed
 	ClipPlay current, previous;
+	ClipPlay base;                    // the stance's standing pose under the other clips (a weapon walk without arms)
 	float blend = 1;                  // 0 at a switch .. 1 when the new clip has taken over
 	std::string customPath;
 	bool wasAnimating = false;
@@ -805,6 +806,9 @@ static void ApplyClips()
 	const kf::Clip* c = gAnim.current.clip;
 	if (c && !c->accumRoot.empty())
 		if (auto* root = Bone(c->accumRoot.c_str())) root->local = RE::NiTransform();
+	// The game plays a weapon stance's aim or idle on the upper body while moving: the stance's walks often have no
+	// arm tracks (Enhanced Animations' 2hr / 2ha ones), which without it stay at rest (a T pose). Under the rest.
+	if (gAnim.current.key != "idle" && gAnim.current.key != "custom") apply(gAnim.base, 1.0f);
 	if (gAnim.blend < 1 && gAnim.previous.clip) apply(gAnim.previous, 1.0f);
 	apply(gAnim.current, gAnim.blend < 1 && gAnim.previous.clip ? gAnim.blend : 1.0f);
 	for (auto& [n, p] : pose) {
@@ -907,6 +911,12 @@ static void UpdateMotion(float dt)
 		float rate = gS.speedScale;
 		Advance(gAnim.current, dt * rate);
 		Advance(gAnim.previous, dt * rate);
+		if (const std::string idle = gAnim.found.count("idle") ? gAnim.found["idle"] : std::string(); gAnim.base.path != idle) {
+			if (idle.empty()) gAnim.base = ClipPlay();
+			else Play(gAnim.base, "idle", idle);
+			gAnim.base.path = idle;   // not tried again every frame when it cannot be read
+		}
+		Advance(gAnim.base, dt * rate);
 		gAnim.blend = std::min(1.0f, gAnim.blend + dt / 0.25f);
 		ApplyClips();
 		// The body travels as the clip does; the preset's speed only where a clip has no root motion.
