@@ -286,6 +286,15 @@ namespace maker
 		return o.str();
 	}
 
+	// The recipe a Maker build left beside its physics XML (<xml>.smprecipe), or empty.
+	static std::string RecipeOf(const std::string& xml)
+	{
+		if (xml.empty()) return "";
+		std::error_code ec;
+		std::string r = xml + ".smprecipe";
+		return fs::exists(r, ec) ? r : "";
+	}
+
 	// Loads a recipe: opens its source NIF in the previewer and puts the settings back on the shapes of the same names.
 	static bool LoadRecipe(const std::string& path)
 	{
@@ -1482,6 +1491,15 @@ namespace maker
 		if (!gM.open) return;
 		// A plain NIF opened in the view becomes the source (unless chains are painted on the current one).
 		if (gItem.loaded && gItem.nifPath != gM.source && !gM.running && (gM.source.empty() || (gM.chains.empty() && gItem.scene.physicsFile.empty()))) Capture();
+		// An SMP NIF the Maker built (its recipe beside its physics XML): its chains are brought back to edit, once, when none
+		// are open (so the result a build opens stays): the recipe reopens the original NIF with them; building replaces the
+		// SMP version.
+		static std::string recipeTried;
+		if (gItem.loaded && !gM.running && !gItem.scene.physicsFile.empty() && gItem.nifPath != recipeTried && gM.chains.empty()) {
+			recipeTried = gItem.nifPath;
+			const std::string recipe = RecipeOf(gItem.xmlPath);
+			if (!recipe.empty()) { AddLog(2, "this NIF was built by the Maker: its chains are loaded to edit (from " + recipe + ")"); LoadRecipe(recipe); }
+		}
 		ImGuiIO& io = ImGui::GetIO();
 		ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 488, 8), ImGuiCond_FirstUseEver);
 		ImGui::SetNextWindowSize(ImVec2(480, io.DisplaySize.y - 190), ImGuiCond_FirstUseEver);
@@ -1498,7 +1516,15 @@ namespace maker
 		if (gM.source.empty()) ImGui::TextWrapped("Open the armour in the previewer (Open NIF...), then click Use the open NIF.");
 		else {
 			ImGui::TextWrapped("Source: %s", gM.source.c_str());
-			if (gM.sourceHasPhysics) ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "This NIF already has SMP physics. Build from the original armour;\nhere, only collision proxies can be added (Outfit, colliders only).");
+			if (gM.sourceHasPhysics) {
+				const std::string recipe = gItem.nifPath == gM.source ? RecipeOf(gItem.xmlPath) : std::string();
+				if (!recipe.empty()) {
+					ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "Built by the Maker: its chains can be edited.");
+					if (ImGui::Button("Edit its chains")) LoadRecipe(recipe);
+					Help("Loads its recipe: the original NIF opens with the chains, their points and the settings; Build makes the SMP version again (the old one kept as .bak).");
+				} else
+					ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "This NIF already has SMP physics, not made in the Maker (no recipe beside\nits XML). Build from the original armour; here, only collision proxies can\nbe added (Outfit, colliders only).");
+			}
 		}
 
 		if (ImGui::BeginTabBar("modes")) {
