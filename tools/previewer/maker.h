@@ -85,6 +85,7 @@ namespace maker
 		float reach = 8, amount = 0.25f;    // grow / fade around the point: how far, how much per click
 		struct Snapshot { std::vector<PaintChain> chains; int selected, point; std::map<std::string, std::set<int>> masks; };
 		std::deque<Snapshot> undo;          // the chains before each edit, newest last (Ctrl+Z), at most kUndo
+		std::deque<Snapshot> redo;          // what Ctrl+Z took back, newest last (Ctrl+Y); a new edit clears it
 		bool stroking = false;
 		bool hit = false;
 		V3 hitPoint, hitNormal;
@@ -123,22 +124,38 @@ namespace maker
 	static State gM;
 
 	// Undo: a copy of the chains before each edit (a brush stroke, smoothing, grow / fade, deleting, loading a recipe).
+	// Redo: what an undo took back; a new edit clears it.
 	constexpr size_t kUndo = 50;
-	static void PushUndo()
+	static State::Snapshot Current() { return { gM.chains, gM.selected, gM.point, gM.masks }; }
+	static void Restore(State::Snapshot& s)
 	{
-		gM.undo.push_back({ gM.chains, gM.selected, gM.point, gM.masks });
-		if (gM.undo.size() > kUndo) gM.undo.pop_front();
-	}
-	static void Undo()
-	{
-		if (gM.undo.empty()) { AddLog(3, "nothing to undo"); return; }
-		auto& s = gM.undo.back();
 		gM.chains = std::move(s.chains);
 		gM.selected = s.selected < (int)gM.chains.size() ? s.selected : -1;
 		gM.point = s.point;
 		gM.masks = std::move(s.masks);
+	}
+	static void PushUndo()
+	{
+		gM.undo.push_back(Current());
+		if (gM.undo.size() > kUndo) gM.undo.pop_front();
+		gM.redo.clear();
+	}
+	static void Undo()
+	{
+		if (gM.undo.empty()) { AddLog(3, "nothing to undo"); return; }
+		gM.redo.push_back(Current());
+		Restore(gM.undo.back());
 		gM.undo.pop_back();
-		AddLog(2, "undone (" + std::to_string(gM.undo.size()) + " more to undo)");
+		AddLog(2, "undone (" + std::to_string(gM.undo.size()) + " more to undo, " + std::to_string(gM.redo.size()) + " to redo)");
+	}
+	static void Redo()
+	{
+		if (gM.redo.empty()) { AddLog(3, "nothing to redo"); return; }
+		gM.undo.push_back(Current());
+		if (gM.undo.size() > kUndo) gM.undo.pop_front();
+		Restore(gM.redo.back());
+		gM.redo.pop_back();
+		AddLog(2, "redone (" + std::to_string(gM.redo.size()) + " more to redo)");
 	}
 
 	static const D3DCOLOR kChainColors[] = { D3DCOLOR_ARGB(255, 255, 120, 40), D3DCOLOR_ARGB(255, 60, 200, 255), D3DCOLOR_ARGB(255, 120, 230, 90),
@@ -212,7 +229,7 @@ namespace maker
 	{
 		std::vector<ShapeRow> old = std::move(gM.shapes);
 		gM.shapes.clear();
-		if (gItem.nifPath != gM.source) { gM.chains.clear(); gM.selected = -1; gM.point = -1; gM.masks.clear(); gM.undo.clear(); }   // another NIF: its chains, masks and history go
+		if (gItem.nifPath != gM.source) { gM.chains.clear(); gM.selected = -1; gM.point = -1; gM.masks.clear(); gM.undo.clear(); gM.redo.clear(); }   // another NIF: its chains, masks and history go
 		gM.source = gItem.nifPath;
 		gM.sourceHasPhysics = !gItem.scene.physicsFile.empty();
 		for (auto& s : gItem.shapes) {
@@ -838,6 +855,9 @@ namespace maker
 		}
 		while (gM.undo.size() > before) Undo();
 		report("all undone");
+		while (!gM.redo.empty()) Redo();
+		report("all redone");
+		while (gM.undo.size() > before) Undo();
 		// Masked vertices keep their paint: every painted one masked, then a grow at point 2 (new vertices may still be taken in).
 		std::map<int, float> was = gM.chains[0].paint;
 		for (auto& [v, p] : was) gM.masks[gM.chains[0].shape].insert(v);
@@ -872,8 +892,11 @@ namespace maker
 	{
 		gM.hit = false;
 		if (!Painting()) { gM.stroking = false; return; }
-		// Ctrl+Z: the last edit undone (not mid-stroke, nor while typing in a field).
-		if (forced < 0 && !gM.stroking && ImGui::GetIO().KeyCtrl && !ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Z, true)) Undo();
+		// Ctrl+Z: the last edit undone; Ctrl+Y: redone (not mid-stroke, nor while typing in a field).
+		if (forced < 0 && !gM.stroking && ImGui::GetIO().KeyCtrl && !ImGui::GetIO().WantTextInput) {
+			if (ImGui::IsKeyPressed(ImGuiKey_Z, true)) Undo();
+			else if (ImGui::IsKeyPressed(ImGuiKey_Y, true)) Redo();
+		}
 		ImGuiIO& io = ImGui::GetIO();
 		bool overUi = io.WantCaptureMouse && !gM.stroking && forced < 0;
 		int only = -1;
@@ -1082,8 +1105,8 @@ namespace maker
 		if (ImGui::Button("Undo")) Undo();
 		ImGui::EndDisabled();
 		ImGui::SameLine();
-		ImGui::TextDisabled("Ctrl+Z (%zu of %zu steps kept)", gM.undo.size(), kUndo);
-		Help("Undoes the last stroke, smoothing, grow or fade, deleted chain or loaded recipe; the last 50 are kept.");
+		ImGui::TextDisabled("Ctrl+Z / Ctrl+Y (%zu to undo, %zu to redo)", gM.undo.size(), gM.redo.size());
+		Help("Undo: the last stroke, smoothing, grow or fade, mask, deleted chain or loaded recipe; the last 50 are kept. Ctrl+Y redoes what Undo took back, until the next edit.");
 		ImGui::SliderFloat("Brush size", &gM.radius, 0.5f, 30, "%.1f units");
 		ImGui::SliderFloat("Brush strength", &gM.strength, 0.05f, 1, "%.2f");
 		Help("Below 1 the paint only partly follows the chain: a softer blend into the mesh's own weights.");
