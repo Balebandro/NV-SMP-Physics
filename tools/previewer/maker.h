@@ -12,6 +12,7 @@
 #include <sstream>
 #include <functional>
 #include <thread>
+#include <tuple>
 
 #include "backup.h"
 
@@ -72,10 +73,13 @@ namespace maker
 		bool open = false;
 		// painting
 		bool paintTab = true, paintOn = true;
-		int tool = 0;                       // 0 new chain, 1 add to the selected one, 2 erase from it
+		bool nifPose = true;                // painting shows the NIF's own pose, not the animation's frame
+		int tool = 0;                       // 0 new chain, 1 add to the selected one, 2 erase from it, 3 smooth it
 		float radius = 6, strength = 1;
 		std::vector<PaintChain> chains;
 		int selected = -1;
+		int point = -1;                     // the selected chain's selected point (0 where it is tied on), -1 none
+		float reach = 8, amount = 0.25f;    // grow / fade around the point: how far, how much per click
 		bool stroking = false;
 		bool hit = false;
 		V3 hitPoint, hitNormal;
@@ -662,6 +666,136 @@ namespace maker
 		return out;
 	}
 
+	// --- weights -----------------------------------------------------------------------------------------------------
+
+	// Each vertex's neighbours over the triangles, with vertices at the same spot in the NIF (UV and normal seams split
+	// them) joined, so smoothing runs across seams. Cached per shape (by name and vertex count).
+	static const std::vector<std::vector<int>>& Neighbours(const ShapeDraw& s)
+	{
+		static std::map<std::string, std::vector<std::vector<int>>> cache;
+		std::string key = (s.info.geometry->m_name ? s.info.geometry->m_name : "") + std::string("#") + std::to_string(s.verts.size());
+		auto it = cache.find(key);
+		if (it != cache.end()) return it->second;
+		const int n = (int)s.verts.size();
+		auto* d = s.info.geometry->data;
+		std::vector<int> weld(n);
+		std::map<std::tuple<int, int, int>, int> at;
+		for (int v = 0; v < n; v++) {
+			RE::NiPoint3 p = d && d->vertices && v < d->vertexCount ? d->vertices[v] : RE::NiPoint3{ s.verts[v].px, s.verts[v].py, s.verts[v].pz };
+			auto k = std::make_tuple((int)std::lround(p.x * 100), (int)std::lround(p.y * 100), (int)std::lround(p.z * 100));
+			weld[v] = at.emplace(k, v).first->second;   // the first vertex at this spot stands for all of them
+		}
+		std::vector<std::set<int>> sets(n);
+		for (size_t t = 0; t + 2 < s.indices.size(); t += 3)
+			for (int a = 0; a < 3; a++)
+				for (int b = 0; b < 3; b++)
+					if (a != b) sets[weld[s.indices[t + a]]].insert(weld[s.indices[t + b]]);
+		auto& out = cache[key];
+		out.assign(n, {});
+		for (int v = 0; v < n; v++) {
+			for (int w : sets[weld[v]]) out[v].push_back(w);
+			if (weld[v] != v) out[v].push_back(weld[v]);   // a seam copy also leans on its twin
+		}
+		return out;
+	}
+
+	// The paint of a chain at a vertex (0 where it is not painted).
+	static float PaintAt(const PaintChain& c, int v) { auto it = c.paint.find(v); return it == c.paint.end() ? 0.0f : it->second; }
+	static void SetPaint(PaintChain& c, int v, float p) { if (p < 0.03f) c.paint.erase(v); else c.paint[v] = std::min(p, 1.0f); }
+
+	// Smoothing: each vertex moves toward its neighbours' average (unpainted ones count as 0), by `f` (0..1) each.
+	static void SmoothVertices(PaintChain& c, const ShapeDraw& s, const std::vector<std::pair<int, float>>& verts)
+	{
+		const auto& nb = Neighbours(s);
+		std::vector<std::pair<int, float>> next;
+		for (auto& [v, f] : verts) {
+			if (v >= (int)nb.size() || nb[v].empty()) continue;
+			float sum = 0;
+			for (int w : nb[v]) sum += PaintAt(c, w);
+			float p = PaintAt(c, v);
+			next.push_back({ v, p + (sum / nb[v].size() - p) * f });
+		}
+		for (auto& [v, p] : next) SetPaint(c, v, p);
+	}
+
+	// The smoothing brush: the vertices under it, by its falloff and strength.
+	static void SmoothBrush(PaintChain& c, const ShapeDraw& s, V3 at)
+	{
+		float r2 = gM.radius * gM.radius;
+		std::vector<std::pair<int, float>> verts;
+		for (int v = 0; v < (int)s.verts.size(); v++) {
+			V3 d = VertexAt(s, v) - at;
+			float dd = Dot(d, d);
+			if (dd > r2) continue;
+			float f = 1 - dd / r2;
+			verts.push_back({ v, f * f * (3 - 2 * f) * gM.strength * 0.5f });
+		}
+		SmoothVertices(c, s, verts);
+	}
+
+	// The whole chain smoothed once: every painted vertex and the ones around it.
+	static void SmoothChain(PaintChain& c, const ShapeDraw& s)
+	{
+		const auto& nb = Neighbours(s);
+		std::set<int> region;
+		for (auto& [v, p] : c.paint) {
+			region.insert(v);
+			if (v < (int)nb.size()) for (int w : nb[v]) region.insert(w);
+		}
+		std::vector<std::pair<int, float>> verts;
+		for (int v : region) verts.push_back({ v, 0.5f });
+		SmoothVertices(c, s, verts);
+	}
+
+	// Grow or fade the chain's influence around one of its points: within `reach` of it, by `amount` at the point,
+	// falling off smoothly to nothing at the reach. Growing also takes in vertices not painted yet.
+	static void GrowAround(PaintChain& c, const ShapeDraw& s, V3 at, bool grow)
+	{
+		float r2 = gM.reach * gM.reach;
+		for (int v = 0; v < (int)s.verts.size(); v++) {
+			V3 d = VertexAt(s, v) - at;
+			float dd = Dot(d, d);
+			if (dd > r2) continue;
+			float f = 1 - dd / r2;
+			f = f * f * (3 - 2 * f) * gM.amount;
+			float p = PaintAt(c, v);
+			SetPaint(c, v, grow ? p + (1 - p) * f : p * (1 - f));
+		}
+	}
+
+	// --weights-test (testing): on the first chain, smoothing three times, then growing and fading at point 2, each
+	// logged as painted vertices, total paint and the largest step between neighbours (smoothing lowers it).
+	static void WeightsTest()
+	{
+		if (gM.chains.empty()) { AddLog(4, "weights test: no chain"); return; }
+		PaintChain& c = gM.chains[0];
+		int si = ShapeIndex(c.shape);
+		if (si < 0) { AddLog(4, "weights test: the chain's shape is gone"); return; }
+		const ShapeDraw& s = gItem.shapes[si];
+		auto report = [&](const char* what) {
+			const auto& nb = Neighbours(s);
+			float total = 0, step = 0;
+			for (auto& [v, p] : c.paint) {
+				total += p;
+				if (v < (int)nb.size()) for (int w : nb[v]) step = std::max(step, std::fabs(p - PaintAt(c, w)));
+			}
+			char b[160];
+			snprintf(b, sizeof b, "weights test, %s: %zu vertices, paint %.2f, largest neighbour step %.2f", what, c.paint.size(), total, step);
+			AddLog(2, b);
+		};
+		report("painted");
+		for (int i = 0; i < 3; i++) SmoothChain(c, s);
+		report("smoothed x3");
+		auto points = PlannedBones(s, c);
+		if (points.size() > 2) {
+			gM.reach = 8; gM.amount = 0.5f;
+			GrowAround(c, s, points[2], true);
+			report("grown at point 2");
+			GrowAround(c, s, points[2], false);
+			report("faded at point 2");
+		}
+	}
+
 	static void Brush(PaintChain& c, const ShapeDraw& s, V3 at, bool erase)
 	{
 		float r2 = gM.radius * gM.radius;
@@ -706,6 +840,7 @@ namespace maker
 				c.shape = name;
 				gM.chains.push_back(c);
 				gM.selected = (int)gM.chains.size() - 1;
+				gM.point = -1;
 			} else if (gM.selected < 0 || gM.chains[gM.selected].shape != name) {
 				AddLog(3, gM.selected < 0 ? "select a chain to add to or erase from" : "the selected chain is on " + gM.chains[gM.selected].shape + ": paint on that shape");
 				return;
@@ -717,7 +852,8 @@ namespace maker
 		if (si < 0) { gM.stroking = false; return; }
 		const ShapeDraw& s = gItem.shapes[si];
 		if (gM.hit) {
-			Brush(c, s, gM.hitPoint, gM.tool == 2);
+			if (gM.tool == 3) SmoothBrush(c, s, gM.hitPoint);
+			else Brush(c, s, gM.hitPoint, gM.tool == 2);
 			// The stroke: a vertex every quarter brush, in the order painted.
 			if (gM.tool == 0) {
 				if (c.path.empty()) c.path.push_back(nearV);
@@ -805,12 +941,27 @@ namespace maker
 				points.push_back({ bones[k].x, bones[k].y, bones[k].z, k == 0 ? D3DCOLOR_ARGB(255, 150, 160, 180) : col });
 				if (k) { lines.push_back({ bones[k - 1].x, bones[k - 1].y, bones[k - 1].z, col }); lines.push_back({ bones[k].x, bones[k].y, bones[k].z, col }); }
 			}
+			// The selected point: a yellow cross and its reach as a ring facing the camera.
+			if ((int)ci == gM.selected && gM.point >= 0 && gM.point < (int)bones.size()) {
+				const D3DCOLOR yellow = D3DCOLOR_ARGB(255, 255, 230, 40);
+				V3 p = bones[gM.point], view = Norm(eye - p);
+				V3 u = Norm(Cross(view, std::fabs(view.z) < 0.9f ? V3(0, 0, 1) : V3(1, 0, 0))), w = Cross(view, u);
+				float arm = std::max(0.6f, gM.reach * 0.15f);
+				for (V3 a : { u, w }) { V3 p0 = p - a * arm, p1 = p + a * arm; lines.push_back({ p0.x, p0.y, p0.z, yellow }); lines.push_back({ p1.x, p1.y, p1.z, yellow }); }
+				const int seg = 40;
+				for (int i = 0; i < seg; i++) {
+					float a0 = 6.2831853f * i / seg, a1 = 6.2831853f * (i + 1) / seg;
+					V3 q0 = p + (u * std::cos(a0) + w * std::sin(a0)) * gM.reach, q1 = p + (u * std::cos(a1) + w * std::sin(a1)) * gM.reach;
+					lines.push_back({ q0.x, q0.y, q0.z, yellow });
+					lines.push_back({ q1.x, q1.y, q1.z, yellow });
+				}
+			}
 		}
 		if (gM.hit && Painting()) {
 			V3 n = gM.hitNormal, view = Norm(eye - gM.hitPoint);
 			if (Dot(n, view) < 0) n = n * -1.0f;
 			V3 u = Norm(Cross(n, std::fabs(n.z) < 0.9f ? V3(0, 0, 1) : V3(1, 0, 0))), w = Cross(n, u);
-			D3DCOLOR ring = gM.tool == 2 ? D3DCOLOR_ARGB(255, 255, 90, 90) : D3DCOLOR_ARGB(255, 255, 255, 255);
+			D3DCOLOR ring = gM.tool == 2 ? D3DCOLOR_ARGB(255, 255, 90, 90) : gM.tool == 3 ? D3DCOLOR_ARGB(255, 80, 220, 255) : D3DCOLOR_ARGB(255, 255, 255, 255);
 			const int seg = 32;
 			for (int i = 0; i < seg; i++) {
 				float a0 = 6.2831853f * i / seg, a1 = 6.2831853f * (i + 1) / seg;
@@ -834,10 +985,13 @@ namespace maker
 		}
 		ImGui::Checkbox("Paint (the body holds still)", &gM.paintOn);
 		Help("Left drag on the mesh paints. Right drag orbits, middle drag pans, the wheel zooms, as always.");
+		ImGui::Checkbox("Show the NIF's pose", &gM.nifPose);
+		Help("While painting, the item as it was modelled (what the build reads), not the animation's frame. Off: the pose the animation was in.");
 		ImGui::RadioButton("New chain", &gM.tool, 0); ImGui::SameLine();
 		ImGui::RadioButton("Add to selected", &gM.tool, 1); ImGui::SameLine();
-		ImGui::RadioButton("Erase", &gM.tool, 2);
-		Help("New chain: each stroke is a new chain, laid along the stroke. Add: paints more of the mesh onto the selected chain (its bones stay). Erase: takes paint off the selected chain.");
+		ImGui::RadioButton("Erase", &gM.tool, 2); ImGui::SameLine();
+		ImGui::RadioButton("Smooth", &gM.tool, 3);
+		Help("New chain: each stroke is a new chain, laid along the stroke. Add: paints more of the mesh onto the selected chain (its bones stay). Erase: takes paint off the selected chain. Smooth: evens out the selected chain's paint under the brush (hard edges blend, spots fill in).");
 		ImGui::SliderFloat("Brush size", &gM.radius, 0.5f, 30, "%.1f units");
 		ImGui::SliderFloat("Brush strength", &gM.strength, 0.05f, 1, "%.2f");
 		Help("Below 1 the paint only partly follows the chain: a softer blend into the mesh's own weights.");
@@ -852,7 +1006,7 @@ namespace maker
 			ImGui::SameLine();
 			char label[160];
 			snprintf(label, sizeof label, "Chain %zu on %s (%zu vertices)", i + 1, c.shape.c_str(), c.paint.size());
-			if (ImGui::Selectable(label, gM.selected == (int)i)) gM.selected = (int)i;
+			if (ImGui::Selectable(label, gM.selected == (int)i)) { if (gM.selected != (int)i) gM.point = -1; gM.selected = (int)i; }
 			if (gM.selected == (int)i) {
 				ImGui::Indent();
 				int si = ShapeIndex(c.shape);
@@ -866,6 +1020,41 @@ namespace maker
 				Help("0 swings freely like a rope or a tassel; 0.4 a strap or a flap; 0.8 and up holds its modelled shape and only bounces (a stiff collar, a holster flap).");
 				ImGui::SliderFloat("Weight", &c.weight, 0, 1, "%.2f");
 				Help("0 light and lively (ribbons, hair; the wind moves it); 1 heavy and calm (leather, chain, a weighted end).");
+
+				// Weights: how much of the mesh follows the chain (the paint), evened out or grown and faded by its points.
+				ImGui::SeparatorText("Weights");
+				if (si >= 0 && ImGui::Button("Smooth the whole chain")) {
+					SmoothChain(c, gItem.shapes[si]);
+					AddLog(2, "chain " + std::to_string(i + 1) + " smoothed: " + std::to_string(c.paint.size()) + " vertices");
+				}
+				Help("Evens out the chain's paint everywhere at once (each click a bit more). The Smooth brush does it where you paint.");
+				if (gM.point > c.links) gM.point = -1;
+				ImGui::TextUnformatted("Point:");
+				for (int k = 0; k <= c.links; k++) {
+					ImGui::SameLine();
+					char pl[24];
+					if (k == 0) snprintf(pl, sizeof pl, "Tie-on##p0");
+					else snprintf(pl, sizeof pl, "%d##p%d", k, k);
+					if (ImGui::RadioButton(pl, gM.point == k)) gM.point = gM.point == k ? -1 : k;
+				}
+				Help("Pick one of the chain's points (drawn yellow on the mesh, its reach as a ring), then grow or fade how much of the mesh around it follows the chain.");
+				ImGui::SliderFloat("Reach", &gM.reach, 1, 40, "%.1f units");
+				ImGui::SliderFloat("Amount", &gM.amount, 0.05f, 1, "%.2f");
+				Help("Reach: how far from the point it works, fading to nothing at the edge. Amount: how much each click does at the point itself.");
+				ImGui::BeginDisabled(gM.point < 0 || si < 0);
+				const bool grow = ImGui::Button("Grow influence");
+				ImGui::SameLine();
+				const bool fade = ImGui::Button("Fade influence");
+				ImGui::EndDisabled();
+				if ((grow || fade) && si >= 0 && gM.point >= 0) {
+					auto points = PlannedBones(gItem.shapes[si], c);
+					if (gM.point < (int)points.size()) {
+						GrowAround(c, gItem.shapes[si], points[gM.point], grow);
+						AddLog(2, std::string("chain ") + std::to_string(i + 1) + (grow ? ": influence grown" : ": influence faded") + " around point " +
+							(gM.point == 0 ? std::string("tie-on") : std::to_string(gM.point)) + " (" + std::to_string(c.paint.size()) + " vertices)");
+					}
+				}
+				Help("Grow: more of the mesh around the point follows the chain (vertices not painted yet are taken in). Fade: less of it does, blending back into the mesh's own weights.");
 				if (ImGui::Button("Delete chain")) { gM.chains.erase(gM.chains.begin() + i); gM.selected = -1; ImGui::Unindent(); ImGui::PopID(); break; }
 				ImGui::Unindent();
 			}

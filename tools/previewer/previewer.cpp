@@ -1287,18 +1287,31 @@ static V3 CameraEye()
 
 // --- drawing ----------------------------------------------------------------------------------------------
 
+// The Maker paints on the NIF's own pose (set each frame while it paints): every shape as it was modelled, the skin's
+// frame at its root parent (rootParent's world x NiSkinData::rootParentToSkin inverted), so it stays with the actor.
+static bool gNifPose = false;
+
+static RE::NiTransform NifPoseTransform(RE::NiGeometry* g)
+{
+	auto* skin = g->skinInstance;
+	if (!skin || !skin->skinData) return g->world;
+	return (skin->rootParent ? skin->rootParent->world : g->world) * skin->skinData->rootParentToSkin.Invert();
+}
+
 static void SkinShape(ShapeDraw& s)
 {
 	auto* g = s.info.geometry;
 	int n = (int)s.verts.size();
 	bool hasNormals = (int)s.info.normals.size() == n;
+	const bool skinned = g->skinInstance && !gNifPose;
+	const RE::NiTransform pose = gNifPose ? NifPoseTransform(g) : g->world;
 	for (int v = 0; v < n; v++) {
-		RE::NiPoint3 p = g->skinInstance ? scene::SkinVertex(g, v, s.weights) : g->world * g->data->vertices[v];
+		RE::NiPoint3 p = skinned ? scene::SkinVertex(g, v, s.weights) : pose * g->data->vertices[v];
 		auto& o = s.verts[v];
 		o.px = p.x; o.py = p.y; o.pz = p.z;
 		if (hasNormals) {
-			RE::NiPoint3 nn = g->skinInstance ? scene::SkinNormal(g, s.info.normals[v], v, s.weights)
-			                                  : g->world.rotate * RE::NiPoint3{ s.info.normals[v].x, s.info.normals[v].y, s.info.normals[v].z };
+			RE::NiPoint3 nn = skinned ? scene::SkinNormal(g, s.info.normals[v], v, s.weights)
+			                          : pose.rotate * RE::NiPoint3{ s.info.normals[v].x, s.info.normals[v].y, s.info.normals[v].z };
 			o.nx = nn.x; o.ny = nn.y; o.nz = nn.z;
 		}
 		if (v < (int)s.info.uvs.size()) { o.u = s.info.uvs[v].first; o.v = s.info.uvs[v].second; }
@@ -2330,6 +2343,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	std::vector<std::string> proxyShapes;   // --proxy-shape: the Shapes list's Generate proxies button, for these, pressed once
 	float stroke[4] = { -1, 0, 0, 0 };   // --paint-stroke x0 y0 x1 y1 (window fractions): a simulated brush drag from frame 60 to 120, for testing
 	bool buildAfterStroke = false;
+	bool weightsTest = false;   // --weights-test: after the stroke, smooth the chain and grow / fade it at point 2, logging the paint, for testing
 	int shotEvery = 20, shotCount = 0;
 	bool noUi = false, exitAfter = false;
 	for (size_t i = 0; i < args.size(); i++) {
@@ -2378,6 +2392,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--remove-skeleton") removeSkeleton = true;   // testing: the Remove the copied skeleton button, pressed once
 		else if (a == "--async") gAsyncStep = true;
 		else if (a == "--paint-stroke") for (int k = 0; k < 4; k++) stroke[k] = (float)atof(next().c_str());
+		else if (a == "--weights-test") weightsTest = true;
 		else if (a == "--show") {
 			std::string s = next();
 			gS.showBones = s.find("bones") != std::string::npos;
@@ -2440,6 +2455,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		if (gItem.loaded) {
 			float simDt = (jitterOut.empty() && clipOut.empty() && clipMeshOut.empty()) || gRealtime ? dt * gS.timeScale : gMeasureStep;   // measuring: a fixed step, comparable runs (--realtime: the real one)
 			const bool painting = maker::Painting();   // the body holds still under the brush
+			gNifPose = painting && maker::gM.nifPose;  // and is shown in the NIF's own pose
 			UpdateMotion(painting ? 0.0f : simDt);
 			UpdateWind(wallTime);
 			if (gAsyncStep) {
@@ -2876,6 +2892,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 			float th = std::tan(0.75f / 2);
 			float mx = io.MousePos.x / std::max(1L, rc.right), my = io.MousePos.y / std::max(1L, rc.bottom);
 			int forced = -1;
+			if (weightsTest && frameNo == 130) maker::WeightsTest();
 			if (stroke[0] >= 0 && frameNo >= 60 && frameNo <= 121) {
 				float t = std::min(1.0f, (frameNo - 60) / 60.0f);
 				mx = stroke[0] + (stroke[2] - stroke[0]) * t; my = stroke[1] + (stroke[3] - stroke[1]) * t;
