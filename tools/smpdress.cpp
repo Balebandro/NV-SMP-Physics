@@ -149,7 +149,7 @@ struct PaintChain {
 };
 
 struct Job {
-	enum Kind { Cloth, Chains, Painted } kind;
+	enum Kind { Cloth, Chains, Painted, Pieces } kind;
 	std::string shape;
 	std::string anchor = "Bip01 Pelvis";
 	float top = -1e9f;
@@ -167,6 +167,8 @@ struct Job {
 	bool neckSet = false;      // --neck x y z (default: the centre of the shape's top 4 units)
 	Vec3 neck;
 	std::vector<PaintChain> painted;   // --painted "Shape" file.smppaint: the shape's chains from the file
+	std::string groups;        // --groups "0,1|2|3" (--pieces): the pieces of each rigid body, top first
+	Vec3 up{ 0, 0, 1 };        // --up x y z (--pieces): which way is up in the shape's space
 };
 
 // Reads the chains of one shape from a .smppaint file (written by the NV SMP Maker):
@@ -572,6 +574,43 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 	bool strips = f.typeOf(geom.data) == "NiTriStripsData";
 	GeometryData gd;
 	gd.read(f.blocks[geom.data], strips);
+	// An unskinned shape (a weapon charm, a rigid prop) is skinned first, all of it on the anchor: a node of that name
+	// in the NIF, else a new one on the root where the root is (a weapon's "Weapon": its NIF's space is that node's).
+	// The shape's own transform becomes the skin transform, and its shader is told it is skinned.
+	if (geom.skin < 0) {
+		int anchorBlk = findBlockByName(f, job.anchor);
+		if (anchorBlk >= 0 && !isNodeType(f.typeOf(anchorBlk))) throw std::runtime_error(job.anchor + " is not a node");
+		if (anchorBlk < 0) {
+			AVObject node;
+			node.isNode = true;
+			node.name = f.addString(job.anchor);
+			Writer w;
+			node.write(w);
+			anchorBlk = f.addBlock("NiNode", w.b);
+			root.children.push_back(anchorBlk);
+		}
+		SkinData nsd;
+		nsd.skinTransform = geom.av.local;
+		nsd.bones.resize(1);
+		std::vector<Weights> one(gd.vertices.size(), Weights{ { 0, 1.0f } });
+		for (size_t v = 0; v < gd.vertices.size(); v++) nsd.bones[0].weights.push_back({ (uint16_t)v, 1.0f });
+		SkinInstance nsi;
+		nsi.data = f.addBlock("NiSkinData", nsd.write());
+		nsi.partition = f.addBlock("NiSkinPartition", buildPartition(one, gd.triangles, 1).write());
+		nsi.skeletonRoot = f.roots[0];
+		nsi.bones = { anchorBlk };
+		geom.skin = f.addBlock("NiSkinInstance", nsi.write());
+		geom.av.local = Transform();
+		for (auto p : geom.av.properties) {
+			const std::string& t = f.typeOf(p);
+			if (t.rfind("BSShader", 0) != 0 || t == "BSShaderTextureSet") continue;
+			Reader r(f.blocks[p].data(), f.blocks[p].size());
+			r.u32(); r.skip(4 * r.u32()); r.i32(); r.u16(); r.u32();   // name, extra data, controller, flags, shader type
+			f.blocks[p][r.pos] |= 0x02;                                  // shader flags: Skinned
+		}
+		f.blocks[shapeBlock] = geom.write();
+		printf("  %s had no skin: skinned to %s\n", job.shape.c_str(), job.anchor.c_str());
+	}
 	bool dism = f.typeOf(geom.skin) == "BSDismemberSkinInstance";
 	SkinInstance si;
 	si.read(f.blocks[geom.skin], dism);
@@ -580,7 +619,7 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 	SkinPartition sp;
 	sp.read(f.blocks[si.partition]);
 	size_t nv = gd.vertices.size();
-	printf("\n%s '%s': %zu verts, %zu tris, %zu bones, %zu partitions\n", job.kind == Job::Cloth ? "cloth" : job.kind == Job::Painted ? "painted chains" : "chains", job.shape.c_str(),
+	printf("\n%s '%s': %zu verts, %zu tris, %zu bones, %zu partitions\n", job.kind == Job::Cloth ? "cloth" : job.kind == Job::Painted ? "painted chains" : job.kind == Job::Pieces ? "pieces" : "chains", job.shape.c_str(),
 		nv, gd.triangles.size(), si.bones.size(), sp.parts.size());
 	for (auto b : si.bones) if (strName(f, b).rfind("SMP ", 0) == 0) throw std::runtime_error("shape already has SMP bones");
 
@@ -634,7 +673,7 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 	float zMax = -1e9f, zMin = 1e9f;
 	for (auto& p : pos) { zMax = std::max(zMax, p.z); zMin = std::min(zMin, p.z); }
 	std::vector<Weights> neww = orig;
-	std::string tag = job.kind == Job::Cloth ? "Cape" : job.kind == Job::Painted ? "Paint" : "Rope";
+	std::string tag = job.kind == Job::Cloth ? "Cape" : job.kind == Job::Painted ? "Paint" : job.kind == Job::Pieces ? "Piece" : "Rope";
 	// Names stay unique across shapes of the outfit.
 	static int shapeIndex = 0;
 	char prefix[32];
@@ -774,6 +813,88 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 			}
 			printf("  kept %s's own weights: %d vertices static, %d blended\n", k.bone.c_str(), full, blended);
 		}
+	}
+	else if (job.kind == Job::Pieces) {
+		// A chain of rigid bodies made of the mesh's pieces (a charm: rings, links, a pendant): the pieces listed top
+		// first by their centre along --up, grouped by --groups ("0,1|2|3,4": groups split by |). The first group stays
+		// on the anchor (where it is tied on); each other group is one bone, all of its vertices on it, hanging from
+		// the group above at its own top, the last one the heavy end.
+		auto pieces = piecesOf(gd, pos);
+		auto along = [&](int v) { return dot(pos[v], job.up); };
+		struct Piece { std::vector<int> verts; float centre, lo, hi; };
+		std::vector<Piece> list;
+		for (auto& pc : pieces) {
+			Piece p{ pc, 0, 1e9f, -1e9f };
+			for (int v : pc) { float a = along(v); p.centre += a; p.lo = std::min(p.lo, a); p.hi = std::max(p.hi, a); }
+			p.centre /= pc.size();
+			list.push_back(p);
+		}
+		std::sort(list.begin(), list.end(), [](const Piece& a, const Piece& b) { return a.centre > b.centre; });
+		for (size_t k = 0; k < list.size(); k++) {
+			Vec3 c{};
+			for (int v : list[k].verts) c = c + pos[v];
+			c = c * (1.0f / list[k].verts.size());
+			printf("  piece %zu: %zu verts, centre (%.2f %.2f %.2f), up %.2f..%.2f\n", k, list[k].verts.size(), c.x, c.y, c.z, list[k].lo, list[k].hi);
+		}
+		std::vector<std::vector<int>> groups(1);
+		for (size_t at = 0; at <= job.groups.size(); ) {
+			size_t end = job.groups.find_first_of(",|", at);
+			if (end == std::string::npos) end = job.groups.size();
+			std::string tok = job.groups.substr(at, end - at);
+			if (!tok.empty()) {
+				int k = atoi(tok.c_str());
+				if (k < 0 || k >= (int)list.size()) throw std::runtime_error("--groups: no piece " + tok);
+				groups.back().push_back(k);
+			}
+			if (end < job.groups.size() && job.groups[end] == '|') groups.emplace_back();
+			at = end + 1;
+		}
+		if (job.groups.empty() || groups.size() < 2) throw std::runtime_error("--pieces needs --groups: the pieces above, the fixed group first, then each body's, split by |");
+		std::vector<int> used(list.size(), 0);
+		for (auto& g : groups) for (int k : g) if (used[k]++) throw std::runtime_error("--groups: piece " + std::to_string(k) + " is in two groups");
+		for (size_t k = 0; k < list.size(); k++) if (!used[k]) printf("  note: piece %zu is in no group: it stays on the anchor\n", k);
+		// A group's top: the centre of its vertices within 0.1 units of its highest point (where it hangs).
+		auto topOf = [&](const std::vector<int>& g) {
+			float hi = -1e9f;
+			for (int k : g) hi = std::max(hi, list[k].hi);
+			Vec3 c{}; int n = 0;
+			for (int k : g) for (int v : list[k].verts) if (along(v) > hi - 0.1f) { c = c + pos[v]; n++; }
+			return c * (1.0f / std::max(n, 1));
+		};
+		std::vector<std::string> names;
+		for (size_t gi = 1; gi < groups.size(); gi++) {
+			if (groups[gi].empty()) throw std::runtime_error("--groups: an empty group");
+			const bool last = gi + 1 == groups.size();
+			if (gi == 1) {   // where the chain is tied on: an anchor bone at the first body's top
+				NewBone a;
+				a.name = std::string(prefix) + " L0";
+				a.parent = job.anchor;
+				a.role = "anchor";
+				a.bind = topOf(groups[1]);
+				addBone(a);
+				names.push_back(a.name);
+				res.topBones.push_back(a.name);
+			}
+			NewBone b;
+			b.name = std::string(prefix) + " L" + std::to_string(gi);
+			b.parent = names.back();
+			b.role = last ? "end" : "rope";
+			b.bind = last ? topOf(groups[gi]) : topOf(groups[gi + 1]);   // its lower end: the next body hangs there
+			size_t nverts = 0;
+			for (int k : groups[gi]) for (int v : list[k].verts) { b.piecePts.push_back(pos[v]); nverts++; }
+			if (last) {   // the end's weight where its pieces are (a box around them, as rope ends have)
+				for (auto& p : b.piecePts) {
+					b.boxMin = { std::min(b.boxMin.x, p.x), std::min(b.boxMin.y, p.y), std::min(b.boxMin.z, p.z) };
+					b.boxMax = { std::max(b.boxMax.x, p.x), std::max(b.boxMax.y, p.y), std::max(b.boxMax.z, p.z) };
+				}
+				b.hasBox = true;
+			}
+			const int slot = addBone(b);
+			for (int k : groups[gi]) for (int v : list[k].verts) neww[v] = { { slot, 1.0f } };
+			names.push_back(b.name);
+			printf("  body %zu (%s): %zu verts, bone at (%.2f %.2f %.2f)\n", gi, b.role.c_str(), nverts, b.bind.x, b.bind.y, b.bind.z);
+		}
+		res.warp.push_back(names);
 	}
 	else if (job.kind == Job::Painted) {
 		// Each painted chain: links laid along its stroke (from where the painting started, the end that is tied on, to
@@ -1069,6 +1190,9 @@ int main(int argc, char** argv)
 			for (auto& pc : j.painted) pc.global = paintCount++;
 			jobs.push_back(j);
 		}
+		else if (a == "--pieces") { need(1); Job j; j.kind = Job::Pieces; j.shape = argv[++i]; jobs.push_back(j); }
+		else if (a == "--groups") { need(1); cur().groups = argv[++i]; }
+		else if (a == "--up") { need(3); cur().up = normalize({ (float)atof(argv[i + 1]), (float)atof(argv[i + 2]), (float)atof(argv[i + 3]) }); i += 3; }
 		else if (a == "--collide") { need(1); colliders.push_back(argv[++i]); }
 		else if (a == "--collide-skip") { need(1); collideSkip.push_back(argv[++i]); }
 		else if (a == "--proxy") { need(1); proxyCell = (float)atof(argv[++i]); }
