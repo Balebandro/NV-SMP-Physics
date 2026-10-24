@@ -1227,7 +1227,30 @@ static void ToggleProxy(const std::string& name, int occurrence)
 		nif::Geometry g;
 		g.read(f.blocks[blk]);
 		g.av.name = f.addString(to);
-		if (!unmark) g.av.flags &= ~1u;
+		// As smpdress --proxy makes them: hidden in NIF viewers by a never-pass alpha test (the game's shaders ignore it;
+		// the plugin hides proxies in game), in place of the shape's own alpha property, and its other properties its own
+		// copies (a shader property shared with the render mesh carried the test over to it, 2026-10-19). Unmarked, the
+		// never-pass test goes again (the shape's old alpha property is in the backup).
+		auto neverPass = [&](int p) {
+			const auto& b = f.blocks[p];
+			return f.typeOf(p) == "NiAlphaProperty" && b.size() >= 15 && *(const uint16_t*)&b[12] == (0x0200 | (7 << 10));
+		};
+		std::vector<int32_t> props;
+		for (auto p : g.av.properties) {
+			if (p < 0) continue;
+			if (unmark) { if (!neverPass(p)) props.push_back(p); continue; }
+			if (f.typeOf(p) == "NiAlphaProperty") continue;
+			nif::Bytes copy = f.blocks[p];
+			props.push_back(f.addBlock(f.typeOf(p), copy));
+		}
+		if (!unmark) {
+			g.av.flags &= ~1u;
+			nif::Writer a;
+			a.u32(0xFFFFFFFF); a.u32(0); a.i32(-1);   // no name, no extra data, no controller
+			a.u16(0x0200 | (7 << 10)); a.u8(255);
+			props.push_back(f.addBlock("NiAlphaProperty", a.b));
+		}
+		g.av.properties = props;
 		f.blocks[blk] = g.write();
 		std::string err, kept = backup::keep(gItem.nifPath, &err);
 		if (!err.empty()) { AddLog(4, "could not back up " + gItem.nifPath + ": " + err + " (nothing renamed)"); return; }
