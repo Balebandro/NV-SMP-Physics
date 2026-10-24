@@ -404,7 +404,30 @@ namespace hdt
 			body->setAngularVelocity(av);
 		}
 
+		// New Vegas: no CCD motion clamping (see createPredictiveContacts): a body stopped short of its step at what its
+		// sweep hit, after the solver, while the bodies jointed to it move the whole step, tore a chain apart at every touch.
+		auto& dispatchInfo = getDispatchInfo();
+		const bool continuous = dispatchInfo.m_useContinuous;
+		dispatchInfo.m_useContinuous = false;
 		btDiscreteDynamicsWorldMt::integrateTransforms(timeStep);
+		dispatchInfo.m_useContinuous = continuous;
+	}
+
+	// New Vegas: continuous collision (CCD bodies, <ccd>1</ccd> or a rigid piece) as Bullet's predictive contacts: a body
+	// whose step would carry it into a shape gets a contact there before the solver, solved with its joints, so it stops
+	// at the surface and its chain holds together (integrateTransforms does not clamp). Their manifolds are the
+	// dispatcher's, which solveConstraints frees with all the others each step: then the list is only forgotten here
+	// (releasing them again faulted, and the step guard turned the physics off). Kept contacts (a step that keeps them
+	// for the next, m_keepContacts) are still the dispatcher's, and are released as Bullet does.
+	void SkinnedMeshWorld::createPredictiveContacts(btScalar timeStep)
+	{
+		if (m_predictiveFreed)
+			m_predictiveManifolds.clear();
+		else
+			releasePredictiveContacts();
+		m_predictiveFreed = false;
+		if (m_nonStaticRigidBodies.size() > 0)
+			createPredictiveContactsInternal(&m_nonStaticRigidBodies[0], m_nonStaticRigidBodies.size(), timeStep);
 	}
 
 	void SkinnedMeshWorld::calculateSimulationIslands()
@@ -501,5 +524,6 @@ namespace hdt
 
 		// the HDT manifolds are still recreated every frame, clear to prevent stale data.
 		static_cast<CollisionDispatcher*>(m_dispatcher1)->clearAllManifold();
+		m_predictiveFreed = true;
 	}
 }

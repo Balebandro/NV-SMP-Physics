@@ -34,6 +34,7 @@ namespace hdt
 		std::vector<float> m_timeSteps;
 		bool m_reuseContacts = false;   // this step reuses the last step's contacts (m_collideOncePerFrame)
 		bool m_keepContacts = false;    // this step's contacts are kept for the next one
+		bool m_predictiveFreed = false;  // the last step's predictive contacts went with every manifold (solveConstraints)
 
 		void readTransform(float timeStep)
 		{
@@ -70,11 +71,8 @@ namespace hdt
 
 		void predictUnconstraintMotion(btScalar timeStep) override;
 		void integrateTransforms(btScalar timeStep) override;
-		// New Vegas: none. Bullet makes them for CCD bodies (<ccd>1</ccd>) whose sweep hits, as manifolds kept to the next
-		// step, but the dispatcher's manifold list is cleared every step here (no persistent manifolds), so releasing
-		// one faulted and the step guard turned the physics off. The CCD motion clamp in integrateTransforms stays; the
-		// next step's contacts push the body off what it was stopped at.
-		void createPredictiveContacts(btScalar) override {}
+		// New Vegas: continuous collision as Bullet's predictive contacts only (see the .cpp).
+		void createPredictiveContacts(btScalar timeStep) override;
 		void performDiscreteCollisionDetection() override;
 		void calculateSimulationIslands() override;
 		void solveConstraints(btContactSolverInfo& solverInfo) override;

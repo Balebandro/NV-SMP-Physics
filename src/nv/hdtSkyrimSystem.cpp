@@ -712,9 +712,9 @@ namespace hdt
 	//   - a body (per-triangle) mesh whose every vertex is on one animated bone (a weapon's wall proxy) gives that bone a
 	//     convex hull of those vertices, solid (a mesh spread over several bones, as a body's legs, is left alone);
 	//   - if the item has such a wall, each simulated bone that carries a rigid piece of a cloth (per-vertex) mesh (8+
-	//     vertices weighted 0.99+ to it alone: a charm's link, its pendant) collides as a solid with continuous collision
-	//     (see BoneTemplate::m_ccd): a convex hull of that piece, or its own shape from the XML when that is convex; these
-	//     pieces do not collide with each other.
+	//     vertices weighted 0.99+ to it alone: a charm's link, its pendant) collides as a solid: a convex hull of that
+	//     piece, or its own shape from the XML; these pieces do not collide with each other. No continuous collision: the
+	//     solid contacts hold well enough with the item-jump reset (prepareForRead), and a chain kept whole matters more.
 	// The meshes' own collision stays; this is added to it. Cloth and hair (blended weights, no rigid wall) are unchanged.
 	void SkyrimSystemCreator::addRigidPieceCollision()
 	{
@@ -764,20 +764,14 @@ namespace hdt
 				auto* bone = body->m_skinnedBones[slot].ptr;
 				if (!bone || bone->m_rig.isStaticOrKinematicObject() || skinPoints.size() < 8 ||
 					std::find(pieces.begin(), pieces.end(), bone) != pieces.end()) continue;
-				// A bone with its own shape (the XML's) keeps it, with continuous collision too when it is convex.
+				// A bone with its own shape (the XML's) keeps it.
 				const bool own = bone->m_shapeCollides;
 				if (!own) {
 					std::vector<btVector3> points;
 					for (auto& p : skinPoints) points.push_back(toRig(bone, body->m_skinnedBones[slot], p));
 					bone->m_rig.setCollisionShape(hullOf(points));
 					bone->m_shapeCollides = true;
-				} else if (!bone->m_rig.getCollisionShape()->isConvex())
-					continue;
-				btVector3 centre;
-				btScalar radius;
-				bone->m_rig.getCollisionShape()->getBoundingSphere(centre, radius);
-				bone->m_rig.setCcdMotionThreshold(radius * 0.5f);
-				bone->m_rig.setCcdSweptSphereRadius(radius * 0.5f);
+				}
 				pieces.push_back(bone);
 				logger::info("[SMP] {}: its piece on {} collides as a solid ({} vertices, {})", body->m_name.c_str(), bone->m_name.c_str(), skinPoints.size(),
 					own ? "the XML's shape" : "their hull");
