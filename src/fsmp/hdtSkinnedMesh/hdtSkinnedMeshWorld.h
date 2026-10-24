@@ -70,6 +70,11 @@ namespace hdt
 
 		void predictUnconstraintMotion(btScalar timeStep) override;
 		void integrateTransforms(btScalar timeStep) override;
+		// New Vegas: none. Bullet makes them for CCD bodies (<ccd>1</ccd>) whose sweep hits, as manifolds kept to the next
+		// step, but the dispatcher's manifold list is cleared every step here (no persistent manifolds), so releasing
+		// one faulted and the step guard turned the physics off. The CCD motion clamp in integrateTransforms stays; the
+		// next step's contacts push the body off what it was stopped at.
+		void createPredictiveContacts(btScalar) override {}
 		void performDiscreteCollisionDetection() override;
 		void calculateSimulationIslands() override;
 		void solveConstraints(btContactSolverInfo& solverInfo) override;

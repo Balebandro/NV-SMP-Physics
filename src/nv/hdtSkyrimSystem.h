@@ -29,6 +29,7 @@ namespace hdt
 		int findBoneIdx(const RE::BSFixedString& name);
 
 		float prepareForRead(float timeStep) override;
+		btVector3 modelOffset() const;
 
 		const std::vector<RE::BSTSmartPointer<SkinnedMeshBody>>& meshes() const { return m_meshes; }
 		// For drawing the system (the previewer).
@@ -42,6 +43,10 @@ namespace hdt
 
 		btQuaternion m_lastRootRotation;
 		btVector3 m_lastRootPosition;
+		// New Vegas: the item's root, and where it last was in the actor's frame (a jump of the item alone resets too).
+		RE::NiPointer<RE::NiAVObject> m_model;
+		btVector3 m_lastModelOffset;
+		bool m_haveModelOffset = false;
 
 		// New Vegas: the skin slots this system pointed at its own extra-bone nodes, put back on
 		// the skeleton root when it goes (so nothing renders with a node that is about to be freed).
@@ -160,6 +165,7 @@ namespace hdt
 			float m_gravityFactor = 1.0f;
 			float m_windFactor = 1.0f;
 			U32 m_collisionFilter = 0;
+			bool m_ccd = false;   // <ccd>1</ccd>: swept collision for a bone whose shape collides (small fast parts: a charm)
 		};
 
 		enum FrameType

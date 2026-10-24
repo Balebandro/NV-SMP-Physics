@@ -239,6 +239,13 @@ namespace hdt
 		return g_retiredSet.count(node) != 0;
 	}
 
+	// The item's root in the actor's frame (the skeleton root's).
+	btVector3 SkyrimSystem::modelOffset() const
+	{
+		const RE::NiPoint3 d = m_model->world.translate - m_skeleton->world.translate;
+		return convertNi(m_skeleton->world.rotate.Transpose() * d);
+	}
+
 	float SkyrimSystem::prepareForRead(float timeStep)
 	{
 		auto newRoot = m_skeleton.get();
@@ -266,6 +273,11 @@ namespace hdt
 		if (timeStep > RESET_PHYSICS) {
 			if ((newPos - m_lastRootPosition).length() > 500.0f) {
 				timeStep = RESET_PHYSICS;
+			} else if (const float jump = m_haveModelOffset && m_model ? (modelOffset() - m_lastModelOffset).length() : 0.0f; jump > 20.0f && jump > 1500.0f * timeStep) {
+				// The item alone jumped on the actor, over 20 units and faster than 1500 a second (a weapon snapped into the
+				// hands from a rest pose, re-attached elsewhere; a fast swing at a low frame rate is neither):
+				// its pieces would be dragged through what they collide with (a charm through its weapon), so over again.
+				timeStep = RESET_PHYSICS;
 			} else if (world->m_unclampedResets) {
 				btVector3 rotAxis;
 				float rotAngle;
@@ -278,6 +290,7 @@ namespace hdt
 
 		m_lastRootRotation = newRot;
 		m_lastRootPosition = newPos;
+		if (m_model) { m_lastModelOffset = modelOffset(); m_haveModelOffset = true; }
 		m_oldRoot = hdt::make_nismart(newRoot);
 		return timeStep;
 	}
@@ -564,6 +577,7 @@ namespace hdt
 		auto meshNameMap = file->second;
 
 		m_mesh = RE::make_smart<SkyrimSystem>(skeleton);
+		m_mesh->m_model = model;
 		m_boneIndex.clear();
 		m_extraBones.clear();
 		m_createdNodes.clear();
@@ -923,6 +937,7 @@ namespace hdt
 		m_reader = nullptr;
 		m_boneTemplates.clear();   // the default template: mass 0, kinematic
 		m_mesh = RE::make_smart<SkyrimSystem>(skeleton);
+		m_mesh->m_model = model;
 		m_boneIndex.clear();
 		m_extraBones.clear();
 		m_createdNodes.clear();
@@ -1055,6 +1070,8 @@ namespace hdt
 					cinfo.m_gravityFactor = btClamped(m_reader->readFloat(), 0.0f, 1.0f);
 				} else if (name == "wind-factor") {
 					cinfo.m_windFactor = std::max(m_reader->readFloat(), 0.0f);
+				} else if (name == "ccd") {
+					cinfo.m_ccd = m_reader->readInt() != 0;
 				} else {
 					logger::warn("unknown element - {}", name.c_str());
 					m_reader->skipCurrentElement();
@@ -1269,6 +1286,13 @@ namespace hdt
 			bone->m_windFactor = boneTemplate.m_windFactor;
 			bone->m_shapeCollides = boneTemplate.m_collisionFilter != 0 && boneTemplate.m_collisionShape &&
 				boneTemplate.m_collisionShape->getShapeType() != EMPTY_SHAPE_PROXYTYPE;
+			if (boneTemplate.m_ccd && bone->m_shapeCollides && !bone->m_rig.isStaticOrKinematicObject()) {
+				btVector3 centre;
+				btScalar radius;
+				boneTemplate.m_collisionShape->getBoundingSphere(centre, radius);
+				bone->m_rig.setCcdMotionThreshold(radius * 0.5f);
+				bone->m_rig.setCcdSweptSphereRadius(radius * 0.5f);
+			}
 			bone->m_canCollideWithBone = boneTemplate.m_canCollideWithBone;
 			bone->m_noCollideWithBone = boneTemplate.m_noCollideWithBone;
 
