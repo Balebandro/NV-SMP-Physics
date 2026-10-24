@@ -92,6 +92,12 @@ struct File {
 		blocks.push_back(std::move(data));
 		return (int)blocks.size() - 1;
 	}
+	void setType(size_t i, const std::string& type) {
+		size_t t = 0;
+		for (; t < blockTypes.size(); t++) if (blockTypes[t] == type) break;
+		if (t == blockTypes.size()) blockTypes.push_back(type);
+		blockTypeIndex[i] = (uint16_t)t;
+	}
 
 	static std::string shortString(Reader& r) { uint8_t l = r.u8(); std::string s((const char*)r.p + r.pos, l); r.skip(l); if (!s.empty() && s.back() == 0) s.pop_back(); return s; }
 	static std::string sizedString(Reader& r) { uint32_t l = r.u32(); std::string s((const char*)r.p + r.pos, l); r.skip(l); return s; }
@@ -238,6 +244,38 @@ struct GeometryData {
 		}
 	}
 };
+
+// The game draws a skinned NiTriStrips from its skin partition's strips: one partitioned into triangles (as the tools
+// here partition) draws nothing. Such a shape becomes an NiTriShape: the same data, its strips as a triangle list (the
+// data's other fields are laid out alike up to the indices). False if the shape is not strips.
+inline bool stripsToShape(File& f, int shapeBlock) {
+	Geometry g;
+	g.read(f.blocks[shapeBlock]);
+	if (g.data < 0 || f.typeOf(g.data) != "NiTriStripsData") return false;
+	const Bytes& b = f.blocks[g.data];
+	GeometryData gd;
+	gd.read(b, true);
+	Reader r(b.data(), b.size());
+	r.i32();
+	uint16_t nv = r.u16();
+	r.u8(); r.u8();
+	if (r.u8()) r.skip(nv * 12);
+	uint16_t bsFlags = r.u16();
+	if (r.u8()) { r.skip(nv * 12); if (bsFlags & 4096) r.skip(nv * 24); }
+	r.skip(16);
+	if (r.u8()) r.skip(nv * 16);
+	r.skip((bsFlags & 63) * nv * 8);   // uv sets
+	r.u16(); r.i32();                  // consistency, additional data
+	Writer w;
+	w.raw(b.data(), r.pos);
+	w.u16((uint16_t)gd.triangles.size()); w.u32((uint32_t)gd.triangles.size() * 3);
+	w.u8(1); for (auto& t : gd.triangles) { w.u16(t.v[0]); w.u16(t.v[1]); w.u16(t.v[2]); }
+	w.u16(0);   // match groups
+	f.blocks[g.data] = w.b;
+	f.setType(g.data, "NiTriShapeData");
+	f.setType(shapeBlock, "NiTriShape");
+	return true;
+}
 
 // NiSkinInstance / BSDismemberSkinInstance.
 struct SkinInstance {

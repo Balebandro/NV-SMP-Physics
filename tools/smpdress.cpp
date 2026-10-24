@@ -1182,6 +1182,7 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 	f.blocks[geom.skin] = si.write();
 	f.blocks[si.data] = sd.write();
 	f.blocks[si.partition] = np.write();
+	stripsToShape(f, shapeBlock);   // the partition is a triangle list: a strips shape would not be drawn
 	return res;
 }
 
