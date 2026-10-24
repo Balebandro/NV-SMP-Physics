@@ -119,7 +119,9 @@ namespace nvsmp
 				char name[128];
 				const bool named = CopyName(slot, name, sizeof(name));
 				if (!g_waitSet.count(slot)) {
-					if (IsLiveBone(slot, actor, model)) {
+					// A weapon keeps its own nodes in the scene (only skinned armor has them dropped): one still under the
+					// actor is placed by the game, as a skeleton bone is.
+					if (IsLiveBone(slot, actor, nullptr)) {
 						skeleton[i] = slot;   // the best reference, left as it is
 						if (!liveReference) { reference = (int)i; liveReference = true; }
 						continue;
