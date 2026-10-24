@@ -294,14 +294,14 @@ static SkinPartition buildPartition(const std::vector<Weights>& neww, const std:
 		p.bones.assign(bones.begin(), bones.end());
 		std::map<int, int> boneLocal;
 		for (size_t i = 0; i < p.bones.size(); i++) boneLocal[p.bones[i]] = (int)i;
+		// The partition's vertices in the shape's own order (a one-partition shape's map is then the identity): the game
+		// drew a charm partitioned in first-use order with its texture scrambled.
 		std::map<int, int> vertLocal;
+		for (auto& t : pt) for (int k = 0; k < 3; k++) vertLocal.emplace(t.v[k], 0);
+		for (auto& [v, local] : vertLocal) { local = (int)p.vertexMap.size(); p.vertexMap.push_back((uint16_t)v); }
 		for (auto& t : pt) {
 			Triangle lt;
-			for (int k = 0; k < 3; k++) {
-				auto it = vertLocal.find(t.v[k]);
-				if (it == vertLocal.end()) { it = vertLocal.emplace(t.v[k], (int)p.vertexMap.size()).first; p.vertexMap.push_back(t.v[k]); }
-				lt.v[k] = (uint16_t)it->second;
-			}
+			for (int k = 0; k < 3; k++) lt.v[k] = (uint16_t)vertLocal[t.v[k]];
 			p.triangles.push_back(lt);
 		}
 		for (auto v : p.vertexMap) {
