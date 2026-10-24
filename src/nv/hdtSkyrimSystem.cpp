@@ -13,6 +13,7 @@
 #include "hdtSkyrimPhysicsWorld.h"
 
 #include <cctype>
+#include <map>
 #include <sstream>
 #include <unordered_set>
 
@@ -686,6 +687,8 @@ namespace hdt
 		}
 		m_deferredBuilds.clear();
 
+		addRigidPieceCollision();
+
 		if (m_ground) {
 			bool simulatedBody = false;
 			for (auto& b : m_mesh->m_meshes) simulatedBody |= !b->m_isKinematic;
@@ -701,6 +704,90 @@ namespace hdt
 		if (m_staleSlots)
 			logger::info("[SMP] {} skin slot(s) of the item's bones held something other than the skeleton root (left from an earlier attach; not referenced)", m_staleSlots);
 		return m_mesh->valid() ? m_mesh : nullptr;
+	}
+
+	// New Vegas: solid collision for rigid pieces against a rigid wall, made from the item's own collision meshes, so no
+	// XML has to ask for it. Mesh collision (cloth vertices against body triangles) is tested a step at a time and pushes
+	// softly: small rigid pieces swung hard (a charm against its weapon) pass a wall between two steps. Here:
+	//   - a body (per-triangle) mesh whose every vertex is on one animated bone (a weapon's wall proxy) gives that bone a
+	//     convex hull of those vertices, solid (a mesh spread over several bones, as a body's legs, is left alone);
+	//   - if the item has such a wall, each simulated bone that carries a rigid piece of a cloth (per-vertex) mesh (8+
+	//     vertices weighted 0.99+ to it alone: a charm's link, its pendant) collides as a solid with continuous collision
+	//     (see BoneTemplate::m_ccd): a convex hull of that piece, or its own shape from the XML when that is convex; these
+	//     pieces do not collide with each other.
+	// The meshes' own collision stays; this is added to it. Cloth and hair (blended weights, no rigid wall) are unchanged.
+	void SkyrimSystemCreator::addRigidPieceCollision()
+	{
+		auto toRig = [](SkinnedMeshBone* bone, const SkinnedMeshBody::SkinnedBone& sb, const btVector3& skinPos) {
+			return bone->m_rigToLocal * (sb.vertexToBone * skinPos);   // the vertex in the bone's body (rig) space
+		};
+		auto rigidSlot = [](const Vertex& v) {
+			for (int k = 0; k < 4; ++k)
+				if (v.m_weight[k] >= 0.99f) return (int)v.getBoneIdx(k);
+			return -1;
+		};
+		auto hullOf = [this](const std::vector<btVector3>& points) {
+			auto hull = std::make_shared<btConvexHullShape>();
+			for (auto& p : points) hull->addPoint(p, false);
+			hull->recalcLocalAabb();
+			hull->setMargin(0.01f);
+			m_shapeRefs.push_back(hull);
+			return hull.get();
+		};
+
+		int walls = 0;
+		for (auto& body : m_mesh->m_meshes) {
+			if (!body->m_shape || !body->m_shape->asPerTriangleShape() || body->m_vertices.size() < 4) continue;
+			int slot = rigidSlot(body->m_vertices[0]);
+			for (auto& v : body->m_vertices) if (rigidSlot(v) != slot) { slot = -1; break; }
+			if (slot < 0 || slot >= (int)body->m_skinnedBones.size()) continue;
+			auto* bone = body->m_skinnedBones[slot].ptr;
+			if (!bone || !bone->m_rig.isStaticOrKinematicObject() || bone->m_shapeCollides) continue;
+			std::vector<btVector3> points;
+			for (auto& v : body->m_vertices) points.push_back(toRig(bone, body->m_skinnedBones[slot], v.m_skinPos));
+			bone->m_rig.setCollisionShape(hullOf(points));
+			bone->m_shapeCollides = true;
+			++walls;
+			logger::info("[SMP] {}: rigid on {}, collides as a solid wall ({} vertices)", body->m_name.c_str(), bone->m_name.c_str(), points.size());
+		}
+		if (!walls) return;
+
+		std::vector<SkinnedMeshBone*> pieces;
+		for (auto& body : m_mesh->m_meshes) {
+			if (!body->m_shape || body->m_shape->asPerTriangleShape()) continue;
+			std::map<int, std::vector<btVector3>> rigid;
+			for (auto& v : body->m_vertices) {
+				const int slot = rigidSlot(v);
+				if (slot >= 0 && slot < (int)body->m_skinnedBones.size()) rigid[slot].push_back(v.m_skinPos);
+			}
+			for (auto& [slot, skinPoints] : rigid) {
+				auto* bone = body->m_skinnedBones[slot].ptr;
+				if (!bone || bone->m_rig.isStaticOrKinematicObject() || skinPoints.size() < 8 ||
+					std::find(pieces.begin(), pieces.end(), bone) != pieces.end()) continue;
+				// A bone with its own shape (the XML's) keeps it, with continuous collision too when it is convex.
+				const bool own = bone->m_shapeCollides;
+				if (!own) {
+					std::vector<btVector3> points;
+					for (auto& p : skinPoints) points.push_back(toRig(bone, body->m_skinnedBones[slot], p));
+					bone->m_rig.setCollisionShape(hullOf(points));
+					bone->m_shapeCollides = true;
+				} else if (!bone->m_rig.getCollisionShape()->isConvex())
+					continue;
+				btVector3 centre;
+				btScalar radius;
+				bone->m_rig.getCollisionShape()->getBoundingSphere(centre, radius);
+				bone->m_rig.setCcdMotionThreshold(radius * 0.5f);
+				bone->m_rig.setCcdSweptSphereRadius(radius * 0.5f);
+				pieces.push_back(bone);
+				logger::info("[SMP] {}: its piece on {} collides as a solid ({} vertices, {})", body->m_name.c_str(), bone->m_name.c_str(), skinPoints.size(),
+					own ? "the XML's shape" : "their hull");
+			}
+		}
+		for (size_t i = 0; i < pieces.size(); ++i)
+			for (size_t j = i + 1; j < pieces.size(); ++j) {
+				pieces[i]->m_rig.setIgnoreCollisionCheck(&pieces[j]->m_rig, true);
+				pieces[j]->m_rig.setIgnoreCollisionCheck(&pieces[i]->m_rig, true);
+			}
 	}
 
 	// New Vegas: the ground under the actor, so cloth rests on it when crouching or sitting instead of

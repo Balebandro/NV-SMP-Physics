@@ -319,6 +319,7 @@ namespace hdt
 		// When the physics file is missing or broken: the item's own bones alone, kinematic, carried
 		// on their parents, so it renders at rest instead of stretched toward the skeleton root.
 		RE::BSTSmartPointer<SkyrimSystem> bindOnlySystem(RE::NiNode* skeleton, RE::NiAVObject* model);
+		void addRigidPieceCollision();
 		void addGroundPlane();
 		RE::BSTSmartPointer<SkyrimBody> readVirtualLegs();
 		RE::NiNode* createExtraBoneNode(const std::string& name, RE::NiTransform& anchorToNode, RE::NiNode*& anchor);
