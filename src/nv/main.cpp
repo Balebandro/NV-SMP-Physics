@@ -314,16 +314,38 @@ namespace nvsmp
 			SafeUpdate();
 	}
 
-	static void PatchCall(uint32_t site)
+	// An SMP item (a shape carrying the physics key; the game strips the root's extra data before this check) is not
+	// skinned for the add-on check: the game attaches it as any weapon, and the plugin builds its physics.
+	static bool HasPhysicsShape(RE::NiAVObject* obj, int depth = 0)
+	{
+		if (!obj || depth > 48)
+			return false;
+		if (obj->extraDataCount && obj->FindStringExtra("HDT Skinned Mesh Physics Object"))
+			return true;
+		if (auto* node = obj->AsNode())
+			for (uint16_t i = 0; i < node->ChildEnd(); ++i)
+				if (HasPhysicsShape(node->children[i], depth + 1))
+					return true;
+		return false;
+	}
+
+	static bool __cdecl AddOnSkinnedCheckHook(RE::NiNode* model)
+	{
+		if (HasPhysicsShape(model))
+			return false;
+		return ((bool(__cdecl*)(RE::NiNode*))Game::kFindSkinnedNode)(model);
+	}
+
+	static void PatchCall(uint32_t site, uint32_t target, void* hook)
 	{
 		uint8_t* p = (uint8_t*)site;
-		if (p[0] != 0xE8 || site + 5 + *(int32_t*)(p + 1) != Game::kWaitForParallelUpdate) {
+		if (p[0] != 0xE8 || site + 5 + *(int32_t*)(p + 1) != target) {
 			Log("call at %08X is not the expected one, left alone", site);
 			return;
 		}
 		DWORD old;
 		VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
-		*(int32_t*)(p + 1) = (int32_t)((uint32_t)&WaitForParallelUpdateHook - (site + 5));
+		*(int32_t*)(p + 1) = (int32_t)((uint32_t)hook - (site + 5));
 		VirtualProtect(p, 5, old, &old);
 		FlushInstructionCache(GetCurrentProcess(), p, 5);
 	}
@@ -523,7 +545,8 @@ extern "C"
 		else
 			Log("no xNVSE messaging: physics is not paused across loads");
 		for (uint32_t s : Game::kWaitForParallelUpdateCalls)
-			PatchCall(s);
+			PatchCall(s, Game::kWaitForParallelUpdate, (void*)&WaitForParallelUpdateHook);
+		PatchCall(Game::kAddOnSkinnedCheckCall, Game::kFindSkinnedNode, (void*)&AddOnSkinnedCheckHook);
 		return true;
 	}
 }

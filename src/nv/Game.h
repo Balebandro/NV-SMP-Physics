@@ -17,6 +17,11 @@ namespace Game
 	constexpr uint32_t kPlayerGet3D = 0x00950BB0;          // PlayerCharacter::Get3D(bool firstPerson) (as NV Cloth Physics uses it)
 	constexpr uint32_t kWaitForParallelUpdate = 0x00872AD0; // TESMain::DrawWorld_WaitForParallelUpdate
 	constexpr uint32_t kFileFinderGetFile = 0x00AFDF20;    // FileFinder::GetFile (loose, then archives)
+	constexpr uint32_t kFindSkinnedNode = 0x004910D0;      // Animation::FindSkinnedNode(NiNode*): the model has a skinned shape
+
+	// BipedAnim::LoadAndAttachAddOn's (0x004AEED0) FindSkinnedNode call: a skinned add-on model (a weapon) is refused
+	// ("MODELS: Tyring to add skinned object ... as an add on to skeleton.") and never attached.
+	constexpr uint32_t kAddOnSkinnedCheckCall = 0x004AF0FC;
 
 	// The calls to WaitForParallelUpdate in TESMain's draw paths: the game has finished animating
 	// and updating every actor's world transforms, and has not drawn yet.
