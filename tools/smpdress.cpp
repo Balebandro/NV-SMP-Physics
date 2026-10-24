@@ -592,7 +592,7 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 			Writer w;
 			node.write(w);
 			anchorBlk = f.addBlock("NiNode", w.b);
-			root.children.push_back(anchorBlk);
+			root.children.insert(root.children.begin(), anchorBlk);   // before the shapes: see the bone nodes below
 		}
 		SkinData nsd;
 		nsd.skinTransform = geom.av.local;
@@ -1327,8 +1327,11 @@ int main(int argc, char** argv)
 			}
 		}
 
-		// The bone nodes under the root (a valid tree for NifSkope; the game drops them, the plugin rebuilds them).
-		for (int b : newNodeBlocks) root.children.push_back(b);
+		// The bone nodes under the root (a valid tree for NifSkope; the game drops an armor's, the plugin rebuilds them; a
+		// weapon keeps its own). Before the shapes: the game's selective update (the first-person model) recomputes a skinned
+		// shape's bound from its bones when it reaches the shape, so bones after it gave a bound from last frame's places and
+		// the charm was culled while the gun moved.
+		root.children.insert(root.children.begin(), newNodeBlocks.begin(), newNodeBlocks.end());
 		if (!proxyOnly) addStringExtra(f, root, "HDT Skinned Mesh Physics Object", physicsPath);
 		{
 			Writer w;
