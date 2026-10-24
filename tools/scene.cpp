@@ -353,6 +353,7 @@ namespace scene
 				AddStringExtra(item.model, f.strings[n].c_str(), f.strings[v]);
 			}
 		}
+		std::map<int, RE::NiNode*> ownNodes;   // a weapon's own skin nodes, by block
 		for (size_t blk = 0; blk < f.blocks.size(); blk++) {
 			const std::string& t = f.typeOf(blk);
 			if (t != "NiTriShape" && t != "NiTriStrips") continue;
@@ -371,6 +372,33 @@ namespace scene
 					t = node.local * t;
 				}
 				info.geometry->local = ToRE(t);
+			}
+			// A weapon keeps its own nodes (the game drops only armor's): a slot naming a NIF node that is not a skeleton
+			// bone points at that node, made under the item's root where the NIF places it.
+			if (weapon && info.geometry->skinInstance) {
+				nif::Geometry g;
+				g.read(f.blocks[blk]);
+				nif::SkinInstance si;
+				si.read(f.blocks[g.skin], f.typeOf(g.skin) == "BSDismemberSkinInstance");
+				for (size_t i = 0; i < si.bones.size(); i++) {
+					const int b = si.bones[i];
+					if (b < 0 || item.skeleton.bones.count(StrName(f, b)))
+						continue;
+					RE::NiNode*& own = ownNodes[b];
+					if (!own) {
+						own = NewNode(StrName(f, b).c_str());
+						nif::Transform t;
+						for (int p = b; p >= 0 && p != f.roots[0]; p = parentOf.count(p) ? parentOf[p] : -1) {
+							nif::Reader r(f.blocks[p].data(), f.blocks[p].size());
+							nif::AVObject node;
+							node.read(r, true);
+							t = node.local * t;
+						}
+						own->local = ToRE(t);
+						AddChild(item.model, own);
+					}
+					info.geometry->skinInstance->bones[i] = own;
+				}
 			}
 			AddChild(item.model, info.geometry);
 			item.byName[info.geometry->m_name] = info.geometry;
