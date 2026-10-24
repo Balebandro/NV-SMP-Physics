@@ -47,6 +47,10 @@ namespace hdt
 		RE::NiPointer<RE::NiAVObject> m_model;
 		btVector3 m_lastModelOffset;
 		bool m_haveModelOffset = false;
+		// New Vegas: on the player's first-person model (setFirstPerson): its root turns with the camera, so turning
+		// fast does not reset it. And the resets since the last report, by cause (prepareForRead): the stats line.
+		bool m_firstPerson = false;
+		int m_resetsTurn = 0, m_resetsJump = 0, m_resetsOther = 0;
 
 		// New Vegas: the skin slots this system pointed at its own extra-bone nodes, put back on
 		// the skeleton root when it goes (so nothing renders with a node that is about to be freed).

@@ -19,6 +19,21 @@ namespace hdt
 			++m_depth;
 	}
 
+	// The node's world transform as the root's times the local transforms below it, false if the root is not above it.
+	static bool WorldFromRoot(RE::NiAVObject* node, RE::NiAVObject* root, RE::NiTransform& out)
+	{
+		RE::NiTransform chain = node->local;
+		int depth = 0;
+		for (RE::NiAVObject* p = node->parent; p && depth < 64; p = p->parent, ++depth) {
+			if (p == root) {
+				out = root->world * chain;
+				return true;
+			}
+			chain = p->local * chain;
+		}
+		return false;
+	}
+
 	void SkyrimBone::readTransform(float timeStep)
 	{
 		// An extra bone rides on its anchor: where it would be if it were the anchor's child.
@@ -27,7 +42,19 @@ namespace hdt
 
 		auto oldScale = m_currentTransform.getScale();
 
-		m_currentTransform = convertNi(m_node->world);
+		RE::NiTransform world = m_node->world;
+		// Far from the world's origin (tens of thousands of units) a float holds a place to about 0.008: the game's world
+		// transforms of the first-person weapon came out a rounding different every frame, a shake the charm took up.
+		// Built from the skeleton root's (one rounding, the same while the player stands) and the locals below it.
+		if (m_preciseInput && m_skeleton && m_rig.isStaticOrKinematicObject()) {
+			RE::NiAVObject* from = m_anchor ? (RE::NiAVObject*)m_anchor.get() : (RE::NiAVObject*)m_node.get();
+			RE::NiTransform w;
+			if (WorldFromRoot(from, m_skeleton.get(), w)) {
+				world = m_anchor ? w * m_anchorToNode : w;
+				if (m_anchor) m_node->world = world;
+			}
+		}
+		m_currentTransform = convertNi(world);
 
 		auto newScale = m_currentTransform.getScale();
 		auto current = m_rig.getWorldTransform();
@@ -52,6 +79,7 @@ namespace hdt
 		}
 
 		auto dest = m_currentTransform.asTransform() * m_localToRig;
+		dest.getOrigin() -= s_origin;   // into the physics' space
 		if (timeStep <= RESET_PHYSICS) {
 			m_filterReady = false;   // the jitter filter starts again from the reset place
 			m_jitterSamples = 0;
@@ -108,23 +136,27 @@ namespace hdt
 
 	void SkyrimBone::writeTransform()
 	{
-		auto transform = m_rig.getWorldTransform() * m_rigToLocal;
+		const btTransform inPhysics = m_rig.getWorldTransform() * m_rigToLocal;   // in the physics' space (see s_origin)
+		btTransform transform = inPhysics;
+		transform.getOrigin() += s_origin;
 
 		m_currentTransform.setBasis(transform.getBasis());
 		m_currentTransform.setOrigin(transform.getOrigin());
 
 		btTransform drawn = transform;
 		RE::NiAVObject* parent = m_anchor ? (RE::NiAVObject*)m_anchor.get() : (RE::NiAVObject*)m_node->parent;
+		btTransform relDrawn;   // the drawn pose relative to the parent, kept as computed (not from world transforms)
 		if (!m_rig.isStaticOrKinematicObject() && parent && s_stepTime > 0) {
 			// The pose relative to the parent at the physics' time (the parent's own physics body when it has one), put
 			// on the parent as drawn this frame (written before this bone: bones go root first). The physics runs
-			// behind the frame by a varying slice of a step; relative to the parent that slice hardly shows.
+			// behind the frame by a varying slice of a step; relative to the parent that slice hardly shows. Taken in the
+			// physics' space, where both are near 0: from world transforms it carried their rounding (see s_origin).
 			btTransform P(convertNi(parent->world.rotate), convertNi(parent->world.translate));
 			btTransform Pphys = P;
+			Pphys.getOrigin() -= s_origin;
 			if (auto it = s_boneByNode.find(parent); it != s_boneByNode.end())
 				Pphys = it->second->m_rig.getWorldTransform() * it->second->m_rigToLocal;
-			btTransform toParent = P.inverse();
-			btTransform rel = Pphys.inverse() * transform;
+			btTransform rel = Pphys.inverse() * inPhysics;
 			btVector3 x = rel.getOrigin();
 			btQuaternion q = rel.getRotation();
 			if (s_filter.enabled) {
@@ -145,16 +177,17 @@ namespace hdt
 					m_filterRot = m_filterRot.slerp(q, a);
 					m_filterRot.normalize();
 				}
-				drawn = P * btTransform(m_filterRot, m_filterPos);
+				relDrawn = btTransform(m_filterRot, m_filterPos);
 			} else
-				drawn = P * rel;
+				relDrawn = rel;
+			drawn = P * relDrawn;
 			MeasureJitter(x, m_rawHist, m_rawD2, m_rawJitter, m_jitterSamples, s_stepTime, m_lastStepTime);
-			btVector3 drawnRel = (toParent * drawn).getOrigin();
+			const btVector3 drawnRel = relDrawn.getOrigin();
 			MeasureJitter(drawnRel, m_jitterHist, m_jitterD2, m_jitter, m_jitterSamples, s_stepTime, m_lastStepTime);
 			m_filterLag += ((drawnRel - x).length() - m_filterLag) * 0.02f;
 			m_jitterSamples++;
 			m_lastStepTime = s_stepTime;
-			m_drawnRel = toParent * drawn;
+			m_drawnRel = relDrawn;
 			m_drawnRelValid = true;
 		} else {
 			m_filterReady = false;
@@ -172,7 +205,8 @@ namespace hdt
 		if (!finite) {
 			if (m_anchor) m_node->world = m_anchor->world * m_anchorToNode;
 			else if (m_node->parent) m_node->world = m_node->parent->world * m_node->local;
-			const btTransform rest = convertNi(m_node->world).asTransform() * m_localToRig;
+			btTransform rest = convertNi(m_node->world).asTransform() * m_localToRig;
+			rest.getOrigin() -= s_origin;
 			static const btVector3 zero(0, 0, 0);
 			m_rig.setWorldTransform(rest);
 			m_rig.setInterpolationWorldTransform(rest);
@@ -188,7 +222,10 @@ namespace hdt
 
 		m_node->world.rotate = convertBt(drawn.getBasis());
 		m_node->world.translate = convertBt(drawn.getOrigin());
-		if (m_writeLocal && !m_rig.isStaticOrKinematicObject() && m_node->parent)
+		if (m_writeLocal && m_drawnRelValid && m_node->parent == parent) {
+			m_node->local.rotate = convertBt(relDrawn.getBasis());
+			m_node->local.translate = convertBt(relDrawn.getOrigin());
+		} else if (m_writeLocal && !m_rig.isStaticOrKinematicObject() && m_node->parent)
 			m_node->local = m_node->parent->world.Invert() * m_node->world;
 
 		// Nodes under a simulated bone that are not simulated themselves (attached props, a chain's
@@ -212,7 +249,10 @@ namespace hdt
 		btTransform drawn = btTransform(convertNi(parent->world.rotate), convertNi(parent->world.translate)) * m_drawnRel;
 		m_node->world.rotate = convertBt(drawn.getBasis());
 		m_node->world.translate = convertBt(drawn.getOrigin());
-		if (m_writeLocal && m_node->parent)
+		if (m_writeLocal && m_node->parent == parent) {
+			m_node->local.rotate = convertBt(m_drawnRel.getBasis());
+			m_node->local.translate = convertBt(m_drawnRel.getOrigin());
+		} else if (m_writeLocal && m_node->parent)
 			m_node->local = m_node->parent->world.Invert() * m_node->world;
 		for (uint16_t i = 0; i < m_node->ChildEnd(); ++i) {
 			if (auto* child = m_node->children[i])

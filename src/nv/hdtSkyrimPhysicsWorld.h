@@ -43,8 +43,7 @@ namespace hdt
 
 		std::unique_lock<std::mutex> lockSimulation() { return std::unique_lock(m_lock); }
 
-		btVector3 applyTranslationOffset();
-		void restoreTranslationOffset(const btVector3&);
+		void recentre();   // see the .cpp
 
 		btContactSolverInfo& getSolverInfo() { return btDiscreteDynamicsWorld::getSolverInfo(); }
 		void setGravity(const btVector3& g) { btDiscreteDynamicsWorld::setGravity(g); }

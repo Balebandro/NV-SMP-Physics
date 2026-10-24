@@ -232,6 +232,7 @@ namespace hdt
 	{
 		typedef void(__thiscall * AttachChild_t)(RE::NiNode*, RE::NiAVObject*, int);
 		static const auto attachChild = (AttachChild_t)0x00A5ED10;   // NiNode::AttachChild(child, bFirstAvail)
+		m_firstPerson = true;
 		for (auto& m : m_meshes)
 			m->m_isolation = this;
 		int attached = 0;
@@ -239,6 +240,7 @@ namespace hdt
 			auto* bone = static_cast<SkyrimBone*>(b.get());
 			bone->m_isolation = this;
 			bone->m_writeLocal = true;
+			bone->m_preciseInput = true;
 			RE::NiNode* node = bone->m_node.get();
 			if (!node || node->parent || !bone->m_anchor)
 				continue;
@@ -295,24 +297,31 @@ namespace hdt
 
 		if (timeStep > RESET_PHYSICS && world->m_resetPc > 0)
 			timeStep = RESET_PHYSICS;
+		if (timeStep <= RESET_PHYSICS)
+			++m_resetsOther;
 
 		// A jump of the whole actor (a load door, fast travel, a teleport) or a turn faster than any
 		// animation turns: start the cloth over in its rest pose, as FSMP's unclamped resets do.
 		if (timeStep > RESET_PHYSICS) {
 			if ((newPos - m_lastRootPosition).length() > 500.0f) {
 				timeStep = RESET_PHYSICS;
+				++m_resetsJump;
 			} else if (const float jump = m_haveModelOffset && m_model ? (modelOffset() - m_lastModelOffset).length() : 0.0f; jump > 20.0f && jump > 1500.0f * timeStep) {
 				// The item alone jumped on the actor, over 20 units and faster than 1500 a second (a weapon snapped into the
 				// hands from a rest pose, re-attached elsewhere; a fast swing at a low frame rate is neither):
 				// its pieces would be dragged through what they collide with (a charm through its weapon), so over again.
 				timeStep = RESET_PHYSICS;
-			} else if (world->m_unclampedResets) {
+				++m_resetsJump;
+			} else if (world->m_unclampedResets && !m_firstPerson) {
+				// Not on the first-person model: its root turns with the camera (looking around is not a teleport).
 				btVector3 rotAxis;
 				float rotAngle;
 				btTransformUtil::calculateDiffAxisAngleQuaternion(m_lastRootRotation, newRot, rotAxis, rotAngle);
 				float limit = world->m_unclampedResetAngle * timeStep;
-				if (rotAngle < -limit || rotAngle > limit)
+				if (rotAngle < -limit || rotAngle > limit) {
 					timeStep = RESET_PHYSICS;
+					++m_resetsTurn;
+				}
 			}
 		}
 

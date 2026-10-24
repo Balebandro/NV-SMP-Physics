@@ -53,6 +53,7 @@ namespace hdt
 		_MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
 		QueryPerformanceCounter(&m_beginTick);
 		std::unique_lock<std::mutex> l(m_lock);
+		recentre();
 
 		// New Vegas: a fixed step, m_timeTick (1 / the rate setting), whatever the frame rate. FSMP stepped the frame
 		// time itself above its rate (and whole ticks plus a remainder below it), so the cloth behaved differently at
@@ -111,9 +112,9 @@ namespace hdt
 	{
 		LARGE_INTEGER t0;
 		QueryPerformanceCounter(&t0);
-		auto offset = applyTranslationOffset();
+		// The bodies stay in the physics' space (SkyrimBone::s_origin, see recentre): no offset there and back every step,
+		// which in world coordinates rounded every body by up to about 0.004 units each time.
 		stepSimulation(m_pendingTime, 0, m_timeTick * 1.0001f);   // a hair over: n - 1 whole steps and a last one of the same size
-		restoreTranslationOffset(offset);
 		m_stepThreadMs = MsSince(t0);
 	}
 
@@ -209,39 +210,33 @@ namespace hdt
 		m_averageMainMs += (m_readMs + (m_pendingAsync ? waitMs : stepMs) + writeMs - m_averageMainMs) * 0.1f;
 	}
 
-	// Bullet works relative to the centre of everything simulated: far from the world origin, single
-	// precision would make the bones jitter.
-	btVector3 SkyrimPhysicsWorld::applyTranslationOffset()
+	// Bullet works relative to the centre of everything simulated: far from the world origin, single precision would make
+	// the bones jitter. The bodies live in the physics' space (SkyrimBone::s_origin) all the time, not just during a step
+	// (moved there and back every step, they were rounded at world coordinates every step: a charm shimmered in place).
+	// Once their centre is over 1000 units from its origin (the player walked on, another cell), every body moves back by
+	// that much and the origin forward: one rounding then, and still again.
+	void SkyrimPhysicsWorld::recentre()
 	{
-		btVector3 center;
-		center.setZero();
+		btVector3 center(0, 0, 0);
 		int count = 0;
-		for (int i = 0; i < m_collisionObjects.size(); ++i) {
-			auto rig = btRigidBody::upcast(m_collisionObjects[i]);
-			if (rig) {
+		for (int i = 0; i < m_collisionObjects.size(); ++i)
+			if (auto rig = btRigidBody::upcast(m_collisionObjects[i])) {
 				center += rig->getWorldTransform().getOrigin();
 				++count;
 			}
-		}
-
-		if (count > 0) {
-			center /= static_cast<btScalar>(count);
-			for (int i = 0; i < m_collisionObjects.size(); ++i) {
-				auto rig = btRigidBody::upcast(m_collisionObjects[i]);
-				if (rig)
-					rig->getWorldTransform().getOrigin() -= center;
+		if (count == 0)
+			return;
+		center /= static_cast<btScalar>(count);
+		if (center.length2() < 1000.0f * 1000.0f)
+			return;
+		for (int i = 0; i < m_collisionObjects.size(); ++i)
+			if (auto rig = btRigidBody::upcast(m_collisionObjects[i])) {
+				rig->getWorldTransform().getOrigin() -= center;
+				btTransform t = rig->getInterpolationWorldTransform();
+				t.getOrigin() -= center;
+				rig->setInterpolationWorldTransform(t);
 			}
-		}
-		return center;
-	}
-
-	void SkyrimPhysicsWorld::restoreTranslationOffset(const btVector3& offset)
-	{
-		for (int i = 0; i < m_collisionObjects.size(); ++i) {
-			auto rig = btRigidBody::upcast(m_collisionObjects[i]);
-			if (rig)
-				rig->getWorldTransform().getOrigin() += offset;
-		}
+		SkyrimBone::s_origin += center;
 	}
 
 	void SkyrimPhysicsWorld::setWind(const btVector3& target, uint32_t a_smoothingSamples)

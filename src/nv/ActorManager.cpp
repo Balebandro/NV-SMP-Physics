@@ -1507,8 +1507,17 @@ namespace nvsmp
 				logger::info("[stats]   furthest from rest: {}", most);
 			size_t joints = item.system->constraints().size();
 			for (auto& group : item.system->constraintGroups()) joints += group->m_constraints.size();
-			logger::info("[stats]   {} person: joints apart at most {:.3f} in the physics, {:.3f} as drawn ({} joints)", item.firstPerson ? "first" : "third",
-				item.jointGapPhys, item.jointGapDrawn, joints);
+			float jitter = 0, rawJitter = 0;
+			for (auto& b : item.system->getBones()) {
+				auto* bone = static_cast<hdt::SkyrimBone*>(b.get());
+				jitter = std::max(jitter, bone->m_jitter);
+				rawJitter = std::max(rawJitter, bone->m_rawJitter);
+			}
+			auto* sys = item.system.get();
+			logger::info("[stats]   {} person: joints apart at most {:.3f} in the physics, {:.3f} as drawn ({} joints); resets: {} turn, {} jump, {} other; "
+				"jitter {:.4f} drawn, {:.4f} raw", item.firstPerson ? "first" : "third", item.jointGapPhys, item.jointGapDrawn, joints,
+				sys->m_resetsTurn, sys->m_resetsJump, sys->m_resetsOther, jitter, rawJitter);
+			sys->m_resetsTurn = sys->m_resetsJump = sys->m_resetsOther = 0;
 			item.jointGapPhys = item.jointGapDrawn = 0;
 		}
 	}

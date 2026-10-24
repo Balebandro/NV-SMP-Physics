@@ -632,6 +632,7 @@ struct Anim
 	std::string customPath;
 	bool wasAnimating = false;
 } gAnim;
+static V3 gFar;   // --far x y z: the actor that far from the world origin (float precision as in the game)
 static float gSweepRate = 7.0f, gSweepPeriod = 1.2f;   // "Turn back and forth": the fastest turn (rad/s) and a cycle (s); --sweep rate period
 static bool gStanceForced = false;   // --stance: kept over a weapon's own (its folder's)
 static bool gFirstPerson = false;    // a weapon with physics on the first-person skeleton, seen from its Camera1st
@@ -973,7 +974,7 @@ static void UpdateMotion(float dt)
 	auto* actor = gItem.scene.skeleton.actor;
 	actor->local.rotate = scene::RotZ(m.yaw);
 	V3 at = m.pos;
-	actor->local.translate = { at.x, at.y, z + newBob };
+	actor->local.translate = { at.x + gFar.x, at.y + gFar.y, z + newBob + gFar.z };   // --far: tested where the game puts the player
 	actor->world = actor->local;
 	hdt::updateTransformUpDown(actor);
 }
@@ -1797,7 +1798,7 @@ static void DrawScene(const M4& viewProj, const M4& view, const M4& proj)
 		auto add = [&](V3 a, V3 b, D3DCOLOR c) { lines.push_back({ a.x, a.y, a.z, c }); lines.push_back({ b.x, b.y, b.z, c }); };
 		if (gS.showConstraints) {
 			auto addC = [&](hdt::BoneScaleConstraint* c, D3DCOLOR col) {
-				auto a = c->m_boneA->m_rig.getWorldTransform().getOrigin(), b = c->m_boneB->m_rig.getWorldTransform().getOrigin();
+				auto a = c->m_boneA->m_rig.getWorldTransform().getOrigin() + hdt::SkyrimBone::s_origin, b = c->m_boneB->m_rig.getWorldTransform().getOrigin() + hdt::SkyrimBone::s_origin;
 				add(V3(a.x(), a.y(), a.z()), V3(b.x(), b.y(), b.z()), col);
 			};
 			for (auto& c : gItem.system->constraints()) addC(c.get(), D3DCOLOR_ARGB(255, 120, 230, 120));
@@ -2750,6 +2751,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--clip") clipOut = next();
 		else if (a == "--clipmesh") clipMeshOut = next();
 		else if (a == "--joints") jointsOut = next();
+		else if (a == "--far") { gFar.x = (float)atof(next().c_str()); gFar.y = (float)atof(next().c_str()); gFar.z = (float)atof(next().c_str()); }
 		else if (a == "--sweep") { gSweepRate = (float)atof(next().c_str()); gSweepPeriod = (float)atof(next().c_str()); }
 		else if (a == "--stance") { gAnim.stance = std::clamp(atoi(next().c_str()), 0, IM_ARRAYSIZE(kStances) - 1); gStanceForced = true; }
 		else if (a == "--first-person") gFirstPerson = true;   // testing: the First person box ticked (a weapon with physics)
@@ -3146,6 +3148,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 				if (++jointFrames == 720) {
 					if (FILE* f = fopen(jointsOut.c_str(), "w")) {
 						fprintf(f, "joints apart: worst %.3f, mean of each frame's widest %.3f (%zu joints, %d frames)\n", jointWorst, jointSum / jointFrames, all.size(), jointFrames);
+						// The plugin's own jitter measure (SkyrimBone::m_jitter), as its stats line gives it: the bones' worst.
+						float jitter = 0, rawJitter = 0;
+						for (auto& b : gItem.system->getBones()) {
+							auto* bone = static_cast<hdt::SkyrimBone*>(b.get());
+							jitter = std::max(jitter, bone->m_jitter);
+							rawJitter = std::max(rawJitter, bone->m_rawJitter);
+						}
+						fprintf(f, "jitter %.4f drawn, %.4f raw\n", jitter, rawJitter);
 						fclose(f);
 					}
 					done = true;

@@ -30,6 +30,8 @@ namespace hdt
 		// the game's own update of the node later in the frame keeps it (the player's first-person model, which the game
 		// moves into camera space for its draw). See SkyrimSystem::setFirstPerson.
 		bool m_writeLocal = false;
+		// New Vegas: an animated bone's pose read as the skeleton root's world times the locals below it (see readTransform).
+		bool m_preciseInput = false;
 
 		// New Vegas: the jitter filter. A simulated bone's drawn place, relative to the node it hangs from, goes through
 		// a One Euro filter (Casiez et al. 2012): an adaptive low-pass whose cutoff rises with the bone's speed, so a
@@ -46,6 +48,10 @@ namespace hdt
 		static inline float s_stepTime = 0;   // the step the world just took (seconds), set before writeTransform
 		static inline float s_kinematicFraction = 1;   // how far the animated bones go toward this frame's pose (see readTransform), set before readTransform
 		static inline std::unordered_map<RE::NiAVObject*, SkyrimBone*> s_boneByNode;   // every simulated system's bones by node, set before writeTransform
+		// Where the physics' space is in the world (SkyrimPhysicsWorld::recentre): the bodies live at world - s_origin. Far
+		// from the world's origin a float holds a place to about 0.008, and bodies kept in world coordinates were rounded
+		// that much on every step (a charm shimmered in place); here they stay near 0 and only the reads and writes move.
+		static inline btVector3 s_origin = btVector3(0, 0, 0);
 		// The plugin's and the previewer's one knob: smoothing 0 (light) .. 1 (strong) sets the cutoff at rest from 8 Hz
 		// down to 0.5 Hz and the speed term from 0.12 down to 0.0075 (both evenly on a log scale; 0.5 = 2 Hz and 0.03,
 		// which with 180 Hz physics kept every chain of the Sunset poncho under 0.005 jitter at 60, 144 and 180 fps, for
