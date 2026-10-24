@@ -26,6 +26,10 @@ namespace hdt
 		// it follows the anchor while kinematic, and the physics moves it otherwise.
 		RE::NiPointer<RE::NiNode> m_anchor;
 		RE::NiTransform m_anchorToNode;
+		// New Vegas: a simulated bone's place also written as its node's local transform (relative to its scene parent), so
+		// the game's own update of the node later in the frame keeps it (the player's first-person model, which the game
+		// moves into camera space for its draw). See SkyrimSystem::setFirstPerson.
+		bool m_writeLocal = false;
 
 		// New Vegas: the jitter filter. A simulated bone's drawn place, relative to the node it hangs from, goes through
 		// a One Euro filter (Casiez et al. 2012): an adaptive low-pass whose cutoff rises with the bone's speed, so a

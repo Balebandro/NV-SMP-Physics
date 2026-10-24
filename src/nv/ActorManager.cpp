@@ -693,6 +693,9 @@ namespace nvsmp
 			return;
 		}
 		item.system = system;
+		item.firstPerson = root == m_firstPersonRoot;
+		if (item.firstPerson)
+			item.system->setFirstPerson();
 		hdt::SkyrimPhysicsWorld::get()->addSkinnedMeshSystem(item.system.get());
 		logger::info("[SMP] '{}': {} bones, {} collision bodies", file, item.system->getBones().size(), item.system->meshes().size());
 
@@ -888,6 +891,47 @@ namespace nvsmp
 			p = end + 1;
 		}
 		return out;
+	}
+
+	// A weapon's skins in the player's first-person model (the shapes whose "SMP Bones" slots are all nodes of their own
+	// model, under the shape's parent): the game never draws them as it leaves them (+0x1C, the renderer's matrix count,
+	// stays 0), so each is bound here on those nodes, as BindHairSkin does.
+	// No physics in first person: the charm hangs as the NIF has it.
+	static void BindOwnNodeSkins(RE::NiAVObject* obj, int depth = 0)
+	{
+		if (!obj || depth > 48)
+			return;
+		if (auto* g = hdt::castNiGeometry(obj)) {
+			auto* sk = g->skinInstance;
+			if (!sk || !sk->skinData || !sk->skinData->boneCount || !g->parent)
+				return;
+			const std::string list = g->SmpBonesList();
+			if (list.empty())
+				return;
+			const std::vector<std::string> names = SlotNames(list);
+			const uint32_t n = sk->skinData->boneCount;
+			if (names.size() < n)
+				return;
+			std::vector<RE::NiAVObject*> nodes(n);
+			for (uint32_t i = 0; i < n; ++i)
+				if (!(nodes[i] = FindOutside(g->parent, nullptr, names[i].c_str())))
+					return;
+			if (sk->boneCount)
+				return;
+			auto** bones = static_cast<RE::NiAVObject**>(((void*(__cdecl*)(size_t))Game::kNiNew)(n * sizeof(RE::NiAVObject*)));
+			if (!bones)
+				return;
+			std::copy(nodes.begin(), nodes.end(), bones);
+			sk->bones = bones;
+			sk->boneCount = n;
+			if (!sk->rootParent)
+				sk->rootParent = g->parent;
+			logger::info("[SMP] first person: {} came with its skin unbound: bound on its own nodes ({} slots)", g->GetName(), n);
+			return;
+		}
+		if (auto* node = obj->AsNode())
+			for (uint16_t i = 0; i < node->ChildEnd(); ++i)
+				BindOwnNodeSkins(node->children[i], depth + 1);
 	}
 
 	// The skin slot of a hair's Bip01 Head, by its "SMP Bones" list (not always the first: a hair rigged elsewhere lists it last).
@@ -1277,10 +1321,37 @@ namespace nvsmp
 		m_scanRef = nullptr;
 	}
 
+	// How far apart each constraint's two pivots are, in the physics and as drawn (the nodes as the
+	// frame left them), the widest per item until the next report.
+	static void SampleJointGaps(hdt::SkyrimSystem* system, float& phys, float& drawn)
+	{
+		std::vector<hdt::BoneScaleConstraint*> all;
+		for (auto& c : system->constraints()) all.push_back(c.get());
+		for (auto& group : system->constraintGroups())
+			for (auto& c : group->m_constraints) all.push_back(c.get());
+		for (auto* c : all) {
+			if (!c->getConstraint() || c->getConstraint()->getConstraintType() != D6_SPRING_2_CONSTRAINT_TYPE) continue;
+			auto* g = static_cast<btGeneric6DofSpring2Constraint*>(c->getConstraint());
+			auto* a = static_cast<hdt::SkyrimBone*>(c->m_boneA);
+			auto* b = static_cast<hdt::SkyrimBone*>(c->m_boneB);
+			if (&g->getRigidBodyA() != &a->m_rig) std::swap(a, b);
+			const btVector3 pa = (g->getRigidBodyA().getWorldTransform() * g->getFrameOffsetA()).getOrigin();
+			const btVector3 pb = (g->getRigidBodyB().getWorldTransform() * g->getFrameOffsetB()).getOrigin();
+			phys = std::max(phys, (float)(pa - pb).length());
+			if (!a->m_node || !b->m_node) continue;
+			const btTransform ra = hdt::convertNi(a->m_node->world).asTransform() * a->m_localToRig;
+			const btTransform rb = hdt::convertNi(b->m_node->world).asTransform() * b->m_localToRig;
+			drawn = std::max(drawn, (float)((ra * g->getFrameOffsetA()).getOrigin() - (rb * g->getFrameOffsetB()).getOrigin()).length());
+		}
+	}
+
 	void ActorManager::update()
 	{
 		++m_frame;
 		const auto& s = gSettings;
+		for (auto& [key, item] : m_items)
+			if (item.system)
+				SampleJointGaps(item.system.get(), item.jointGapPhys, item.jointGapDrawn);
 
 		// The race menu: race hair lets go of everything it held (see m_raceMenu), and is placed each frame instead.
 		m_menuHair.clear();
@@ -1312,8 +1383,12 @@ namespace nvsmp
 		m_playerRootName = playerRoot ? playerRoot->GetName() : "(none)";
 		if (playerRoot)
 			KeepRadius(playerRoot, m_lastRootRadius);
-		if (RE::NiNode* firstPerson = player ? Game::PlayerFirstPerson3D(player) : nullptr; firstPerson && firstPerson != playerRoot)
+		m_firstPersonRoot = nullptr;
+		if (RE::NiNode* firstPerson = player ? Game::PlayerFirstPerson3D(player) : nullptr; firstPerson && firstPerson != playerRoot) {
 			SetProxiesHidden(firstPerson, true);
+			BindOwnNodeSkins(firstPerson);
+			m_firstPersonRoot = firstPerson;
+		}
 		std::vector<std::tuple<float, RE::NiNode*, void*>> actors;
 		if (playerRoot)
 			actors.push_back({ 0.0f, playerRoot, player });
@@ -1327,6 +1402,14 @@ namespace nvsmp
 
 		for (auto& a : actors)
 			scanActor(std::get<1>(a), std::get<2>(a));
+		// The player's first-person model: the weapon it holds gets physics of its own (a charm), on that model. Only what
+		// hangs on its Weapon node: the model also holds the worn items again, which are not seen in first person.
+		if (m_firstPersonRoot)
+			if (RE::NiAVObject* weapon = FindOutside(m_firstPersonRoot, nullptr, "Weapon")) {
+				m_scanRef = player;
+				scan(m_firstPersonRoot, weapon, 0);
+				m_scanRef = nullptr;
+			}
 		if (!m_raceMenu && !g_menuSkins.empty()) {   // the menu closed: the hair that remains got its skin back in the scan; the rest went
 			logger::info("[SMP] race menu closed: {} hair skin(s) left with copies the menu threw away", g_menuSkins.size());
 			g_menuSkins.clear();
@@ -1422,6 +1505,11 @@ namespace nvsmp
 				drawn, item.system->m_boundSlots.size(), world->m_averageStepMs, world->m_averageMainMs);
 			if (!most.empty())
 				logger::info("[stats]   furthest from rest: {}", most);
+			size_t joints = item.system->constraints().size();
+			for (auto& group : item.system->constraintGroups()) joints += group->m_constraints.size();
+			logger::info("[stats]   {} person: joints apart at most {:.3f} in the physics, {:.3f} as drawn ({} joints)", item.firstPerson ? "first" : "third",
+				item.jointGapPhys, item.jointGapDrawn, joints);
+			item.jointGapPhys = item.jointGapDrawn = 0;
 		}
 	}
 

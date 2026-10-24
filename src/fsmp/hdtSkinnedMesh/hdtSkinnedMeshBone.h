@@ -24,6 +24,9 @@ namespace hdt
 		// New Vegas: a nonzero <collision-filter> on a bone with a <shape>: the shape collides (Bullet rigid contacts)
 		// with the other bones' shapes that have one too (rigid pieces knocking together). Off by default, as in FSMP.
 		bool m_shapeCollides = false;
+		// New Vegas: the collision group it keeps to (null: the shared one): bones of different groups never collide (the
+		// player's first-person copy of an item, which sits where the third-person body is).
+		const void* m_isolation = nullptr;
 
 		btRigidBody m_rig;
 		btTransform m_localToRig;

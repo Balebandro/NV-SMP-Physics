@@ -27,6 +27,8 @@ namespace hdt
 
 	bool SkinnedMeshBone::canCollideWith(SkinnedMeshBone* rhs)
 	{
+		if (m_isolation != rhs->m_isolation)
+			return false;
 		if (m_canCollideWithBone.size()) {
 			return std::find(m_canCollideWithBone.begin(), m_canCollideWithBone.end(), rhs->m_name) !=
 			       m_canCollideWithBone.end();

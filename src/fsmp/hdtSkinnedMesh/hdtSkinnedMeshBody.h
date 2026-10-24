@@ -75,6 +75,7 @@ namespace hdt
 		//		int m_priority;
 		bool m_isKinematic;
 		bool m_lodNoCollide = false;   // New Vegas: its actor is past the collision distance: in no collision pair
+		const void* m_isolation = nullptr;   // New Vegas: as SkinnedMeshBone::m_isolation, for bodies
 		bool m_useBoundingSphere;
 		RE::BSTSmartPointer<SkinnedMeshShape> m_shape;
 

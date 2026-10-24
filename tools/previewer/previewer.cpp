@@ -599,8 +599,8 @@ static void BuildSystem()
 static const char* kSwayTip = "How far the constraint swings to the sides (its y limit): -1 not at all, 0 as its template has it, 1 two and a half "
 	"times as far (at most 1.5 rad). Leaves its forward-back swing and twist as they are.";
 
-static const char* kPresets[] = { "Stand", "Walk", "Run", "Walk in circles", "Spin in place", "Start and stop", "Jumping", "Sneak", "Sneak walk", "Drive (WASD)", "Animation file" };
-enum { kStand, kWalk, kRun, kCircles, kSpin, kStartStop, kJumping, kSneak, kSneakWalk, kDrive, kCustom };
+static const char* kPresets[] = { "Stand", "Walk", "Run", "Walk in circles", "Spin in place", "Start and stop", "Jumping", "Sneak", "Sneak walk", "Drive (WASD)", "Animation file", "Turn back and forth" };
+enum { kStand, kWalk, kRun, kCircles, kSpin, kStartStop, kJumping, kSneak, kSneakWalk, kDrive, kCustom, kSweep };
 
 // Weapon stances: the locomotion file name prefix the game uses for each.
 static const char* kStances[] = { "Unarmed", "Pistol", "Rifle", "Automatic rifle", "One-hand melee", "Two-hand melee" };
@@ -632,6 +632,7 @@ struct Anim
 	std::string customPath;
 	bool wasAnimating = false;
 } gAnim;
+static float gSweepRate = 7.0f, gSweepPeriod = 1.2f;   // "Turn back and forth": the fastest turn (rad/s) and a cycle (s); --sweep rate period
 static bool gStanceForced = false;   // --stance: kept over a weapon's own (its folder's)
 static bool gFirstPerson = false;    // a weapon with physics on the first-person skeleton, seen from its Camera1st
 
@@ -871,6 +872,8 @@ static void UpdateMotion(float dt)
 		}
 		break;
 	case kCustom: want = "custom"; break;
+	// Quick turns one way and the other (a mouse turning the player): up to 7 rad/s, a cycle every 1.2 s.
+	case kSweep: targetYawRate = gSweepRate * std::sin(m.time * 6.2831853f / gSweepPeriod); want = "idle"; break;
 	}
 	bool onGround = m.jump < 0 && m.jumpStage == Motion::kGround;
 	jumpNow = jumpNow && onGround;
@@ -2701,6 +2704,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	LocalFree(argv);
 	std::string start, shots, jitterOut, clipOut, logOut;   // --jitter / --clip file: how much the cloth shakes / clips (see below); --log file: the log, written on exit
 	std::string clipMeshOut;   // --clipmesh file: how much the cloth shapes sink into the body collision shapes (see below)
+	std::string jointsOut;     // --joints file: how far the constraints come apart (see below)
 	std::string recipe;   // --recipe file: the Make SMP window loads it (with --maker-build: and builds it, for testing)
 	bool addBoneLists = false;
 	bool genProxies = false, useProxies = false, fixXmlPath = false, removeSkeleton = false;
@@ -2745,6 +2749,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--jitter") jitterOut = next();
 		else if (a == "--clip") clipOut = next();
 		else if (a == "--clipmesh") clipMeshOut = next();
+		else if (a == "--joints") jointsOut = next();
+		else if (a == "--sweep") { gSweepRate = (float)atof(next().c_str()); gSweepPeriod = (float)atof(next().c_str()); }
 		else if (a == "--stance") { gAnim.stance = std::clamp(atoi(next().c_str()), 0, IM_ARRAYSIZE(kStances) - 1); gStanceForced = true; }
 		else if (a == "--first-person") gFirstPerson = true;   // testing: the First person box ticked (a weapon with physics)
 		else if (a == "--kf") { gAnim.customPath = next(); gS.preset = kCustom; }
@@ -2828,7 +2834,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		}
 
 		if (gItem.loaded) {
-			float simDt = (jitterOut.empty() && clipOut.empty() && clipMeshOut.empty()) || gRealtime ? dt * gS.timeScale : gMeasureStep;   // measuring: a fixed step, comparable runs (--realtime: the real one)
+			float simDt = (jitterOut.empty() && clipOut.empty() && clipMeshOut.empty() && jointsOut.empty()) || gRealtime ? dt * gS.timeScale : gMeasureStep;   // measuring: a fixed step, comparable runs (--realtime: the real one)
 			const bool painting = maker::Painting();   // the body holds still under the brush
 			gNifPose = painting && maker::gM.nifPose;  // and is shown in the NIF's own pose
 			UpdateMotion(painting ? 0.0f : simDt);
@@ -3112,6 +3118,34 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 					if (f) {
 						for (auto& [name, st] : stats)
 							fprintf(f, "%s: %.2f%% of samples inside the body, deepest %.2f units\n", name.c_str(), st.samples ? 100.0 * st.inside / st.samples : 0.0, st.deepest);
+						fclose(f);
+					}
+					done = true;
+				}
+			}
+
+			// --joints: how far apart each constraint's two pivots get in the physics (a chain coming apart), over 6 s after
+			// 2 s of settling: the worst and the mean of each frame's widest, then the program closes.
+			static int jointFrames = 0;
+			static double jointWorst = 0, jointSum = 0;
+			if (!jointsOut.empty() && gItem.system && frameNo >= 240) {
+				std::vector<hdt::BoneScaleConstraint*> all;
+				for (auto& c : gItem.system->constraints()) all.push_back(c.get());
+				for (auto& group : gItem.system->constraintGroups())
+					for (auto& c : group->m_constraints) all.push_back(c.get());
+				double widest = 0;
+				for (auto* c : all) {
+					if (!c->getConstraint() || c->getConstraint()->getConstraintType() != D6_SPRING_2_CONSTRAINT_TYPE) continue;
+					auto* g = static_cast<btGeneric6DofSpring2Constraint*>(c->getConstraint());
+					const btVector3 pa = (g->getRigidBodyA().getWorldTransform() * g->getFrameOffsetA()).getOrigin();
+					const btVector3 pb = (g->getRigidBodyB().getWorldTransform() * g->getFrameOffsetB()).getOrigin();
+					widest = std::max(widest, (double)(pa - pb).length());
+				}
+				jointWorst = std::max(jointWorst, widest);
+				jointSum += widest;
+				if (++jointFrames == 720) {
+					if (FILE* f = fopen(jointsOut.c_str(), "w")) {
+						fprintf(f, "joints apart: worst %.3f, mean of each frame's widest %.3f (%zu joints, %d frames)\n", jointWorst, jointSum / jointFrames, all.size(), jointFrames);
 						fclose(f);
 					}
 					done = true;

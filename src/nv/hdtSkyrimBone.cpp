@@ -188,6 +188,8 @@ namespace hdt
 
 		m_node->world.rotate = convertBt(drawn.getBasis());
 		m_node->world.translate = convertBt(drawn.getOrigin());
+		if (m_writeLocal && !m_rig.isStaticOrKinematicObject() && m_node->parent)
+			m_node->local = m_node->parent->world.Invert() * m_node->world;
 
 		// Nodes under a simulated bone that are not simulated themselves (attached props, a chain's
 		// loose tip) follow it. Simulated children are written after this one (bones go root first).
@@ -210,6 +212,8 @@ namespace hdt
 		btTransform drawn = btTransform(convertNi(parent->world.rotate), convertNi(parent->world.translate)) * m_drawnRel;
 		m_node->world.rotate = convertBt(drawn.getBasis());
 		m_node->world.translate = convertBt(drawn.getOrigin());
+		if (m_writeLocal && m_node->parent)
+			m_node->local = m_node->parent->world.Invert() * m_node->world;
 		for (uint16_t i = 0; i < m_node->ChildEnd(); ++i) {
 			if (auto* child = m_node->children[i])
 				updateTransformUpDown(child);

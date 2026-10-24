@@ -49,6 +49,8 @@ namespace nvsmp
 			int builds = 0;
 			bool failed = false;
 			bool waiting = false;                 // the game has not bound its skin yet
+			bool firstPerson = false;             // on the player's first-person model
+			float jointGapPhys = 0, jointGapDrawn = 0;   // the widest a constraint's two pivots were apart since the last report
 			hdt::DefaultBBP::NameMap_t names;     // race hair: the physics file's shape names -> the game's (see RaceHairFile)
 			std::unordered_map<std::string, std::string> boneLists;   // and the "SMP Bones" lists the game stripped
 			// Race hair is drawn without skinning (see CpuSkin): its shapes skinned here, their skins held aside.
@@ -112,6 +114,7 @@ namespace nvsmp
 		bool buildMenuSystem(RE::NiNode* root, RE::NiAVObject* shape, const std::string& model);
 		float m_lastRootRadius = 0;   // the player root's last finite bound radius (see KeepRadius)
 		std::string m_playerRootName;   // what the last scan took as the player's 3D (for the log)
+		RE::NiNode* m_firstPersonRoot = nullptr;   // the player's first-person model this frame (its items: SkyrimSystem::setFirstPerson)
 		float m_builtWaistCollision = -1.0f;   // the waist collision the systems were built with
 		int m_builtGround = -1;                // and the ground setting
 		bool m_rebuildPending = false;         // a collision setting changed: rebuild at the next update

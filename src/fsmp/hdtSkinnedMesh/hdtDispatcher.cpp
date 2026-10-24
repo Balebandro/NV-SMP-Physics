@@ -32,6 +32,8 @@ namespace hdt
 		// New Vegas: an actor past the collision distance (ActorManager) keeps its physics without collision.
 		if (shape0->m_lodNoCollide || shape1->m_lodNoCollide)
 			return false;
+		if (shape0->m_isolation != shape1->m_isolation)
+			return false;
 
 		return shape0->canCollideWith(shape1) && shape1->canCollideWith(shape0);
 	}

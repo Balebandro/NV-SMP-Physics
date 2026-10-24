@@ -223,6 +223,33 @@ namespace hdt
 			logger::info("[SMP] system removed: {} skin slot(s) put back, {} node(s) kept", restored, retired);
 	}
 
+	// The player's first-person model: the game draws it after moving it into camera space, updating its nodes again from
+	// their local transforms. So the nodes made here (held by skin slots only, out of the scene) hang on their anchors, with
+	// the update flags (SELECTIVE_UPDATE 0x2, SELECTIVE_UPDATE_TRANSFORMS 0x4), and the simulated bones write their local
+	// transforms too: that update then puts the charm where the physics has it. And it collides with nothing of other
+	// systems: it sits where the third-person body is.
+	void SkyrimSystem::setFirstPerson()
+	{
+		typedef void(__thiscall * AttachChild_t)(RE::NiNode*, RE::NiAVObject*, int);
+		static const auto attachChild = (AttachChild_t)0x00A5ED10;   // NiNode::AttachChild(child, bFirstAvail)
+		for (auto& m : m_meshes)
+			m->m_isolation = this;
+		int attached = 0;
+		for (auto& b : m_bones) {
+			auto* bone = static_cast<SkyrimBone*>(b.get());
+			bone->m_isolation = this;
+			bone->m_writeLocal = true;
+			RE::NiNode* node = bone->m_node.get();
+			if (!node || node->parent || !bone->m_anchor)
+				continue;
+			node->local = bone->m_anchorToNode;
+			*reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(node) + 0x30) |= 0x2 | 0x4;
+			attachChild(bone->m_anchor.get(), node, 1);
+			++attached;
+		}
+		logger::info("[SMP] first person: {} node(s) hung on their anchors, collisions kept to this system", attached);
+	}
+
 	int SkyrimSystem::releaseSlots()
 	{
 		int restored = 0;
@@ -688,6 +715,23 @@ namespace hdt
 		m_deferredBuilds.clear();
 
 		addRigidPieceCollision();
+
+		// A small system (a charm, a pendant: a few light links on a bone that can move fast, a weapon swung by a
+		// turn) has its joints solved with 4 times the solver's iterations: at 10, a hard turn left a charm's pivots up to
+		// 2 units apart (the chain came apart), at 40 0.5 (previewer, --joints). Bullet takes the most any constraint of
+		// a simulation island asks for, for that island only, so the other items' solving costs the same.
+		{
+			int simulated = 0;
+			for (auto& b : m_mesh->m_bones) simulated += !b->m_rig.isStaticOrKinematicObject();
+			if (simulated > 0 && simulated <= 16) {
+				const int iterations = 4 * SkyrimPhysicsWorld::get()->getSolverInfo().m_numIterations;
+				for (auto& c : m_mesh->m_constraints)
+					if (c->getConstraint()) c->getConstraint()->setOverrideNumSolverIterations(iterations);
+				for (auto& group : m_mesh->m_constraintGroups)
+					for (auto& c : group->m_constraints)
+						if (c->getConstraint()) c->getConstraint()->setOverrideNumSolverIterations(iterations);
+			}
+		}
 
 		if (m_ground) {
 			bool simulatedBody = false;
