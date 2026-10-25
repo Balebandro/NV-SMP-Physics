@@ -833,6 +833,31 @@ namespace maker
 		if (m.empty()) gM.masks.erase(shape);
 	}
 
+	// Ctrl+click with Mask / Unmask: the whole element vertex v is on (the connected piece, over the triangles and across
+	// seams) masked (or unmasked). How many vertices that was.
+	static int MaskElement(const std::string& shape, const ShapeDraw& s, int v, bool unmask)
+	{
+		const auto& nb = Neighbours(s);
+		if (v < 0 || v >= (int)nb.size()) return 0;
+		std::vector<char> in(nb.size(), 0);
+		std::vector<int> open{ v };
+		in[v] = 1;
+		while (!open.empty()) {
+			const int x = open.back();
+			open.pop_back();
+			for (int w : nb[x]) if (!in[w]) { in[w] = 1; open.push_back(w); }
+		}
+		// A seam copy lists the vertex it is welded to, which does not list it back: taken in by its link into the piece.
+		for (int u = 0; u < (int)nb.size(); u++)
+			if (!in[u]) for (int w : nb[u]) if (in[w]) { in[u] = 2; break; }
+		auto& m = gM.masks[shape];
+		int count = 0;
+		for (int u = 0; u < (int)nb.size(); u++)
+			if (in[u]) { if (unmask) m.erase(u); else m.insert(u); ++count; }
+		if (m.empty()) gM.masks.erase(shape);
+		return count;
+	}
+
 	// Smoothing: each vertex moves toward its neighbours' average (unpainted ones count as 0), by `f` (0..1) each.
 	static void SmoothVertices(PaintChain& c, const ShapeDraw& s, const std::vector<std::pair<int, float>>& verts)
 	{
@@ -1057,6 +1082,14 @@ namespace maker
 		int shape, nearV;
 		V3 p, n;
 		if (!overUi && Raycast(eye, dir, only, shape, p, n, nearV)) { gM.hit = true; gM.hitPoint = p; gM.hitNormal = n; gM.hitShape = shape; }
+		// Ctrl+click with Mask / Unmask: the whole element under the mouse (see MaskElement), one undo step.
+		if (gM.tool >= 4 && forced < 0 && !gM.stroking && io.KeyCtrl && gM.hit && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			const std::string name = gItem.shapes[shape].info.geometry->m_name ? gItem.shapes[shape].info.geometry->m_name : "";
+			PushUndo();
+			const int count = MaskElement(name, gItem.shapes[shape], nearV, gM.tool == 5);
+			AddLog(2, std::string(gM.tool == 5 ? "unmasked" : "masked") + " an element of " + name + ": " + std::to_string(count) + " vertices");
+			return;
+		}
 		bool down = forced >= 0 ? forced == 1 : ImGui::IsMouseDown(ImGuiMouseButton_Left) && !io.KeyCtrl;
 		bool clicked = forced >= 0 ? forced == 1 : ImGui::IsMouseClicked(ImGuiMouseButton_Left);
 		if (!gM.stroking) {
@@ -1268,7 +1301,7 @@ namespace maker
 			if (m.empty()) gM.masks.erase(invertOn);
 		}
 		ImGui::EndDisabled();
-		Help("Mask: brush over vertices to protect them (dark blue): no brush, smoothing or grow / fade changes their paint. Unmask frees them. Invert: on the selected chain's shape (or the last one under the brush), masks what is free and frees what is masked, to work only on a part. Move points: drag a chain's point (its bone) to where it should be; the mesh stays, and builds weighted to the bones where they are (moved points show cyan).");
+		Help("Mask: brush over vertices to protect them (dark blue): no brush, smoothing or grow / fade changes their paint. Unmask frees them. Ctrl+click with either: the whole element under the mouse (the connected piece of the mesh) at once. Invert: on the selected chain's shape (or the last one under the brush), masks what is free and frees what is masked, to work only on a part. Move points: drag a chain's point (its bone) to where it should be; the mesh stays, and builds weighted to the bones where they are (moved points show cyan).");
 		Help("New chain: each stroke is a new chain, laid along the stroke. Add: paints more of the mesh onto the selected chain (its bones stay). Erase: takes paint off the selected chain. Smooth: evens out the selected chain's paint under the brush (hard edges blend, spots fill in).");
 		ImGui::BeginDisabled(gM.undo.empty());
 		if (ImGui::Button("Undo")) Undo();
