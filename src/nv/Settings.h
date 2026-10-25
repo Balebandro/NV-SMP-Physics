@@ -26,7 +26,6 @@ namespace nvsmp
 
 		bool collisions = true;         // off: the cloth passes through the body (for finding what pushes it)
 		bool collideOncePerFrame = false; // the collision tests on a frame's first step only, later steps reuse its contacts
-		float waistCollision = 0.0f;    // 0: bones the physics file keeps out of collision stay out; 1: they collide fully
 		bool ground = true;             // a ground plane at the actor's feet the cloth rests on (crouching, sitting)
 
 		// The jitter filter (SkyrimBone::s_filter): smooths what is drawn of each simulated bone, not the physics.

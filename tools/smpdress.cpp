@@ -59,6 +59,7 @@
 // creates them from this list) and "HDT Skinned Mesh Physics Object" on the shape and the root.
 #include "nif.h"
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <fstream>
 #include <cstdio>
@@ -1169,14 +1170,45 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 		b.center = c; b.radius = rad;
 	}
 
-	SkinPartition np = buildPartition(neww, gd.triangles, sd.bones.size());
-	printf("  partitions: %zu (", np.parts.size());
-	for (auto& p : np.parts) printf(" %zuv/%zut/%zub", p.vertexMap.size(), p.triangles.size(), p.bones.size());
-	printf(" )\n");
-	if (dism) {
-		SkinInstance::Part proto = si.parts.empty() ? SkinInstance::Part{ 257, 0 } : si.parts[0];
-		si.parts.assign(np.parts.size(), proto);
+	// A shape that comes apart (BSDismemberSkinInstance with several body parts: a head's neck cap 1000 and head 1, the part
+	// dismemberment hides) keeps them: each source partition's triangles are partitioned on their own and keep its flags and
+	// body part. As one body part the head never came off.
+	SkinPartition np;
+	std::vector<SkinInstance::Part> parts;
+	if (dism && sp.parts.size() > 1 && si.parts.size() == sp.parts.size()) {
+		auto keyOf = [](uint16_t a, uint16_t b, uint16_t c) { std::array<uint16_t, 3> k{ a, b, c }; std::sort(k.begin(), k.end()); return k; };
+		std::map<std::array<uint16_t, 3>, size_t> partOf;   // a triangle's vertices (sorted) -> its source partition
+		for (size_t k = 0; k < sp.parts.size(); k++) {
+			const auto& p = sp.parts[k];
+			auto global = [&](uint16_t local) { return p.hasVertexMap && local < p.vertexMap.size() ? p.vertexMap[local] : local; };
+			for (auto& t : p.triangles) partOf[keyOf(global(t.v[0]), global(t.v[1]), global(t.v[2]))] = k;
+			for (auto& s : p.strips)
+				for (size_t j = 2; j < s.size(); j++) partOf[keyOf(global(s[j - 2]), global(s[j - 1]), global(s[j]))] = k;
+		}
+		std::vector<std::vector<Triangle>> byPart(sp.parts.size());
+		size_t unmatched = 0;
+		for (auto& t : gd.triangles) {
+			auto it = partOf.find(keyOf(t.v[0], t.v[1], t.v[2]));
+			if (it == partOf.end()) unmatched++;
+			byPart[it == partOf.end() ? 0 : it->second].push_back(t);
+		}
+		if (unmatched) printf("  note: %zu triangle(s) in no source partition: given body part %u\n", unmatched, si.parts[0].bodyPart);
+		for (size_t k = 0; k < byPart.size(); k++) {
+			if (byPart[k].empty()) continue;
+			for (auto& p : buildPartition(neww, byPart[k], sd.bones.size()).parts) { np.parts.push_back(p); parts.push_back(si.parts[k]); }
+		}
+	} else {
+		np = buildPartition(neww, gd.triangles, sd.bones.size());
+		parts.assign(np.parts.size(), si.parts.empty() ? SkinInstance::Part{ 257, 0 } : si.parts[0]);
 	}
+	printf("  partitions: %zu (", np.parts.size());
+	for (size_t k = 0; k < np.parts.size(); k++) {
+		auto& p = np.parts[k];
+		printf(" %zuv/%zut/%zub", p.vertexMap.size(), p.triangles.size(), p.bones.size());
+		if (dism) printf(" part %u", parts[k].bodyPart);
+	}
+	printf(" )\n");
+	if (dism) si.parts = parts;
 
 	std::string smpBones;
 	for (size_t b = 0; b < boneNames.size(); b++) {

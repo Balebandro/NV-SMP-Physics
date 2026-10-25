@@ -1910,7 +1910,7 @@ namespace hdt
 						body->m_noCollideWithBones.insert(bone);
 				} else if (nodeName == "weight-threshold") {
 					auto boneName = m_reader->getAttribute("bone");
-					float wt = m_reader->readFloat() * m_weightThresholdScale;
+					float wt = m_reader->readFloat();
 					for (int i = 0; i < body->m_skinnedBones.size(); ++i) {
 						if (body->m_skinnedBones[i].ptr->m_name == getRenamedBone(boneName)) {
 							body->m_skinnedBones[i].weightThreshold = wt;
@@ -2013,7 +2013,7 @@ namespace hdt
 						body->m_noCollideWithBones.insert(bone);
 				} else if (nodeName == "weight-threshold") {
 					auto boneName = m_reader->getAttribute("bone");
-					float wt = m_reader->readFloat() * m_weightThresholdScale;
+					float wt = m_reader->readFloat();
 					for (int i = 0; i < body->m_skinnedBones.size(); ++i) {
 						if (body->m_skinnedBones[i].ptr->m_name == getRenamedBone(boneName)) {
 							body->m_skinnedBones[i].weightThreshold = wt;

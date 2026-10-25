@@ -339,8 +339,37 @@ namespace scene
 		auto weaponNode = item.skeleton.bones.find("Weapon");
 		if (weaponNode == item.skeleton.bones.end()) weapon = false;
 		item.weapon = weapon;
+		// A static with physics (see Item::worldObject): the root names a physics file and no skin names a skeleton bone (a
+		// "Bip01" one, or one of the game's skeleton when it is loaded; worn items, hair and head parts always name one).
+		if (!weapon) {
+			bool physics = false;
+			{
+				nif::AVObject root;
+				nif::Reader r(f.blocks[f.roots[0]].data(), f.blocks[f.roots[0]].size());
+				root.read(r, true);
+				for (int e : root.extraData) {
+					if (f.typeOf(e) != "NiStringExtraData") continue;
+					nif::Reader er(f.blocks[e].data(), f.blocks[e].size());
+					if (_stricmp(f.strings[er.u32()].c_str(), "HDT Skinned Mesh Physics Object") == 0) physics = true;
+				}
+			}
+			bool skeletonBone = false;
+			for (size_t blk = 0; physics && blk < f.blocks.size() && !skeletonBone; blk++) {
+				if (f.typeOf(blk) != "NiTriShape" && f.typeOf(blk) != "NiTriStrips") continue;
+				nif::Geometry g;
+				g.read(f.blocks[blk]);
+				if (g.skin < 0) continue;
+				nif::SkinInstance si;
+				si.read(f.blocks[g.skin], f.typeOf(g.skin) == "BSDismemberSkinInstance");
+				for (int b : si.bones) {
+					const std::string name = b >= 0 ? StrName(f, b) : std::string();
+					if (_strnicmp(name.c_str(), "Bip01", 5) == 0 || (!skeletonPath.empty() && item.skeleton.bones.count(name))) skeletonBone = true;
+				}
+			}
+			item.worldObject = physics && !skeletonBone;
+		}
 		item.model = NewNode("Scene Root");
-		AddChild(weapon ? weaponNode->second : item.skeleton.actor, item.model);
+		if (!item.worldObject) AddChild(weapon ? weaponNode->second : item.skeleton.actor, item.model);
 		{
 			nif::AVObject root;
 			nif::Reader r(f.blocks[f.roots[0]].data(), f.blocks[f.roots[0]].size());
@@ -373,9 +402,9 @@ namespace scene
 				}
 				info.geometry->local = ToRE(t);
 			}
-			// A weapon keeps its own nodes (the game drops only armor's): a slot naming a NIF node that is not a skeleton
-			// bone points at that node, made under the item's root where the NIF places it.
-			if (weapon && info.geometry->skinInstance) {
+			// A weapon keeps its own nodes (the game drops only armor's), and so does a static: a slot naming a NIF node that is
+			// not a skeleton bone points at that node, made under the item's root where the NIF places it.
+			if ((weapon || item.worldObject) && info.geometry->skinInstance) {
 				nif::Geometry g;
 				g.read(f.blocks[blk]);
 				nif::SkinInstance si;
@@ -405,6 +434,7 @@ namespace scene
 			item.shapes.push_back(std::move(info));
 		}
 		hdt::updateTransformUpDown(item.skeleton.actor);
+		if (item.worldObject) hdt::updateTransformUpDown(item.model);
 		if (const char* named = item.model->FindStringExtra("HDT Skinned Mesh Physics Object"))
 			item.physicsFile = named;
 		return item;

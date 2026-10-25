@@ -111,10 +111,6 @@ namespace hdt
 		// the game attaching it can be missing them; the caller builds it again a little later.
 		bool complete();
 
-		// New Vegas: scales every weight-threshold the physics file sets (the menu's waist collision: 1 -
-		// waist). Applied at build, so FSMP drops exactly the colliders that cannot collide.
-		float m_weightThresholdScale = 1.0f;
-
 		// New Vegas: a ground plane at the actor's feet for the cloth to rest on (see addGroundPlane), raised
 		// or lowered by the offset (game units).
 		bool m_ground = true;

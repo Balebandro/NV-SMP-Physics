@@ -39,6 +39,9 @@ namespace scene
 		std::map<std::string, RE::NiGeometry*> byName;
 		std::string physicsFile;               // what the root's "HDT Skinned Mesh Physics Object" names
 		bool weapon = false;                   // on the skeleton's Weapon node (a weapon NIF), not the actor
+		// A placed object's physics (a static: its root names the physics file, its skins name no skeleton bone): on its own
+		// root, not under the actor, its skins on its own nodes, as the game places it in a cell.
+		bool worldObject = false;
 	};
 
 	// Loads the NIF into a new Item (never freed: the objects are leaked on reload, a few MB at most).

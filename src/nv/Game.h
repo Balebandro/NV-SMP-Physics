@@ -80,6 +80,35 @@ namespace Game
 		}
 	}
 
+	// The game's grab control (UACTN_GRAB 0x1B, Z by default) pressed this frame, read as PlayerCharacter::HandlePhysicsGrab
+	// (0x95F6C0) reads it: TESMain::GetControls (0x877720) then Controls::GetUserAction (0xA24660) with isPressed (1). The
+	// game's own grab holds something while bIsGrabbing (0x11E0D5C) is set.
+	inline bool GrabPressed()
+	{
+		__try {
+			void* main = *(void**)kTESMain;
+			void* controls = main ? ((void*(__thiscall*)(void*))0x00877720)(main) : nullptr;
+			return controls && ((int(__thiscall*)(void*, int, int))0x00A24660)(controls, 0x1B, 1) != 0;
+		} __except (1) {
+			return false;
+		}
+	}
+	inline bool GameGrabbing() { return *(const uint8_t*)0x011E0D5C != 0; }
+
+	// The player's eye and view direction as the game's grab aims (Actor::GetEyeVector 0x8AFF80, third person true, as
+	// PlayerCharacter::UpdateMouseSpring calls it).
+	inline bool EyeVector(RE::NiPoint3& eye, RE::NiPoint3& dir)
+	{
+		__try {
+			void* player = Player();
+			if (!player) return false;
+			((void(__thiscall*)(void*, RE::NiPoint3*, RE::NiPoint3*, int))0x008AFF80)(player, &eye, &dir, 1);
+			return true;
+		} __except (1) {
+			return false;
+		}
+	}
+
 	// A reference's place (TESObjectREFR +0x30).
 	inline RE::NiPoint3 RefPosition(const void* ref) { return At<RE::NiPoint3>(ref, 0x30); }
 

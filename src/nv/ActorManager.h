@@ -77,6 +77,7 @@ namespace nvsmp
 			void* npc = nullptr;                  // race hair: the actor's TESNPC (face values, hair colour)
 			std::string hairModel;                // and its hair's model path
 			bool headPart = false;                // a head part (hairModel is its model path), not race hair (HeadPart)
+			bool raceHead = false;                // a race's head: skinned and morphed by the game, as any item (no CpuSkin)
 		};
 
 		static constexpr unsigned kSettleFrames = 10, kRetryFrames = 30;
@@ -90,7 +91,8 @@ namespace nvsmp
 		void scan(RE::NiNode* root, RE::NiAVObject* obj, int depth);
 		void found(RE::NiNode* root, RE::NiAVObject* model, const char* file, const hdt::DefaultBBP::NameMap_t* names = nullptr,
 			const std::unordered_map<std::string, std::string>* lists = nullptr, RE::NiAVObject* hairShape = nullptr,
-			const char* headPartModel = nullptr);   // a head part's: keyed by its shape (hairShape), not the FaceGen node
+			const char* headPartModel = nullptr,    // a head part's: keyed by its shape (hairShape), not the FaceGen node
+			bool raceHead = false);                 // a race's head (see RaceHead): keyed by its shape too
 
 		std::map<std::pair<void*, void*>, Item> m_items;   // by (skeleton, model)
 		unsigned m_frame = 0;
@@ -153,6 +155,15 @@ namespace nvsmp
 		std::unordered_set<void*> m_explosionsSeen;   // last frame's explosions (each pushes once)
 		unsigned m_explosionHits = 0;                 // for the log
 		void pushByExplosions(const std::vector<void*>& explosions);
+		// The game's grab (Z) on simulated bones (see grabBones): a bone within kGrabRadius of the line of sight and kGrabReach
+		// along it is taken, then pulled each frame toward where it was taken along the view (its velocity kGrabPull times the
+		// gap per second, at most kGrabMaxSpeed units/s).
+		static constexpr float kGrabReach = 300.0f, kGrabRadius = 12.0f, kGrabPull = 12.0f, kGrabMaxSpeed = 3000.0f;
+		const void* m_grabSystem = nullptr;   // the held bone's system (only compared: used while still an item's)
+		size_t m_grabBone = 0;                // and its index there
+		float m_grabDistance = 0;             // how far along the view it is held
+		bool m_gameGrabbing = false;          // the game's own grab held something last frame
+		void grabBones(RE::NiNode* playerRoot);
 		// Head parts with physics in the race menu, as race hair: the player's copies (skin off, see g_menuHeadPartSkins)
 		// skinned each frame (skinMenuHeadParts) on a system of their own per head part file, on the same stand-in skeleton.
 		struct MenuHeadPart { RE::NiAVObject* shape; RE::NiNode* root; std::string model, key; };   // key: its lower-case game name
@@ -167,11 +178,16 @@ namespace nvsmp
 		void skinMenuHeadParts();
 		bool buildMenuHeadPart(const MenuHeadPart& h, MenuPartSystem& out);
 		void dropMenuHeadParts(const char* why);
+		// The player's race head physics in the race menu, as a head part's (its slots released): the face copies the menu
+		// shows have their own bones' slot nodes put on its bones each frame (PlaceFaceBones), the game skins them.
+		MenuPartSystem m_menuFace;
+		std::string m_menuFaceModel;   // the race head it was built for
+		bool buildMenuFace(RE::NiGeometry* g, RE::NiNode* root, const std::string& model);
+		void dropMenuFace(const char* why);
 		float m_lastRootRadius = 0;   // the player root's last finite bound radius (see KeepRadius)
 		std::string m_playerRootName;   // what the last scan took as the player's 3D (for the log)
 		RE::NiNode* m_firstPersonRoot = nullptr;   // the player's first-person model this frame (its items: SkyrimSystem::setFirstPerson)
-		float m_builtWaistCollision = -1.0f;   // the waist collision the systems were built with
-		int m_builtGround = -1;                // and the ground setting
+		int m_builtGround = -1;                // the ground setting the systems were built with
 		bool m_rebuildPending = false;         // a collision setting changed: rebuild at the next update
 	};
 }

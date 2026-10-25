@@ -331,7 +331,6 @@ struct Settings
 	int collisionThreads = -1;   // as the plugin's iCollisionThreads
 	bool collisions = true;
 	bool collideOncePerFrame = false;   // as the plugin's bCollideOncePerFrame
-	float waistCollision = 0.0f;
 	bool ground = true;
 	bool jitterFilter = true;     // the plugin's jitter filter (SkyrimBone::SetJitterFilter)
 	float jitterSmoothing = 0.5f;
@@ -367,10 +366,12 @@ struct Item
 	RE::BSTSmartPointer<hdt::SkyrimSystem> system;
 	std::vector<ShapeDraw> shapes;
 	int simulatedBones = 0, constraintCount = 0;
-	float builtWaist = -1;
 	// The body's animated bones and their rest locals.
 	RE::NiNode *pelvis = nullptr, *lThigh = nullptr, *rThigh = nullptr, *lCalf = nullptr, *rCalf = nullptr;
 	RE::NiTransform pelvis0, lThigh0, rThigh0, lCalf0, rCalf0;
+	RE::NiPoint3 staticCenter;   // a static's middle, where the camera looks (see scene::Item::worldObject)
+	float staticSize = 0;        // and its bounding box's diagonal
+	bool fitCamera = false;      // the camera to back off to it on the next frame
 } gItem;
 static bool gFirstPerson = false;    // a weapon with physics on the first-person skeleton, seen from its Camera1st
 
@@ -510,6 +511,13 @@ static void BuildSystem()
 		world->removeSkinnedMeshSystem(gItem.system.get());
 		gItem.system = nullptr;   // gives the skin slots back
 	}
+	// A static's bones are its own nodes (a worn item's are made anew by each build): the physics left them where it moved
+	// them (it writes their world transforms, not their locals), and a build takes the nodes as they are for the rest pose.
+	// Back at rest from their locals first, or an edit to the XML rebuilt the cloth wherever it had swung to.
+	if (gItem.scene.worldObject && gItem.scene.model) {
+		gItem.scene.model->world = gItem.scene.model->local;
+		hdt::updateTransformUpDown(gItem.scene.model);
+	}
 	for (auto& s : gItem.shapes) s.collider = 0;
 	gItem.simulatedBones = gItem.constraintCount = 0;
 	if (gItem.scene.physicsFile.empty()) {
@@ -570,10 +578,11 @@ static void BuildSystem()
 
 	hdt::DefaultBBP::PhysicsFile_t file{ gItem.xmlNamed, {} };
 	hdt::SkyrimSystemCreator creator;
-	creator.m_weightThresholdScale = 1.0f - gS.waistCollision;
 	creator.m_ground = gS.ground;
-	gItem.builtWaist = gS.waistCollision;
-	auto system = creator.createOrUpdateSystem(gItem.scene.skeleton.actor, gItem.scene.model, &file, {}, nullptr);
+	// A static is built as the plugin builds a placed object: its own root as the skeleton, its bones its own nodes, no
+	// ground plane (it would sit on the object's origin).
+	if (gItem.scene.worldObject) { creator.m_worldObject = true; creator.m_ground = false; }
+	auto system = creator.createOrUpdateSystem(gItem.scene.worldObject ? gItem.scene.model : gItem.scene.skeleton.actor, gItem.scene.model, &file, {}, nullptr);
 	if (!system) {
 		AddLog(4, "no physics built from " + xml + " (see the messages above)");
 		return;
@@ -1425,6 +1434,31 @@ static void LoadItem(const std::string& path)
 		std::to_string(gItem.roots.folders.size()) + " Data folders and " + std::to_string(gItem.roots.archives.size()) + " archives searched");
 	if (gItem.scene.weapon)
 		AddLog(2, "a weapon: on the skeleton's Weapon node, as the game holds it (pick its stance under Motion)");
+	// A static: stood on the ground (its lowest point at z 0; in game its reference places it), the camera on it.
+	if (gItem.scene.worldObject) {
+		auto* model = gItem.scene.model;
+		float lo = FLT_MAX;
+		RE::NiPoint3 mn{ FLT_MAX, FLT_MAX, FLT_MAX }, mx{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+		auto bound = [&](bool lift) {
+			for (auto& d : gItem.shapes) {
+				auto* g = d.info.geometry;
+				for (int v = 0; v < (int)g->data->vertexCount; v++) {
+					const RE::NiPoint3 p = g->skinInstance ? scene::SkinVertex(g, v, d.weights) : g->world * g->data->vertices[v];
+					if (lift) lo = std::min(lo, p.z);
+					else { mn = { std::min(mn.x, p.x), std::min(mn.y, p.y), std::min(mn.z, p.z) }; mx = { std::max(mx.x, p.x), std::max(mx.y, p.y), std::max(mx.z, p.z) }; }
+				}
+			}
+		};
+		bound(true);
+		if (lo != FLT_MAX) model->local.translate.z -= lo;
+		model->world = model->local;
+		hdt::updateTransformUpDown(model);
+		bound(false);
+		gItem.staticCenter = mn.x != FLT_MAX ? (mn + mx) * 0.5f : model->world.translate;
+		gItem.staticSize = mn.x != FLT_MAX ? (mx - mn).Length() : 0.0f;
+		gItem.fitCamera = true;
+		AddLog(2, "a placed object (a static): its own physics on its own nodes, as the game builds one placed in a cell; stood on the ground here");
+	}
 	auto& r = gItem.roots;
 	AddLog(2, r.mo2Instance.empty() ? std::string("MO2: none found") : "MO2: " + r.mo2Instance + ", profile '" + r.mo2Profile + "' (" + r.mo2How + ")");
 	AddLog(2, r.gameData.empty() ? std::string("game: not found") : "game: " + r.gameData + " (" + r.gameHow + ")");
@@ -1513,6 +1547,7 @@ static V3 FocusPoint()
 {
 	if (!gFocusNode.empty() && gItem.scene.skeleton.actor)
 		if (auto* n = hdt::findObject(gItem.scene.skeleton.actor, gFocusNode.c_str())) return V3(n->world * gFocusAt);
+	if (gItem.scene.worldObject) return V3(gItem.staticCenter);
 	if (gItem.pelvis) return V3(gItem.pelvis->world.translate) - V3(0, 0, 22);
 	return V3(gItem.scene.skeleton.actor ? gItem.scene.skeleton.actor->world.translate : RE::NiPoint3{}) + V3(0, 0, 70);
 }
@@ -1522,6 +1557,8 @@ static void UpdateCamera(float dt)
 	ImGuiIO& io = ImGui::GetIO();
 	V3 focus = FocusPoint();
 	if (!gCam.init) { gCam.target = focus; gCam.init = true; }
+	// A static just loaded: far enough back to see all of it (a drape is taller than the body the default is made for).
+	if (gItem.fitCamera) { gCam.dist = std::clamp(std::max(250.0f, gItem.staticSize * 1.4f), 20.0f, 2000.0f); gItem.fitCamera = false; }
 	float k = 1.0f - std::exp(-dt * 10.0f);
 	gCam.target = gCam.target + (focus - gCam.target) * k;
 	if (!io.WantCaptureMouse) {
@@ -1535,7 +1572,7 @@ static void UpdateCamera(float dt)
 		}
 		if (io.MouseWheel != 0) gCam.dist = std::clamp(gCam.dist * std::pow(0.88f, io.MouseWheel), 20.0f, 2000.0f);
 		// Ctrl + left drag: drag the body around (the cloth feels it like any other move).
-		if (io.KeyCtrl && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0)) {
+		if (io.KeyCtrl && !gItem.scene.worldObject && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0)) {
 			V3 right(std::cos(gCam.yaw), std::sin(gCam.yaw), 0), fwd(-std::sin(gCam.yaw), std::cos(gCam.yaw), 0);
 			float s = gCam.dist * 0.0022f;
 			gMotion.pos = gMotion.pos + right * (io.MouseDelta.x * s) + fwd * (-io.MouseDelta.y * s);
@@ -2015,6 +2052,10 @@ static void Panels(float fps)
 	}
 
 	if (ImGui::CollapsingHeader("Motion", gOpenValues ? 0 : ImGuiTreeNodeFlags_DefaultOpen)) {
+		// A static does not walk (see UpdateMotion): the panel stays, greyed out.
+		const bool still = gItem.scene.worldObject;
+		if (still) ImGui::TextDisabled("A placed object: it stays where it stands, no motion.");
+		ImGui::BeginDisabled(still);
 		if (ImGui::Combo("Motion##preset", &gS.preset, kPresets, IM_ARRAYSIZE(kPresets))) {   // own ID: the header is "Motion" too
 			// The sneak presets crouch; leaving them stands up.
 			bool sneakPreset = gS.preset == kSneak || gS.preset == kSneakWalk;
@@ -2067,6 +2108,7 @@ static void Panels(float fps)
 		ImGui::PopItemWidth();
 		if (ImGui::Button("Back to start")) { gMotion = Motion(); gAnim.current = gAnim.previous = ClipPlay(); world->resetSystems(); }
 		ImGui::TextDisabled("Ctrl + drag: move the body by hand");
+		ImGui::EndDisabled();
 	}
 
 	if (ImGui::CollapsingHeader("Physics", gOpenValues ? 0 : ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -2089,12 +2131,10 @@ static void Panels(float fps)
 		changed |= Undo("iterations", gS.solverIterations, kDefaults.solverIterations);
 		changed |= ImGui::Checkbox("Collisions", &gS.collisions);
 		changed |= ImGui::Checkbox("Collide once per frame", &gS.collideOncePerFrame);
+		ImGui::BeginDisabled(gItem.scene.worldObject);   // a static is built without the ground plane (see BuildSystem)
 		bool rebuild = ImGui::Checkbox("Ground collision", &gS.ground);
+		ImGui::EndDisabled();
 		Help("As the game's F7 menu: a ground plane at the feet the cloth rests on when crouching or sitting (the floor grid is at its height).");
-		ImGui::SliderFloat("Waist collision", &gS.waistCollision, 0.0f, 1.0f, "%.2f");
-		rebuild |= ImGui::IsItemDeactivatedAfterEdit();
-		rebuild |= Undo("waist", gS.waistCollision, kDefaults.waistCollision);
-		Help("As in the game's F7 menu: the rows the physics file keeps out of collision. 0 = they follow the body, 1 = they collide. Rebuilds on release.");
 		if (rebuild && gItem.loaded) BuildSystem();
 		changed |= ImGui::Checkbox("Jitter filter", &gS.jitterFilter);
 		Help("As in the game's F7 menu: smooths the small fast shaking of the cloth (what is drawn, not the physics). The Chains readouts in Bone values show the jitter left.");
@@ -2913,7 +2953,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 			float simDt = (jitterOut.empty() && clipOut.empty() && clipMeshOut.empty() && jointsOut.empty()) || gRealtime ? dt * gS.timeScale : gMeasureStep;   // measuring: a fixed step, comparable runs (--realtime: the real one)
 			const bool painting = maker::Painting();   // the body holds still under the brush
 			gNifPose = painting && maker::gM.nifPose;  // and is shown in the NIF's own pose
-			UpdateMotion(painting ? 0.0f : simDt);
+			if (!gItem.scene.worldObject) UpdateMotion(painting ? 0.0f : simDt);   // a static stands still, the floor with it
 			UpdateWind(wallTime);
 			if (gAsyncStep) {
 				// As the plugin does with bAsyncStep: last frame's step written on the pose as it is now, this frame's

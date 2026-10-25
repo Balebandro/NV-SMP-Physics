@@ -154,6 +154,34 @@ namespace nvsmp
 				PlaceDroppedBones(node->children[i], actor, model, depth + 1);
 	}
 
+	// The race menu's face with a race head's bones (see RaceHead): no physics there, and the slots of the head's own bones hold
+	// the game's nodes for the NIF's, never placed (at the world origin: the nose was drawn stretched down to it). Each frame
+	// they are put on the menu's physics bones of their names (`names`: the slots' lower-case names), or else at rest from a
+	// skeleton bone of the same skin, in place (the slots keep their nodes, nothing is held).
+	static void PlaceFaceBones(RE::NiGeometry* g, RE::NiAVObject* actor, const std::vector<std::string>& names = {},
+		const std::unordered_map<std::string, RE::NiAVObject*>* bones = nullptr)
+	{
+		__try {
+			auto* skin = g->skinInstance;
+			if (!skin || !skin->bones || !skin->skinData || !skin->skinData->boneData) return;
+			const uint32_t n = skin->skinData->boneCount;
+			int reference = -1;
+			for (uint32_t i = 0; i < n && reference < 0; ++i)
+				if (RE::NiAVObject* slot = skin->bones[i]; slot && IsLiveBone(slot, actor, nullptr)) reference = (int)i;
+			if (reference < 0) return;
+			const auto* data = skin->skinData->boneData;
+			const RE::NiTransform skinToWorld = skin->bones[reference]->world * data[reference].skinToBone;
+			for (uint32_t i = 0; i < n; ++i)
+				if (RE::NiAVObject* slot = skin->bones[i]; slot && !IsLiveBone(slot, actor, nullptr)) {
+					RE::NiAVObject* bone = nullptr;
+					if (bones && i < names.size())
+						if (auto it = bones->find(names[i]); it != bones->end()) bone = it->second;
+					slot->world = bone ? bone->world : skinToWorld * data[i].skinToBone.Invert();
+				}
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+		}
+	}
+
 	// A safety net for the player: while the root's bound radius is not finite (one broken bone in any skinned item makes
 	// it so, and the game then draws nothing of the player), the last good radius is written back so the view test
 	// passes. The bound (a pointer at NiAVObject +0x20 in New Vegas) is read under SEH; the game recomputes it each
@@ -472,6 +500,50 @@ namespace nvsmp
 		return count;
 	}
 
+	// The NPC's race head model path: TESNPC's race (TESRaceForm at 0x10C, the race at +4), its kHeadModels[sex][0] (0xB0, 0xC0
+	// per sex, as TESRace::GetHeadPartModel 0x613970), the TESModel's path at +4; the sex is TESActorBaseData's flag 1 (0x34).
+	static const char* RaceHeadModel(void* ref)
+	{
+		__try {
+			void* base = *(void**)((uint8_t*)ref + 0x20);
+			if (!base || *((uint8_t*)base + 4) != 0x2A) return nullptr;
+			void* race = *(void**)((uint8_t*)base + 0x110);
+			if (!race) return nullptr;
+			const uint32_t female = *(uint32_t*)((uint8_t*)base + 0x34) & 1;
+			return *(const char**)((uint8_t*)race + 0xB0 + 0xC0 * female + 4);
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return nullptr;
+		}
+	}
+
+	// A race's head: the game's FaceGen loader keeps its NIF's face shape as "FaceGenFace" (TESRace::ppHeadPartNames[0]), skinned
+	// and bound by the game, its extra data stripped as race hair's. Read from the head's NIF: the shape with bones there, whatever
+	// its name, is the game's FaceGenFace.
+	static const RaceHairFile& RaceHead(const char* model)
+	{
+		static std::unordered_map<std::string, RaceHairFile> cache;
+		std::string key = model;
+		for (auto& c : key) c = (char)tolower((unsigned char)c);
+		if (auto it = cache.find(key); it != cache.end()) return it->second;
+		RaceHairFile& f = cache[key];
+		const std::string bytes = hdt::readAllFile(("Meshes\\" + std::string(model)).c_str());
+		if (bytes.empty()) logger::warn("[SMP] race head Meshes\\{}: not found", model);
+		else {
+			try {
+				RaceHairFile file = ParseRaceHair(bytes, "");
+				for (auto& [lower, list] : file.lists) {
+					f.physics = file.physics;
+					f.lists["facegenface"] = list;
+					if (auto v = file.verts.find(lower); v != file.verts.end()) f.verts["facegenface"] = v->second;
+					f.names[file.nifName[lower]] = { "FaceGenFace" };
+					break;
+				}
+			} catch (std::exception& e) { logger::warn("[SMP] race head Meshes\\{}: {}", model, e.what()); }
+			if (!f.physics.empty()) logger::info("[SMP] race head Meshes\\{}: physics '{}'", model, f.physics);
+		}
+		return f;
+	}
+
 	static void* NpcOf(void* ref)
 	{
 		__try {
@@ -580,10 +652,10 @@ namespace nvsmp
 	}
 
 	void ActorManager::found(RE::NiNode* root, RE::NiAVObject* model, const char* file, const hdt::DefaultBBP::NameMap_t* names,
-		const std::unordered_map<std::string, std::string>* lists, RE::NiAVObject* hairShape, const char* headPartModel)
+		const std::unordered_map<std::string, std::string>* lists, RE::NiAVObject* hairShape, const char* headPartModel, bool raceHead)
 	{
-		// A head part shares the FaceGen node with the hair and the other head parts: keyed by its own shape.
-		auto key = std::make_pair((void*)root, headPartModel && hairShape ? (void*)hairShape : (void*)model);
+		// A head part (or the race's head) shares the FaceGen node with the hair and the other head parts: keyed by its own shape.
+		auto key = std::make_pair((void*)root, (headPartModel || raceHead) && hairShape ? (void*)hairShape : (void*)model);
 		auto it = m_items.find(key);
 		if (it != m_items.end() && it->second.file != file) {
 			// The same node now names another file: rebuild.
@@ -602,7 +674,10 @@ namespace nvsmp
 			item.file = file;
 			item.worldObject = m_scanWorldObject;
 			if (names) item.names = *names;
-			if (lists) {
+			if (lists && raceHead) {
+				item.boneLists = *lists;
+				item.raceHead = true;
+			} else if (lists) {
 				item.boneLists = *lists;
 				item.npc = NpcOf(m_scanRef);
 				if (headPartModel) { item.hairModel = headPartModel; item.headPart = true; }
@@ -718,13 +793,10 @@ namespace nvsmp
 		hdt::SkyrimSystemCreator creator;
 		creator.m_boneLists = item.boneLists;
 		if (!item.hairModel.empty()) creator.m_fileMeshes = (item.headPart ? HeadPart(item.hairModel.c_str()) : RaceHair(item.hairModel.c_str())).proxies;   // its collision proxies, from the NIF
-		// Waist collision 0 keeps the file's weight thresholds, 1 removes them.
-		creator.m_weightThresholdScale = 1.0f - gSettings.waistCollision;
 		// The ground plane is anchored on the item's root: an actor's feet, but a placed object's own origin (a cloth's top
 		// edge, which would then hang below the plane and be shoved up through it).
 		creator.m_ground = gSettings.ground && !item.worldObject;
 		creator.m_worldObject = item.worldObject;
-		m_builtWaistCollision = gSettings.waistCollision;
 		m_builtGround = gSettings.ground;
 		logger::info("[SMP] building '{}' for {} on '{}' (try {})", file, model->GetName(), root->GetName(), item.builds);
 		// Race hair: its Bip01 Head slot on the skeleton's head. The game binds it by name and may take the hair NIF's own node
@@ -806,7 +878,7 @@ namespace nvsmp
 		// Race hair: the game draws it without skinning (its hair shader has no skinned path), at the node holding it. Its
 		// shapes are skinned here every frame instead (skinOnCpu), from their vertices as the game made them (with the face
 		// sliders' morphs), and their skins taken off so nothing else skins them again (NVR's shadows did).
-		if (!item.boneLists.empty())
+		if (!item.boneLists.empty() && !item.raceHead)
 			if (auto* node = model->AsNode())
 				for (uint16_t i = 0; i < node->ChildEnd(); ++i) {
 					auto* g = hdt::castNiGeometry(node->children[i]);
@@ -870,8 +942,19 @@ namespace nvsmp
 	}
 
 	// The skins given back and the vertices as the game made them, when the physics goes (the shapes may stay).
+	// A placed object's bones (its own nodes, which stay in its 3D) are put back at rest too: the simulated ones wrote their
+	// swung pose into them (world and local), and the next build (another file, a re-pointed skin, the object back in reach,
+	// changed collision settings) would take that pose for the rest one, the cloth rebuilt wherever it had swung to.
 	void ActorManager::ReleaseCpuSkins(Item& item)
 	{
+		if (item.worldObject && item.system && item.skeleton && item.worldRest.size() == item.system->getBones().size()) {
+			const auto& bones = item.system->getBones();
+			// Worlds first, then each local from its parent's world (a parent may be one of the bones, put back just above).
+			for (size_t i = 0; i < bones.size(); ++i)
+				if (auto* node = static_cast<hdt::SkyrimBone*>(bones[i].get())->m_node.get()) node->world = item.skeleton->world * item.worldRest[i];
+			for (auto& b : bones)
+				if (auto* node = static_cast<hdt::SkyrimBone*>(b.get())->m_node.get(); node && node->parent) node->local = node->parent->world.Invert() * node->world;
+		}
 		for (auto& s : item.cpuSkins) {
 			auto* g = hdt::castNiGeometry(s.shape.get());
 			if (!g) continue;
@@ -1104,7 +1187,6 @@ namespace nvsmp
 		const RaceHairFile& f = RaceHair(model.c_str());
 		hdt::DefaultBBP::PhysicsFile_t physicsFile{ f.physics, f.names };
 		hdt::SkyrimSystemCreator creator;
-		creator.m_weightThresholdScale = 1.0f - gSettings.waistCollision;
 		creator.m_ground = gSettings.ground;
 		creator.m_boneLists = f.lists;
 		creator.m_fileMeshes = f.proxies;
@@ -1266,6 +1348,49 @@ namespace nvsmp
 		m_menuPartSystems.clear();
 	}
 
+	void ActorManager::dropMenuFace(const char* why)
+	{
+		if (m_menuFace.system) {
+			hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(m_menuFace.system.get());
+			logger::info("[SMP] race menu: race head {} physics dropped ({})", m_menuFaceModel, why);
+		}
+		m_menuFace = MenuPartSystem();
+		m_menuFaceModel.clear();
+	}
+
+	// The race menu's physics for the player's race head, as a head part's: built on the face copy the menu shows (the game
+	// bound its skeleton bones; the creator finds its bone list by its name, FaceGenFace), on the stand-in skeleton, then its
+	// slots let go.
+	bool ActorManager::buildMenuFace(RE::NiGeometry* g, RE::NiNode* root, const std::string& model)
+	{
+		const RaceHairFile& f = RaceHead(model.c_str());
+		refreshMenuProxies(root);
+		if (!m_menuRoot || !g->parent) return false;
+		hdt::DefaultBBP::PhysicsFile_t physicsFile{ f.physics, f.names };
+		hdt::SkyrimSystemCreator creator;
+		creator.m_ground = gSettings.ground;
+		creator.m_boneLists = f.lists;
+		creator.m_skeletonNodes = m_menuProxies;
+		auto system = creator.createOrUpdateSystem(m_menuRoot.get(), g->parent, &physicsFile, {}, nullptr);
+		if (!system || !creator.complete()) {
+			if (system) system->releaseSlots();
+			logger::warn("[SMP] race menu: race head {} face {:p}: physics {}", model, (void*)g, system ? "incomplete" : "not built");
+			return false;
+		}
+		system->releaseSlots();
+		hdt::SkyrimPhysicsWorld::get()->addSkinnedMeshSystem(system.get());
+		m_menuFace.system = system;
+		m_menuFace.bones.clear();
+		for (auto& b : system->getBones()) {
+			std::string n = b->m_name.c_str();
+			for (auto& c : n) c = (char)tolower((unsigned char)c);
+			m_menuFace.bones[n] = static_cast<hdt::SkyrimBone*>(b.get())->m_node.get();
+		}
+		m_menuFaceModel = model;
+		logger::info("[SMP] race menu: race head {} physics built ({} bones)", model, system->getBones().size());
+		return true;
+	}
+
 	// The race menu's physics for a head part, as buildMenuSystem's for race hair: built on the copy with its skin on for the
 	// build only (its head slot on the skeleton's head) and its file's game name (the creator finds its bone lists and the
 	// XML's shapes by it), on the stand-in skeleton; then the copy let go (its skin slots put back, the skin off, its name back).
@@ -1297,7 +1422,6 @@ namespace nvsmp
 		if (!m_menuRoot) return false;
 		hdt::DefaultBBP::PhysicsFile_t physicsFile{ f.physics, f.names };
 		hdt::SkyrimSystemCreator creator;
-		creator.m_weightThresholdScale = 1.0f - gSettings.waistCollision;
 		creator.m_ground = gSettings.ground;
 		creator.m_boneLists = f.lists;
 		creator.m_fileMeshes = f.proxies;
@@ -1625,6 +1749,27 @@ namespace nvsmp
 					found(root, obj->parent, f.physics.c_str(), &f.names, &f.lists, obj, models[pick]);
 			}
 		}
+		// The race's head (see RaceHead): the FaceGen face whose race head NIF has physics, the same vertex count. The game skins
+		// and morphs it (sliders, expressions), so it is built as any item, on its node, keyed by its shape (race hair shares the
+		// node). Not in the race menu, which rebuilds the face: its bones are only held at rest there (PlaceFaceBones).
+		if (m_scanRef && obj->m_name && !_stricmp(obj->m_name, "FaceGenFace") && obj->parent)
+			if (auto* g = hdt::castNiGeometry(obj); g && g->data && g->skinInstance)
+				if (const char* head = RaceHeadModel(m_scanRef); head && *head) {
+					const RaceHairFile& f = RaceHead(head);
+					auto v = f.verts.find("facegenface");
+					if (!f.physics.empty() && v != f.verts.end() && v->second == g->data->vertexCount) {
+						if (m_raceMenu) {
+							// The player's: on its menu physics (built here, tried again each second until it is).
+							const bool player = root == Game::Get3D(Game::Player());
+							if (player && m_menuFace.system && m_menuFaceModel != head) dropMenuFace("another race head");
+							if (player && !m_menuFace.system && (m_menuFace.lastTry == 0 || m_frame - m_menuFace.lastTry >= 60)) {
+								m_menuFace.lastTry = m_frame;
+								if (buildMenuFace(g, root, head)) m_menuFace.lastTry = 0;
+							}
+							PlaceFaceBones(g, root, SlotNames(f.lists.at("facegenface")), player && m_menuFace.system ? &m_menuFace.bones : nullptr);
+						} else found(root, obj->parent, f.physics.c_str(), &f.names, &f.lists, obj, nullptr, true);
+					}
+				}
 		if (auto* node = obj->AsNode()) {
 			for (uint16_t i = 0; i < node->ChildEnd(); ++i)
 				scan(root, node->children[i], depth + 1);
@@ -1806,6 +1951,73 @@ namespace nvsmp
 		m_explosionsSeen.swap(now);
 	}
 
+	// The game's grab on SMP bones (Z by default): a press (read as the game reads it, so a rebound key works) takes the
+	// simulated bone nearest the player's line of sight, and the next press lets go, as the game's own grab toggles. Held, the
+	// bone is pulled toward where it was taken along the view each frame (its velocity set toward it, as the game's mouse spring
+	// pulls an object). Not on a press while the game's own grab holds something (that press drops it), not on the player's own
+	// items (the view starts inside them in third person), and let go in menus or a pause. Between the steps, as the pushes.
+	void ActorManager::grabBones(RE::NiNode* playerRoot)
+	{
+		const bool running = Game::FrameTime() > 0.0f;
+		const bool pressed = running && Game::GrabPressed();
+		const bool gameGrabbing = Game::GameGrabbing(), gameWasGrabbing = m_gameGrabbing;
+		m_gameGrabbing = gameGrabbing;
+
+		hdt::SkyrimBone* held = nullptr;
+		const Item* heldItem = nullptr;
+		if (m_grabSystem)
+			for (auto& [key, item] : m_items)
+				if (item.system && item.system.get() == m_grabSystem && m_grabBone < item.system->getBones().size()) {
+					held = static_cast<hdt::SkyrimBone*>(item.system->getBones()[m_grabBone].get());
+					heldItem = &item;
+				}
+		if (m_grabSystem && (!held || pressed || !running)) {
+			logger::info("[SMP] grab: let go{}", held ? "" : " (its physics went)");
+			m_grabSystem = nullptr;
+			held = nullptr;
+			if (pressed) return;   // the press that let go
+		}
+		if (!held && (!pressed || gameGrabbing || gameWasGrabbing)) return;
+
+		RE::NiPoint3 eyeNi, dirNi;
+		if (!Game::EyeVector(eyeNi, dirNi)) return;
+		const btVector3 eye = hdt::convertNi(eyeNi);
+		btVector3 dir = hdt::convertNi(dirNi);
+		if (dir.length2() < 1e-6f) return;
+		dir.normalize();
+
+		if (!held) {
+			float best = kGrabRadius;
+			for (auto& [key, item] : m_items) {
+				if (!item.system || key.first == (void*)playerRoot || key.first == (void*)m_firstPersonRoot) continue;
+				const auto& bones = item.system->getBones();
+				for (size_t i = 0; i < bones.size(); ++i) {
+					const auto& rig = bones[i]->m_rig;
+					if (rig.isStaticOrKinematicObject()) continue;
+					const btVector3 p = rig.getWorldTransform().getOrigin() + hdt::SkyrimBone::s_origin;
+					const btScalar t = (p - eye).dot(dir);
+					if (t <= 0 || t > kGrabReach) continue;
+					const btScalar d = (p - (eye + dir * t)).length();
+					if (d >= best) continue;
+					best = d;
+					m_grabSystem = item.system.get();
+					m_grabBone = i;
+					m_grabDistance = t;
+					held = static_cast<hdt::SkyrimBone*>(bones[i].get());
+					heldItem = &item;
+				}
+			}
+			if (!held) return;
+			logger::info("[SMP] grab: '{}' bone '{}', {:.0f} units away", heldItem->model->GetName(), held->m_name.c_str(), m_grabDistance);
+		}
+
+		auto& rig = held->m_rig;
+		btVector3 velocity = (eye + dir * m_grabDistance - (rig.getWorldTransform().getOrigin() + hdt::SkyrimBone::s_origin)) * kGrabPull;
+		if (velocity.length() > kGrabMaxSpeed) velocity *= kGrabMaxSpeed / velocity.length();
+		rig.setLinearVelocity(velocity);
+		rig.activate(true);
+	}
+
 	void ActorManager::scanActor(RE::NiNode* root, void* ref)
 	{
 		m_scanRef = ref;
@@ -1872,6 +2084,7 @@ namespace nvsmp
 			} else {
 				dropMenuSystem("race menu closed");
 				dropMenuHeadParts("race menu closed");
+				dropMenuFace("race menu closed");
 			}
 		}
 
@@ -1973,12 +2186,13 @@ namespace nvsmp
 		updateStandIns(actors);
 		pushByProjectiles(projectiles);
 		pushByExplosions(explosions);
+		grabBones(playerRoot);
 		stats.actors = (int)roots.size();
 		stats.systems = (int)hdt::SkyrimPhysicsWorld::get()->systemCount();
 		stats.failed = failed;
 
 		// The race menu's hair physics reads its stand-in skeleton before the world steps: the real one's places now.
-		if (m_menuSystem || !m_menuPartSystems.empty()) refreshMenuProxies(playerRoot);
+		if (m_menuSystem || !m_menuPartSystems.empty() || m_menuFace.system) refreshMenuProxies(playerRoot);
 	}
 
 	// A line in the log every couple of seconds saying whether the physics is doing anything visible:
@@ -2054,14 +2268,13 @@ namespace nvsmp
 		}
 	}
 
-	// The waist collision and the ground are built in (see build), so a change rebuilds every system. Not here:
+	// The ground is built in (see build), so a change rebuilds every system. Not here:
 	// the menu calls this from the frame's present, and dropping a system frees game nodes. The rebuild waits
 	// for the next update (rebuildIfPending), where the menu's Reset physics does its work too.
 	void ActorManager::applyCollision()
 	{
-		if (gSettings.waistCollision == m_builtWaistCollision && (int)gSettings.ground == m_builtGround)
+		if ((int)gSettings.ground == m_builtGround)
 			return;
-		m_builtWaistCollision = gSettings.waistCollision;
 		m_builtGround = gSettings.ground;
 		m_rebuildPending = true;
 	}
@@ -2073,7 +2286,7 @@ namespace nvsmp
 		m_rebuildPending = false;
 		if (m_items.empty())
 			return;
-		logger::info("[SMP] collision settings changed (waist {:.2f}, ground {}): rebuilding", gSettings.waistCollision, gSettings.ground ? "on" : "off");
+		logger::info("[SMP] collision settings changed (ground {}): rebuilding", gSettings.ground ? "on" : "off");
 		clear();
 	}
 

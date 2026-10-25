@@ -71,7 +71,7 @@ namespace nvsmp
 			{ "iMinFps", 0, &s.minFps }, { "iMaxSubSteps", 0, &s.maxSubSteps }, { "iSolverIterations", 0, &s.solverIterations }, { "bCollisionThreads", 0, 0, &s.collisionThreadsOn }, { "iCollisionThreads", 0, &s.collisionThreads },{ "bAsyncStep", 0, 0, &s.asyncStep },
 			{ "fGravityScale", &s.gravityScale }, { "bUnclampedResets", 0, 0, &s.unclampedResets }, { "fResetAngle", &s.resetAngle },
 			{ "bWind", 0, 0, &s.wind }, { "fWindStrength", &s.windStrength }, { "bWindInInteriors", 0, 0, &s.windInInteriors }, { "bCollisions", 0, 0, &s.collisions }, { "bCollideOncePerFrame", 0, 0, &s.collideOncePerFrame },
-			{ "fWaistCollision", &s.waistCollision }, { "bGround", 0, 0, &s.ground }, { "bJitterFilter", 0, 0, &s.jitterFilter }, { "fJitterSmoothing", &s.jitterSmoothing },
+			{ "bGround", 0, 0, &s.ground }, { "bJitterFilter", 0, 0, &s.jitterFilter }, { "fJitterSmoothing", &s.jitterSmoothing },
 			{ "iMenuKey", 0, &s.menuKey }, { "iLogLevel", 0, &s.logLevel },
 		};
 	}
@@ -97,7 +97,6 @@ namespace nvsmp
 		world->disabled = !s.enabled;
 		world->m_collisionsEnabled = s.collisions;
 		world->m_collideOncePerFrame = s.collideOncePerFrame;
-		s.waistCollision = std::clamp(s.waistCollision, 0.0f, 1.0f);
 		s.jitterSmoothing = std::clamp(s.jitterSmoothing, 0.0f, 1.0f);
 		hdt::SkyrimBone::SetJitterFilter(s.jitterFilter, s.jitterSmoothing);
 		ActorManager::instance()->applyCollision();
