@@ -290,3 +290,90 @@ namespace hdt
 			i->readTransform(i->prepareForRead(RESET_PHYSICS));
 	}
 }
+
+namespace hdt
+{
+	// Impact sounds. Each step, before its solve, every contact between two simulated bones' shapes (Bullet's own collision of
+	// bone shapes: a bottle's box against another's) where either bone names impact sounds: a pair that was not touching the
+	// step before, striking at its bone's impact speed or faster, sounds once (then not again for kImpactQuiet seconds, so
+	// two bottles settling against each other do not buzz). Not against the body's animated bones, which pieces brush all the
+	// time. How fast they struck is their bodies' speed toward each other along the contact normal, taken before the solver
+	// takes it out (after it they read 0, and it writes no impulses back to these contacts). A softer touch is queued too,
+	// without a file (the previewer logs it, to tune <impact-speed>). Runs on the physics step (its thread, when async):
+	// queued for takeImpacts.
+	static constexpr double kImpactQuiet = 0.12;
+	static constexpr size_t kMaxQueuedImpacts = 32;
+
+	void SkyrimPhysicsWorld::contactsFound()
+	{
+		m_impactClock += m_timeTick;
+		std::set<std::pair<const void*, const void*>> touching;
+		btDispatcher* dispatcher = getCollisionWorld()->getDispatcher();
+		const int n = dispatcher->getNumManifolds();
+		for (int i = 0; i < n; ++i) {
+			btPersistentManifold* manifold = dispatcher->getManifoldByIndexInternal(i);
+			if (manifold->getNumContacts() <= 0) continue;
+			const auto* a = btRigidBody::upcast(manifold->getBody0());
+			const auto* b = btRigidBody::upcast(manifold->getBody1());
+			if (!a || !b || !a->getUserPointer() || !b->getUserPointer()) continue;   // a skinned mesh (cloth, body), not a bone
+			auto* boneA = static_cast<SkyrimBone*>(static_cast<SkinnedMeshBone*>(a->getUserPointer()));
+			auto* boneB = static_cast<SkyrimBone*>(static_cast<SkinnedMeshBone*>(b->getUserPointer()));
+			if (&boneA->m_rig != a || &boneB->m_rig != b) continue;
+			if (a->isStaticOrKinematicObject() || b->isStaticOrKinematicObject()) continue;   // the body's animated bones
+			SkyrimBone* sounding = !boneA->m_impactSounds.empty() ? boneA : !boneB->m_impactSounds.empty() ? boneB : nullptr;
+			if (!sounding) continue;
+			const void* pa = boneA; const void* pb = boneB;
+			const auto key = pa < pb ? std::make_pair(pa, pb) : std::make_pair(pb, pa);
+			touching.insert(key);
+			if (m_touching.count(key)) continue;   // still touching: it sounded when they met
+			// The contact where they come together fastest, and how fast: A's speed toward B along the normal (B to A).
+			int best = -1;
+			btScalar closing = 0;
+			for (int k = 0; k < manifold->getNumContacts(); ++k) {
+				const btManifoldPoint& pt = manifold->getContactPoint(k);
+				const btVector3 va = a->getVelocityInLocalPoint(pt.getPositionWorldOnA() - a->getCenterOfMassPosition());
+				const btVector3 vb = b->getVelocityInLocalPoint(pt.getPositionWorldOnB() - b->getCenterOfMassPosition());
+				const btScalar c = -(va - vb).dot(pt.m_normalWorldOnB);
+				if (best < 0 || c > closing) { closing = c; best = k; }
+			}
+			if (best < 0) continue;
+			const float speed = std::max(0.0f, (float)closing);
+			const bool soft = speed < sounding->m_impactSpeed;   // queued without a file: the previewer logs it, for tuning
+			// Soft touches keep their own quiet time: one must not silence a real strike just after it.
+			auto& quiet = soft ? m_softAt : m_impactAt;
+			auto last = quiet.find(key);
+			if (last != quiet.end() && m_impactClock - last->second < kImpactQuiet) continue;
+			quiet[key] = m_impactClock;
+
+			const bool hard = !soft && speed >= sounding->m_impactHardSpeed && !sounding->m_impactSoundsHard.empty();
+			const auto& files = hard ? sounding->m_impactSoundsHard : sounding->m_impactSounds;
+			m_impactRandom = m_impactRandom * 1664525u + 1013904223u;
+			const btVector3 p = manifold->getContactPoint(best).getPositionWorldOnA() + SkyrimBone::s_origin;
+			const float span = std::max(sounding->m_impactHardSpeed - sounding->m_impactSpeed, 1.0f);
+			Impact hit;
+			if (!soft) hit.file = files[(m_impactRandom >> 8) % files.size()];
+			hit.threshold = sounding->m_impactSpeed;
+			hit.at = { p.x(), p.y(), p.z() };
+			hit.volume = std::clamp(0.35f + 0.65f * (speed - sounding->m_impactSpeed) / span, 0.35f, 1.0f) * sounding->m_impactVolume;
+			hit.speed = speed;
+			hit.boneA = boneA->m_name.c_str();
+			hit.boneB = boneB->m_name.c_str();
+			std::lock_guard l(m_impactLock);
+			if (m_impacts.size() < kMaxQueuedImpacts) m_impacts.push_back(std::move(hit));
+		}
+		m_touching.swap(touching);
+		// Pairs quiet for a while are forgotten (their bones may be gone).
+		for (auto it = m_impactAt.begin(); it != m_impactAt.end();)
+			it = m_impactClock - it->second > 1.0 ? m_impactAt.erase(it) : std::next(it);
+		for (auto it = m_softAt.begin(); it != m_softAt.end();)
+			it = m_impactClock - it->second > 1.0 ? m_softAt.erase(it) : std::next(it);
+	}
+
+	std::vector<SkyrimPhysicsWorld::Impact> SkyrimPhysicsWorld::takeImpacts()
+	{
+		std::lock_guard l(m_impactLock);
+		std::vector<Impact> out;
+		out.swap(m_impacts);
+		return out;
+	}
+}

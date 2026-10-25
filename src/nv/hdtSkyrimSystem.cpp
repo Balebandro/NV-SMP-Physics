@@ -1367,6 +1367,7 @@ namespace hdt
 	void SkyrimSystemCreator::readBoneTemplate(BoneTemplate& cinfo)
 	{
 		bool clearCollide = true;
+		bool clearSounds = true, clearHardSounds = true;   // a bone's own impact sounds replace its template's
 		while (m_reader->Inspect()) {
 			if (m_reader->GetInspected() == XMLReader::Inspected::StartTag) {
 				auto name = m_reader->GetName();
@@ -1417,6 +1418,18 @@ namespace hdt
 					cinfo.m_windFactor = std::max(m_reader->readFloat(), 0.0f);
 				} else if (name == "ccd") {
 					cinfo.m_ccd = m_reader->readInt() != 0;
+				} else if (name == "impact-sound") {
+					if (clearSounds) { cinfo.m_impactSounds.clear(); clearSounds = false; }
+					cinfo.m_impactSounds.push_back(m_reader->readText());
+				} else if (name == "impact-sound-hard") {
+					if (clearHardSounds) { cinfo.m_impactSoundsHard.clear(); clearHardSounds = false; }
+					cinfo.m_impactSoundsHard.push_back(m_reader->readText());
+				} else if (name == "impact-speed") {
+					cinfo.m_impactSpeed = std::max(m_reader->readFloat(), 0.0f);
+				} else if (name == "impact-hard-speed") {
+					cinfo.m_impactHardSpeed = std::max(m_reader->readFloat(), 0.0f);
+				} else if (name == "impact-volume") {
+					cinfo.m_impactVolume = std::clamp(m_reader->readFloat(), 0.0f, 1.0f);
 				} else {
 					logger::warn("unknown element - {}", name.c_str());
 					m_reader->skipCurrentElement();
@@ -1629,6 +1642,11 @@ namespace hdt
 			bone->m_marginMultipler = boneTemplate.m_marginMultipler;
 			bone->m_gravityFactor = boneTemplate.m_gravityFactor;
 			bone->m_windFactor = boneTemplate.m_windFactor;
+			bone->m_impactSounds = boneTemplate.m_impactSounds;
+			bone->m_impactSoundsHard = boneTemplate.m_impactSoundsHard;
+			bone->m_impactSpeed = boneTemplate.m_impactSpeed;
+			bone->m_impactHardSpeed = boneTemplate.m_impactHardSpeed;
+			bone->m_impactVolume = boneTemplate.m_impactVolume;
 			bone->m_shapeCollides = boneTemplate.m_collisionFilter != 0 && boneTemplate.m_collisionShape &&
 				boneTemplate.m_collisionShape->getShapeType() != EMPTY_SHAPE_PROXYTYPE;
 			if (boneTemplate.m_ccd && bone->m_shapeCollides && !bone->m_rig.isStaticOrKinematicObject()) {

@@ -6,6 +6,8 @@
 #include "hdtSkinnedMesh/hdtSkinnedMeshWorld.h"
 #include "hdtSkyrimSystem.h"
 #include <condition_variable>
+#include <map>
+#include <set>
 #include <string>
 
 namespace hdt
@@ -66,6 +68,12 @@ namespace hdt
 		float m_averageStepMs = 0.0f;   // the physics' whole work a frame: reading the pose, the step, writing the bones
 		float m_averageMainMs = 0.0f;   // what of it the game thread spends (all of it unless the step runs on the physics thread)
 
+		// Impact sounds (see contactsFound): a file to play, where in the world, how loud (0..1), how fast it struck (units/s)
+		// and the two bones; a touch softer than the bone's <impact-speed> (threshold) comes with no file, for the previewer's
+		// log. takeImpacts hands over those since the last call (the game thread plays them).
+		struct Impact { std::string file; RE::NiPoint3 at; float volume, speed, threshold; std::string boneA, boneB; };
+		std::vector<Impact> takeImpacts();
+
 	private:
 		SkyrimPhysicsWorld();
 		~SkyrimPhysicsWorld() noexcept;
@@ -73,6 +81,15 @@ namespace hdt
 		void runStep();          // the step itself (m_lock held): no game node is read or written
 		void runStepGuarded();   // runStep under m_lock, a fault caught (SEH) and kept for takeStepFailure
 		void stepThread();
+		void contactsFound() override;
+
+		std::mutex m_impactLock;
+		std::vector<Impact> m_impacts;                                  // waiting for takeImpacts
+		std::set<std::pair<const void*, const void*>> m_touching;       // the bone pairs in contact last step
+		std::map<std::pair<const void*, const void*>, double> m_impactAt;   // when each pair last sounded
+		std::map<std::pair<const void*, const void*>, double> m_softAt;     // and last touched too softly to sound
+		double m_impactClock = 0;                                       // physics time, a step at a time
+		uint32_t m_impactRandom = 0x9E3779B9u;
 
 		std::mutex m_lock;
 		float m_accumulatedInterval = 0;

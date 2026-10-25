@@ -504,6 +504,7 @@ namespace hdt
 			}
 		}
 
+		contactsFound();   // New Vegas: the step's contacts, before the solver takes their approach out
 		btDiscreteDynamicsWorldMt::solveConstraints(solverInfo);
 
 		// New Vegas: the next step of this frame reuses these contacts (m_collideOncePerFrame).

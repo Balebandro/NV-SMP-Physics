@@ -175,6 +175,11 @@ namespace hdt
 			float m_windFactor = 1.0f;
 			U32 m_collisionFilter = 0;
 			bool m_ccd = false;   // <ccd>1</ccd>: swept collision for a bone whose shape collides (small fast parts: a charm)
+			// <impact-sound>, <impact-sound-hard> (each a file under Data, repeatable: one picked at random), <impact-speed>,
+			// <impact-hard-speed>: see SkyrimBone::m_impactSounds.
+			std::vector<std::string> m_impactSounds, m_impactSoundsHard;
+			float m_impactSpeed = 20.0f, m_impactHardSpeed = 150.0f;
+			float m_impactVolume = 1.0f;   // <impact-volume>
 		};
 
 		enum FrameType

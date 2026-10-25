@@ -35,6 +35,9 @@ namespace hdt
 		bool m_reuseContacts = false;   // this step reuses the last step's contacts (m_collideOncePerFrame)
 		bool m_keepContacts = false;    // this step's contacts are kept for the next one
 		bool m_predictiveFreed = false;  // the last step's predictive contacts went with every manifold (solveConstraints)
+		// NV SMP Physics: each step, the contacts collision detection found, before the solver (solveConstraints): the
+		// bodies still have the speeds they came together at, for whoever wants them (impact sounds).
+		virtual void contactsFound() {}
 
 		void readTransform(float timeStep)
 		{

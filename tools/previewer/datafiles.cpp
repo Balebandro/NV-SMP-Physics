@@ -126,8 +126,8 @@ namespace datafiles
 			return a;
 		}
 
-		// The archives in a folder that can hold meshes, animations or textures (sound and voice archives are
-		// skipped: thousands of entries, nothing the previewer reads).
+		// The archives in a folder that can hold meshes, animations, textures or sound effects (an XML's impact sounds).
+		// Voice archives are skipped: thousands of entries, nothing the previewer reads.
 		void AddArchives(const std::string& folder, Roots& r, bool vanillaLast)
 		{
 			std::error_code ec;
@@ -136,7 +136,7 @@ namespace datafiles
 			for (auto& e : fs::directory_iterator(folder, ec)) {
 				if (!e.is_regular_file(ec) || Lower(e.path().extension().string()) != ".bsa") continue;
 				std::string name = Lower(e.path().filename().string());
-				if (name.find("sound") != std::string::npos || name.find("voice") != std::string::npos) continue;
+				if (name.find("voice") != std::string::npos) continue;
 				found.push_back(e.path().string());
 			}
 			// The game loads the DLCs' archives after its own: they come first here.

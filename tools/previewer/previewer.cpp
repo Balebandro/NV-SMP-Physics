@@ -13,6 +13,7 @@
 #include "xmledit.h"
 #include "backup.h"
 #include "nifclean.h"
+#include "sound.h"
 
 #include "hdtSkinnedMesh/hdtSkinnedMeshShape.h"
 #include "hdtSkyrimBone.h"
@@ -331,6 +332,7 @@ struct Settings
 	int collisionThreads = -1;   // as the plugin's iCollisionThreads
 	bool collisions = true;
 	bool collideOncePerFrame = false;   // as the plugin's bCollideOncePerFrame
+	bool impactSounds = true;    // play the XML's <impact-sound> files when bones strike each other (they are logged either way)
 	bool ground = true;
 	bool jitterFilter = true;     // the plugin's jitter filter (SkyrimBone::SetJitterFilter)
 	float jitterSmoothing = 0.5f;
@@ -499,6 +501,31 @@ static void UseProxiesInXml()
 	o.close();
 	AddLog(2, "pointed " + std::to_string(renamed) + " collision shape(s) in " + gItem.xmlPath + " at the NIF's proxies (the file as it was: " + bak + ")");
 	BuildSystem();
+}
+
+// Impact sounds the physics found this frame (SkyrimPhysicsWorld::takeImpacts, the plugin's own detection): each logged
+// with its speed and, with Impact sounds on, played from the file the game would find (loose or in an archive).
+static void PlayImpacts()
+{
+	static std::map<std::string, std::string> found;   // a sound's path in Data -> on disk, for the loaded item's Data folders
+	static std::string foundFor;
+	if (foundFor != gItem.nifPath) { found.clear(); foundFor = gItem.nifPath; }
+	for (auto& hit : hdt::SkyrimPhysicsWorld::get()->takeImpacts()) {
+		char line[200];
+		if (hit.file.empty()) {   // softer than its <impact-speed>: no sound, in game either
+			snprintf(line, sizeof line, "impact: %s on %s at %.0f units/s: too soft to sound (impact-speed %.0f)", hit.boneA.c_str(), hit.boneB.c_str(), hit.speed, hit.threshold);
+			AddLog(2, line);
+			continue;
+		}
+		std::string why = "Impact sounds off";
+		if (gS.impactSounds) {
+			auto it = found.find(hit.file);
+			if (it == found.end()) it = found.emplace(hit.file, datafiles::Resolve(gItem.roots, hit.file)).first;
+			why = it->second.empty() ? "not found in any Data folder or archive" : sound::Play(it->second, hit.volume);
+		}
+		snprintf(line, sizeof line, "impact: %s on %s at %.0f units/s, volume %.2f: ", hit.boneA.c_str(), hit.boneB.c_str(), hit.speed, hit.volume);
+		AddLog(why.empty() ? 2 : 3, line + hit.file + (why.empty() ? "" : " (" + why + ")"));
+	}
 }
 
 // Builds (or rebuilds) the physics for the loaded item from its XML.
@@ -1938,6 +1965,172 @@ static bool Undo(const char* id, T& v, const T& was)
 	return true;
 }
 
+// The game's sound files the item's Data folders and archives hold ("sound\fx\...\x.wav", lower case, sorted), for the
+// impact sound picker: listed once per item (its Data folders), on first use.
+static const std::vector<std::string>& SoundFiles()
+{
+	static std::vector<std::string> files;
+	static std::string listedFor = "-";
+	if (listedFor == gItem.nifPath) return files;
+	listedFor = gItem.nifPath;
+	std::set<std::string> found;
+	auto wav = [](const std::string& p) { return p.size() > 4 && p.compare(p.size() - 4, 4, ".wav") == 0; };
+	for (auto& a : gItem.roots.archives)
+		a->ForEach([&](const std::string& p) { if (p.rfind("sound\\", 0) == 0 && wav(p)) found.insert(p); });
+	for (auto& folder : gItem.roots.folders) {
+		std::error_code ec;
+		const fs::path root = fs::path(folder) / "sound";
+		if (!fs::is_directory(root, ec)) continue;
+		for (auto it = fs::recursive_directory_iterator(root, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+			if (!it->is_regular_file(ec)) continue;
+			std::string rel = "sound\\" + fs::relative(it->path(), root, ec).string();
+			for (auto& c : rel) c = c == '/' ? '\\' : (char)tolower((unsigned char)c);
+			if (wav(rel)) found.insert(rel);
+		}
+	}
+	files.assign(found.begin(), found.end());
+	AddLog(2, "impact sounds: " + std::to_string(files.size()) + " sound files found in the Data folders and archives");
+	return files;
+}
+
+// A sound file under Data played once, as a hit would play it (the picker's Play buttons).
+static void PlayOnce(const std::string& file, float volume)
+{
+	const std::string disk = datafiles::Resolve(gItem.roots, file);
+	const std::string why = disk.empty() ? "not found in any Data folder or archive" : sound::Play(disk, volume);
+	if (!why.empty()) AddLog(3, "cannot play " + file + ": " + why);
+}
+
+// Bone values > Impact sounds: each simulated bone's sound files, picked from the game's sounds (a click plays one,
+// a double click or Add adds it), and its impact speeds and volume. Edits rebuild the physics and are saved with the
+// other values (only an edited bone's impact lines are rewritten). `rebuild` is set when something changed.
+static void ImpactSoundsPanel(bool& rebuild)
+{
+	// The bones the physics simulates (animated ones never sound), by lower-case name; every bone while none is built.
+	std::set<std::string> simulated;
+	if (gItem.system)
+		for (auto& b : gItem.system->getBones())
+			if (!b->m_rig.isStaticOrKinematicObject()) {
+				std::string n = b->m_name.c_str();
+				for (auto& c : n) c = (char)tolower((unsigned char)c);
+				simulated.insert(n);
+			}
+	std::vector<int> order;
+	for (int i = 0; i < (int)gXml.sounds.size(); i++) {
+		std::string n = gXml.sounds[i].name;
+		for (auto& c : n) c = (char)tolower((unsigned char)c);
+		if (simulated.empty() || simulated.count(n) || gXml.sounds[i].HasSounds()) order.push_back(i);
+	}
+	std::stable_sort(order.begin(), order.end(), [](int a, int b) { return gXml.sounds[a].HasSounds() > gXml.sounds[b].HasSounds(); });
+	if (order.empty()) { ImGui::TextDisabled("no simulated bone has a <bone> element in the XML"); return; }
+
+	static int pickBone = -1, pickList = 0, pickRow = -1;   // the browser's target and its selected row
+	static char filter[128] = "";
+	static const char* kListNames[2] = { "Sounds", "Hard hits" };
+	static const char* kValueNames[xmledit::SoundBone::kValues] = { "Speed", "Hard speed", "Volume" };
+	static const float kValueMax[xmledit::SoundBone::kValues] = { 400, 600, 1 };
+	for (int i : order) {
+		auto& s = gXml.sounds[i];
+		ImGui::PushID(i);
+		const bool edited = s.Edited();
+		if (edited) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.8f, 0.4f, 1));
+		const bool open = ImGui::TreeNode("##bone", "%s%s%s", s.name.c_str(),
+			s.HasSounds() ? ("  (" + std::to_string(s.files[0].size() + s.files[1].size()) + " sounds)").c_str() : "", edited ? "  *" : "");
+		if (edited) ImGui::PopStyleColor();
+		if (open) {
+			if (!s.editable) ImGui::TextDisabled("its impact elements share a line with other XML: edit them in the file");
+			else {
+				for (int k = 0; k < 2; k++) {
+					ImGui::PushID(k);
+					ImGui::TextUnformatted(kListNames[k]);
+					if (k == 1) Help("Played instead of the others when a hit is at least the hard speed. None: the others play for every hit.");
+					for (size_t f = 0; f < s.files[k].size(); f++) {
+						ImGui::PushID((int)f);
+						if (ImGui::SmallButton("Play")) PlayOnce(s.files[k][f], s.values[xmledit::SoundBone::kVolume]);
+						ImGui::SameLine();
+						if (ImGui::SmallButton("x")) { s.files[k].erase(s.files[k].begin() + f); rebuild = true; ImGui::PopID(); break; }
+						ImGui::SameLine();
+						ImGui::TextUnformatted(s.files[k][f].c_str());
+						ImGui::PopID();
+					}
+					if (ImGui::SmallButton("Add...")) { pickBone = i; pickList = k; pickRow = -1; ImGui::OpenPopup("sound picker"); }
+					if (pickBone == i && pickList == k && ImGui::BeginPopup("sound picker")) {
+						const auto& all = SoundFiles();
+						ImGui::SetNextItemWidth(ImGui::GetFontSize() * 24);
+						if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+						ImGui::InputTextWithHint("##filter", "filter: words in the path (glass bottle)", filter, sizeof filter);
+						// Every word of the filter in the path.
+						std::vector<std::string> words;
+						{
+							std::string w;
+							for (const char* c = filter;; c++) {
+								if (!*c || *c == ' ') { if (!w.empty()) words.push_back(w); w.clear(); if (!*c) break; }
+								else w += (char)tolower((unsigned char)*c);
+							}
+						}
+						std::vector<int> shown;
+						for (int r = 0; r < (int)all.size(); r++) {
+							bool ok = true;
+							for (auto& w : words) if (all[r].find(w) == std::string::npos) { ok = false; break; }
+							if (ok) shown.push_back(r);
+						}
+						ImGui::TextDisabled("%zu of %zu sounds; click plays one, double click adds it", shown.size(), all.size());
+						ImGui::BeginChild("##list", ImVec2(ImGui::GetFontSize() * 34, ImGui::GetFontSize() * 18), ImGuiChildFlags_Borders);
+						ImGuiListClipper clip;
+						clip.Begin((int)shown.size());
+						bool add = false;
+						while (clip.Step())
+							for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
+								const int r = shown[row];
+								if (ImGui::Selectable(all[r].c_str(), pickRow == r, ImGuiSelectableFlags_AllowDoubleClick)) {
+									pickRow = r;
+									if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) add = true;
+									else PlayOnce(all[r], s.values[xmledit::SoundBone::kVolume]);
+								}
+							}
+						ImGui::EndChild();
+						ImGui::BeginDisabled(pickRow < 0);
+						if (ImGui::Button("Add")) add = true;
+						ImGui::EndDisabled();
+						ImGui::SameLine();
+						if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
+						if (add && pickRow >= 0 && pickRow < (int)all.size()) {
+							s.files[k].push_back(all[pickRow]);
+							rebuild = true;
+							ImGui::CloseCurrentPopup();
+						}
+						ImGui::EndPopup();
+					}
+					ImGui::PopID();
+				}
+				ImGui::PushItemWidth(ImGui::GetFontSize() * 12);
+				for (int k = 0; k < xmledit::SoundBone::kValues; k++) {
+					ImGui::PushID(100 + k);
+					float v = s.values[k];
+					if (ImGui::SliderFloat(kValueNames[k], &v, 0.0f, kValueMax[k], k == xmledit::SoundBone::kVolume ? "%.2f" : "%.0f units/s")) {
+						s.values[k] = v;
+						s.set[k] = true;
+					}
+					rebuild |= ImGui::IsItemDeactivatedAfterEdit();
+					const bool differs = s.set[k] != s.originalSet[k] || (s.set[k] && s.values[k] != s.originalValues[k]);
+					if (UndoButton("undo", differs, s.originalSet[k] ? Shown(s.originalValues[k]) : "the default, " + Shown(s.originalValues[k]))) {
+						s.values[k] = s.originalValues[k];
+						s.set[k] = s.originalSet[k];
+						rebuild = true;
+					}
+					ImGui::PopID();
+				}
+				ImGui::PopItemWidth();
+				Help("Speed: how fast two pieces must come together to sound (slower touches are silent; the log shows every touch's speed). "
+				     "Hard speed: from this speed the hard hits play (if any). Volume: scales every hit (harder hits are louder up to it). "
+				     "A value the file does not set is the plugin's default, written only once changed.");
+			}
+			ImGui::TreePop();
+		}
+		ImGui::PopID();
+	}
+}
+
 #include "maker.h"
 
 // Rewrites the physics path the NIF names (on its root and any shape) to gXmlFixPath, keeping the NIF first, and reloads.
@@ -2131,6 +2324,8 @@ static void Panels(float fps)
 		changed |= Undo("iterations", gS.solverIterations, kDefaults.solverIterations);
 		changed |= ImGui::Checkbox("Collisions", &gS.collisions);
 		changed |= ImGui::Checkbox("Collide once per frame", &gS.collideOncePerFrame);
+		ImGui::Checkbox("Impact sounds", &gS.impactSounds);
+		Help("Bones whose XML names <impact-sound> files play one when their shape strikes another bone's, as in game (<impact-speed>, default 20 units/s, sets how hard; <impact-sound-hard> from <impact-hard-speed>, default 150; <impact-volume> 0 to 1 scales how loud). Every impact is logged with its speed, so the thresholds can be tuned by watching the log; off only silences them.");
 		ImGui::BeginDisabled(gItem.scene.worldObject);   // a static is built without the ground plane (see BuildSystem)
 		bool rebuild = ImGui::Checkbox("Ground collision", &gS.ground);
 		ImGui::EndDisabled();
@@ -2411,6 +2606,14 @@ static void Panels(float fps)
 					}
 					ImGui::PopID();
 				}
+				ImGui::TreePop();
+			}
+			// Impact sounds: the simulated bones' sound files, speeds and volume (see ImpactSoundsPanel).
+			if (!gXml.sounds.empty() && ImGui::TreeNode("##impact sounds", "Impact sounds")) {   // own ID: the Physics panel has an "Impact sounds" box
+				Help("Sounds a bone plays where its shape strikes another simulated bone's, as in game (two bottles clinking). Add picks from "
+				     "the game's own sounds (the item's Data folders and archives); Play hears one at the bone's volume. Edits rebuild the "
+				     "physics, and Save writes them into the XML with the other values.");
+				ImpactSoundsPanel(rebuild);
 				ImGui::TreePop();
 			}
 			ImGui::Separator();
@@ -2961,6 +3164,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 				hdt::SkyrimPhysicsWorld::get()->finishUpdate();
 				if (gS.physics && gItem.system && !painting) hdt::SkyrimPhysicsWorld::get()->beginUpdate(simDt, true);
 			} else if (gS.physics && gItem.system && !painting) hdt::SkyrimPhysicsWorld::get()->doUpdate(simDt);
+			PlayImpacts();
 
 			// --jitter: the simulated bones' frame-to-frame shake in the actor's frame, as the second difference
 			// of their positions (smooth swinging leaves it near 0; fighting contacts make it large), over 4 s

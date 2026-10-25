@@ -3,7 +3,9 @@
 // so the physics core and the system builder use it unchanged.
 #include "hdtConvertNi.h"
 #include "hdtSkinnedMesh/hdtSkinnedMeshBone.h"
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace hdt
 {
@@ -30,6 +32,13 @@ namespace hdt
 		// the game's own update of the node later in the frame keeps it (the player's first-person model, which the game
 		// moves into camera space for its draw). See SkyrimSystem::setFirstPerson.
 		bool m_writeLocal = false;
+
+		// New Vegas: impact sounds (<impact-sound>, see SkyrimPhysicsWorld::contactsFound): one of these files plays when this
+		// bone's shape strikes another bone's at m_impactSpeed (units/s) or faster, one of the hard ones (if any) from
+		// m_impactHardSpeed. None: silent.
+		std::vector<std::string> m_impactSounds, m_impactSoundsHard;
+		float m_impactSpeed = 20.0f, m_impactHardSpeed = 150.0f;
+		float m_impactVolume = 1.0f;   // <impact-volume>: scales how loud they play (the speed sets the rest)
 
 		// New Vegas: the jitter filter. A simulated bone's drawn place, relative to the node it hangs from, goes through
 		// a One Euro filter (Casiez et al. 2012): an adaptive low-pass whose cutoff rises with the bone's speed, so a

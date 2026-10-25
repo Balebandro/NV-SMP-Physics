@@ -42,6 +42,18 @@ Once a frame, right after New Vegas has animated every actor and before it draws
   mesh, each end's radius fitted to the named shape(s). Without the trousers' creases and tight hips, cloth
   can collide up to the waist. `smpify --virtual-legs Legs` writes it (and lets the coat's top rows collide
   partly, threshold 0.5); on the game's run that ended the coat clipping into the thighs at the hips.
+- **Impact sounds.** A bone's `<impact-sound>` (a file under Data, repeatable: one is picked at random each time)
+  plays where its shape strikes another simulated bone's, as in game: two bottles hanging side by side clink.
+  `<impact-speed>` (default 20 units/s) is how fast they must come together, below that they touch in silence;
+  `<impact-sound-hard>` files play instead from `<impact-hard-speed>` (default 150); the volume rises with the
+  speed, scaled by `<impact-volume>` (0 to 1, default 1). A pair sounds when it meets, not while it stays
+  touching, and not again for 0.12 s. Contacts with the body's animated bones make no sound. In game only within
+  1500 units of the player, at most 4 a frame. The previewer plays them too and logs every touch with its speed,
+  so the thresholds can be set by watching it; its Bone values > Impact sounds picks each bone's files from the
+  game's own sounds (and plays them) and sets the speeds and volume.
+  For example, the game's own bottle sounds:
+  `<impact-sound>Sound\fx\phy\glass\bottle_l\phy_bottle_l_01.wav</impact-sound>` (and `_02` to `_05`),
+  `<impact-sound-hard>Sound\fx\phy\glass\bottle_h\phy_bottle_h_01.wav</impact-sound-hard>` (and `_02` to `_04`).
 
 ## Layout
 

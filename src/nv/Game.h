@@ -109,6 +109,29 @@ namespace Game
 		}
 	}
 
+	// A sound file under Data ("Sound\fx\...\x.wav") played once at a place in the world at a volume (0..1), as the game
+	// plays a file sound: BSAudio::GetSoundHandleByFilename (0xAD7480 on BSAudio::GetSingleton 0x453A70; the path as
+	// "Data\...", 3D and one-shot), then the handle's SetPosition (0xAD8B60), SetVolume (0xAD89E0) and Play (0xAD8830).
+	// False if the game made no sound of it (a missing file, the audio not ready).
+	struct SoundHandle { int32_t id; bool assumeSuccess; uint32_t state; };   // BSSoundHandle
+	inline bool PlaySoundAt(const char* file, const RE::NiPoint3& at, float volume)
+	{
+		char path[300];
+		snprintf(path, sizeof path, "%s%s", _strnicmp(file, "Data\\", 5) == 0 ? "" : "Data\\", file);
+		__try {
+			void* audio = ((void* (*)())0x00453A70)();
+			if (!audio) return false;
+			SoundHandle h{ -1, false, 0 };
+			((void*(__thiscall*)(void*, SoundHandle*, const char*, uint32_t, void*))0x00AD7480)(audio, &h, path, 0x2 | 0x100, nullptr);
+			if (h.id == -1) return false;
+			((char(__thiscall*)(SoundHandle*, float, float, float))0x00AD8B60)(&h, at.x, at.y, at.z);
+			((char(__thiscall*)(SoundHandle*, float))0x00AD89E0)(&h, volume);
+			return ((bool(__thiscall*)(SoundHandle*, bool))0x00AD8830)(&h, false);
+		} __except (1) {
+			return false;
+		}
+	}
+
 	// A reference's place (TESObjectREFR +0x30).
 	inline RE::NiPoint3 RefPosition(const void* ref) { return At<RE::NiPoint3>(ref, 0x30); }
 

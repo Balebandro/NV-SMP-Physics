@@ -2018,6 +2018,21 @@ namespace nvsmp
 		rig.activate(true);
 	}
 
+	void ActorManager::playImpacts(const RE::NiPoint3& playerPos)
+	{
+		int played = 0;
+		for (auto& i : hdt::SkyrimPhysicsWorld::get()->takeImpacts()) {
+			if (i.file.empty() || (i.at - playerPos).Length() > kImpactSoundReach || played >= kImpactSoundsPerFrame) continue;   // empty: too soft to sound
+			++played;
+			const bool ok = Game::PlaySoundAt(i.file.c_str(), i.at, i.volume);
+			if (!ok || m_impactLogs < 20) {
+				++m_impactLogs;
+				logger::info("[SMP] impact: '{}' on '{}' at {:.0f} units/s: {} (volume {:.2f}){}", i.boneA, i.boneB, i.speed, i.file, i.volume,
+					ok ? "" : " - the game played nothing (is the file there?)");
+			}
+		}
+	}
+
 	void ActorManager::scanActor(RE::NiNode* root, void* ref)
 	{
 		m_scanRef = ref;
@@ -2187,6 +2202,7 @@ namespace nvsmp
 		pushByProjectiles(projectiles);
 		pushByExplosions(explosions);
 		grabBones(playerRoot);
+		playImpacts(playerPos);
 		stats.actors = (int)roots.size();
 		stats.systems = (int)hdt::SkyrimPhysicsWorld::get()->systemCount();
 		stats.failed = failed;

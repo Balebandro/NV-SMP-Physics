@@ -97,6 +97,35 @@ namespace xmledit
 		bool CollidesWith(const TagShape& o) const { return Allows(o.lists[kTags]) && o.Allows(lists[kTags]); }
 	};
 
+	// A bone's impact sounds (a <bone name=".."> element): its files (<impact-sound>, <impact-sound-hard>) and three numbers
+	// (<impact-speed>, <impact-hard-speed>, <impact-volume>; one not in the file is the plugin's default, and written only
+	// once changed). Edited, its impact lines are written afresh where the first was, else before its end tag (a bone
+	// written <bone .../> or on one line is opened up for them); nothing else in it changes. A bone whose impact elements
+	// share a line with something else is left to edit by hand (editable false).
+	struct SoundBone
+	{
+		enum { kSpeed, kHardSpeed, kVolume, kValues };
+		std::string name;
+		std::vector<std::string> files[2], originalFiles[2];   // light, hard
+		float values[kValues] = { 20, 150, 1 }, originalValues[kValues] = { 20, 150, 1 };
+		bool set[kValues] = {}, originalSet[kValues] = {};     // the number is (to be) in the file
+		bool editable = true;
+		bool selfClosing = false, inlineEnd = false;   // written <bone .../>; its end tag on the same line as something else
+		size_t tagEnd = 0, endAt = 0;                  // its start tag's '>', its "</bone>"
+		size_t insertAt = 0;
+		std::vector<std::pair<size_t, size_t>> lines;  // its impact lines (each whole line), removed when edited
+		std::string indent = "\t\t", boneIndent = "\t";
+		std::string nl = "\n";                         // the line break its start tag's line ends with (files mix them)
+
+		bool Edited() const
+		{
+			for (int k = 0; k < 2; k++) if (files[k] != originalFiles[k]) return true;
+			for (int k = 0; k < kValues; k++) if (set[k] != originalSet[k] || (set[k] && values[k] != originalValues[k])) return true;
+			return false;
+		}
+		bool HasSounds() const { return !files[0].empty() || !files[1].empty(); }
+	};
+
 	struct Doc
 	{
 		std::string text;         // the file as read
@@ -104,6 +133,7 @@ namespace xmledit
 		std::vector<Block> blocks;
 		std::vector<Chain> chains;
 		std::vector<TagShape> shapes;
+		std::vector<SoundBone> sounds;
 		int version = 0;          // counts the files parsed (the master sliders start again at the middle for each)
 
 		bool Edited() const
@@ -113,6 +143,7 @@ namespace xmledit
 				for (auto& l : c.links) if (l.removed || l.stiff != l.origStiff || l.lively != l.origLively || l.sway != l.origSway) return true;
 			}
 			for (auto& s : shapes) if (s.Edited()) return true;
+			for (auto& s : sounds) if (s.Edited()) return true;
 			return false;
 		}
 
@@ -124,6 +155,95 @@ namespace xmledit
 				for (auto& l : c.links) { l.removed = false; l.stiff = l.origStiff; l.lively = l.origLively; l.sway = l.origSway; }
 			}
 			for (auto& s : shapes) for (int k = 0; k < TagShape::kLists; k++) s.lists[k] = s.original[k];
+			for (auto& s : sounds) {
+				for (int k = 0; k < 2; k++) s.files[k] = s.originalFiles[k];
+				for (int k = 0; k < SoundBone::kValues; k++) { s.values[k] = s.originalValues[k]; s.set[k] = s.originalSet[k]; }
+			}
+		}
+
+		static constexpr const char* kSoundFiles[2] = { "impact-sound", "impact-sound-hard" };
+		static constexpr const char* kSoundValues[SoundBone::kValues] = { "impact-speed", "impact-hard-speed", "impact-volume" };
+
+		void ParseSounds()
+		{
+			sounds.clear();
+			auto lineStart = [&](size_t p) { while (p > 0 && text[p - 1] != '\n') p--; return p; };
+			auto lineEnd = [&](size_t p) { size_t e = text.find('\n', p); return e == std::string::npos ? text.size() : e + 1; };
+			auto blank = [&](size_t a, size_t e) { for (size_t p = a; p < e; p++) if (!isspace((unsigned char)text[p])) return false; return true; };
+			std::vector<std::pair<size_t, size_t>> comments;
+			for (size_t c = 0; (c = text.find("<!--", c)) != std::string::npos;) {
+				size_t e = text.find("-->", c);
+				e = e == std::string::npos ? text.size() : e + 3;
+				comments.push_back({ c, e });
+				c = e;
+			}
+			auto inComment = [&](size_t p) { for (auto& [a, e] : comments) if (p >= a && p < e) return true; return false; };
+			for (size_t i = 0; (i = text.find("<bone ", i)) != std::string::npos;) {
+				const size_t tagEnd = text.find('>', i);
+				if (tagEnd == std::string::npos) break;
+				if (inComment(i)) { i = tagEnd; continue; }
+				SoundBone s;
+				const size_t n = text.find("name=\"", i);
+				if (n == std::string::npos || n > tagEnd) { i = tagEnd; continue; }
+				s.name = text.substr(n + 6, text.find('"', n + 6) - (n + 6));
+				s.tagEnd = tagEnd;
+				const size_t ls = lineStart(i);
+				s.boneIndent = blank(ls, i) ? text.substr(ls, i - ls) : "\t";
+				s.indent = s.boneIndent + "\t";
+				s.selfClosing = text[tagEnd - 1] == '/';
+				{ const size_t le = lineEnd(tagEnd); s.nl = le >= 2 && text[le - 1] == '\n' && text[le - 2] == '\r' ? "\r\n" : "\n"; }
+				if (!s.selfClosing) {
+					s.endAt = text.find("</bone>", tagEnd);
+					if (s.endAt == std::string::npos) break;
+					s.inlineEnd = !blank(lineStart(s.endAt), s.endAt);
+					s.insertAt = s.inlineEnd ? s.endAt : lineStart(s.endAt);
+					// Its children's indent, from the first one on a line of its own.
+					for (size_t c = text.find('<', tagEnd); c != std::string::npos && c < s.endAt; c = text.find('<', c + 1))
+						if (blank(lineStart(c), c) && lineStart(c) > tagEnd) { s.indent = text.substr(lineStart(c), c - lineStart(c)); break; }
+					for (size_t c = text.find("<impact-", tagEnd); c != std::string::npos && c < s.endAt; c = text.find("<impact-", c + 1)) {
+						if (inComment(c)) continue;
+						const size_t ne = text.find('>', c);
+						if (ne == std::string::npos) break;
+						const std::string name = text.substr(c + 1, ne - c - 1);
+						const size_t close = text.find("</" + name + ">", ne);
+						if (close == std::string::npos || close > s.endAt) { s.editable = false; break; }
+						std::string v = text.substr(ne + 1, close - ne - 1);
+						while (!v.empty() && isspace((unsigned char)v.back())) v.pop_back();
+						while (!v.empty() && isspace((unsigned char)v.front())) v.erase(v.begin());
+						const size_t a = lineStart(c), e = lineEnd(close);
+						// Alone on its line, or the bone is left to edit by hand.
+						if (!blank(a, c) || !blank(close + name.size() + 3, e)) s.editable = false;
+						bool known = false;
+						for (int k = 0; k < 2; k++) if (name == kSoundFiles[k]) { s.files[k].push_back(v); known = true; }
+						for (int k = 0; k < SoundBone::kValues; k++)
+							if (name == kSoundValues[k]) { s.values[k] = (float)atof(v.c_str()); s.set[k] = true; known = true; }
+						if (!known) continue;   // another impact- element: not ours, left alone
+						if (s.lines.empty()) { s.insertAt = a; s.indent = text.substr(a, c - a); }
+						s.lines.push_back({ a, e });
+						c = close;
+					}
+				}
+				for (int k = 0; k < 2; k++) s.originalFiles[k] = s.files[k];
+				for (int k = 0; k < SoundBone::kValues; k++) { s.originalValues[k] = s.values[k]; s.originalSet[k] = s.set[k]; }
+				sounds.push_back(s);
+				i = tagEnd;
+			}
+		}
+
+		// An edited bone's impact lines, as written (each ending with the bone's own line break).
+		std::string SoundLines(const SoundBone& s) const
+		{
+			const std::string& nl = s.nl;
+			std::string out;
+			for (int k = 0; k < 2; k++)
+				for (auto& f : s.files[k]) out += s.indent + "<" + kSoundFiles[k] + ">" + f + "</" + kSoundFiles[k] + ">" + nl;
+			for (int k = 0; k < SoundBone::kValues; k++) {
+				if (!s.set[k]) continue;
+				char b[32];
+				snprintf(b, sizeof b, "%g", s.values[k]);
+				out += s.indent + "<" + kSoundValues[k] + ">" + b + "</" + kSoundValues[k] + ">" + nl;
+			}
+			return out;
 		}
 
 		static constexpr const char* kTagElements[TagShape::kLists] = { "tag", "no-collide-with-tag", "can-collide-with-tag" };
@@ -277,6 +397,18 @@ namespace xmledit
 				if (!s.Edited()) continue;
 				edits.push_back({ s.insertAt, 0, TagLines(s) });
 				for (auto& [a, e] : s.lines) edits.push_back({ a, e - a, "" });
+			}
+			// An edited bone's impact lines: the old ones removed, the new ones written where the first was (or before its end
+			// tag; a bone written <bone .../> or ending on a line with something else is opened up for them).
+			for (auto& s : sounds) {
+				if (!s.Edited() || !s.editable) continue;
+				const std::string& nl = s.nl;
+				const std::string lines = SoundLines(s);
+				for (auto& [a, e] : s.lines) edits.push_back({ a, e - a, "" });
+				if (lines.empty()) continue;
+				if (s.selfClosing) edits.push_back({ s.tagEnd - 1, 2, ">" + nl + lines + s.boneIndent + "</bone>" });
+				else if (!s.lines.empty() || !s.inlineEnd) edits.push_back({ s.insertAt, 0, lines });
+				else edits.push_back({ s.endAt, 0, nl + lines + s.boneIndent });
 			}
 			// By place; an insertion before a removal at the same place.
 			std::sort(edits.begin(), edits.end(), [](const Edit& a, const Edit& b) { return a.at != b.at ? a.at < b.at : a.len < b.len; });
@@ -434,7 +566,8 @@ namespace xmledit
 					continue;
 				}
 
-				if (blockDepth >= 0 && name != "weight-threshold") {
+				// (Impact sounds' numbers are the Impact sounds section's: see SoundBone.)
+				if (blockDepth >= 0 && name != "weight-threshold" && name.rfind("impact-", 0) != 0) {
 					std::string label;
 					for (size_t k = blockDepth + 1; k < stack.size(); k++) label += stack[k] + "/";
 					label += name;
@@ -474,6 +607,7 @@ namespace xmledit
 			blocks.swap(kept);
 			ParseChains();
 			ParseShapes();
+			ParseSounds();
 		}
 	};
 

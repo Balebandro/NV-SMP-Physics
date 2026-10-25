@@ -164,6 +164,12 @@ namespace nvsmp
 		float m_grabDistance = 0;             // how far along the view it is held
 		bool m_gameGrabbing = false;          // the game's own grab held something last frame
 		void grabBones(RE::NiNode* playerRoot);
+		// Impact sounds the physics found (SkyrimPhysicsWorld::takeImpacts), played where they struck: only within
+		// kImpactSoundReach of the player, at most kImpactSoundsPerFrame a frame.
+		static constexpr float kImpactSoundReach = 1500.0f;
+		static constexpr int kImpactSoundsPerFrame = 4;
+		unsigned m_impactLogs = 0;   // for the log
+		void playImpacts(const RE::NiPoint3& playerPos);
 		// Head parts with physics in the race menu, as race hair: the player's copies (skin off, see g_menuHeadPartSkins)
 		// skinned each frame (skinMenuHeadParts) on a system of their own per head part file, on the same stand-in skeleton.
 		struct MenuHeadPart { RE::NiAVObject* shape; RE::NiNode* root; std::string model, key; };   // key: its lower-case game name
