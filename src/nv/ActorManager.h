@@ -72,6 +72,7 @@ namespace nvsmp
 			std::vector<CpuSkin> cpuSkins;
 			void* npc = nullptr;                  // race hair: the actor's TESNPC (face values, hair colour)
 			std::string hairModel;                // and its hair's model path
+			bool headPart = false;                // a head part (hairModel is its model path), not race hair (HeadPart)
 		};
 
 		static constexpr unsigned kSettleFrames = 10, kRetryFrames = 30;
@@ -84,7 +85,8 @@ namespace nvsmp
 		void scanActor(RE::NiNode* root, void* ref);
 		void scan(RE::NiNode* root, RE::NiAVObject* obj, int depth);
 		void found(RE::NiNode* root, RE::NiAVObject* model, const char* file, const hdt::DefaultBBP::NameMap_t* names = nullptr,
-			const std::unordered_map<std::string, std::string>* lists = nullptr, RE::NiAVObject* hairShape = nullptr);
+			const std::unordered_map<std::string, std::string>* lists = nullptr, RE::NiAVObject* hairShape = nullptr,
+			const char* headPartModel = nullptr);   // a head part's: keyed by its shape (hairShape), not the FaceGen node
 
 		std::map<std::pair<void*, void*>, Item> m_items;   // by (skeleton, model)
 		unsigned m_frame = 0;
@@ -112,6 +114,20 @@ namespace nvsmp
 		void refreshMenuProxies(RE::NiNode* playerRoot);
 		void dropMenuSystem(const char* why);
 		bool buildMenuSystem(RE::NiNode* root, RE::NiAVObject* shape, const std::string& model);
+		// Head parts with physics in the race menu, as race hair: the player's copies (skin off, see g_menuHeadPartSkins)
+		// skinned each frame (skinMenuHeadParts) on a system of their own per head part file, on the same stand-in skeleton.
+		struct MenuHeadPart { RE::NiAVObject* shape; RE::NiNode* root; std::string model, key; };   // key: its lower-case game name
+		std::vector<MenuHeadPart> m_menuHeadParts;   // this frame's, found by the scan
+		struct MenuPartSystem
+		{
+			RE::BSTSmartPointer<hdt::SkyrimSystem> system;
+			std::unordered_map<std::string, RE::NiAVObject*> bones;   // its bones by name, lower case
+			unsigned missing = 0, lastTry = 0;
+		};
+		std::map<std::string, MenuPartSystem> m_menuPartSystems;   // by head part model
+		void skinMenuHeadParts();
+		bool buildMenuHeadPart(const MenuHeadPart& h, MenuPartSystem& out);
+		void dropMenuHeadParts(const char* why);
 		float m_lastRootRadius = 0;   // the player root's last finite bound radius (see KeepRadius)
 		std::string m_playerRootName;   // what the last scan took as the player's 3D (for the log)
 		RE::NiNode* m_firstPersonRoot = nullptr;   // the player's first-person model this frame (its items: SkyrimSystem::setFirstPerson)

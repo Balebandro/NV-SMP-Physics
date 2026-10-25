@@ -26,6 +26,9 @@
 //                     other piece (a bottle, a charm, a tag) is rigid: all of it on the last link of the strand whose
 //                     end is nearest, so it swings with the rope but never bends.
 //       --anchor "Bone"     (default Bip01 Pelvis)
+//       --anchor-at tx ty tz r00 r01 r02 r10 r11 r12 r20 r21 r22   an unskinned shape's anchor node, made here, at this
+//                           transform in the NIF's space (rows of its rotation) instead of on the root: where that bone
+//                           is to the NIF in game (a FaceGen head part is drawn turned and moved off Bip01 Head)
 //       --links n           simulated links per strand (default 4)
 //       --keep-top a b      where the strands are tied on stays static: their top a units keep their own weights,
 //                           blending into the links down to b units
@@ -169,6 +172,8 @@ struct Job {
 	std::vector<PaintChain> painted;   // --painted "Shape" file.smppaint: the shape's chains from the file
 	std::string groups;        // --groups "0,1|2|3" (--pieces): the pieces of each rigid body, top first
 	Vec3 up{ 0, 0, 1 };        // --up x y z (--pieces): which way is up in the shape's space
+	bool anchorAtSet = false;  // --anchor-at: the anchor node made for an unskinned shape, at anchorAt
+	Transform anchorAt;
 };
 
 // Reads the chains of one shape from a .smppaint file (written by the NV SMP Maker):
@@ -580,15 +585,17 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 	GeometryData gd;
 	gd.read(f.blocks[geom.data], strips);
 	// An unskinned shape (a weapon charm, a rigid prop) is skinned first, all of it on the anchor: a node of that name
-	// in the NIF, else a new one on the root where the root is (a weapon's "Weapon": its NIF's space is that node's).
-	// The shape's own transform becomes the skin transform, and its shader is told it is skinned.
+	// in the NIF, else a new one on the root where the root is (a weapon's "Weapon": its NIF's space is that node's), or
+	// at --anchor-at. The shape's own transform becomes the skin transform, and its shader is told it is skinned.
 	if (geom.skin < 0) {
 		int anchorBlk = findBlockByName(f, job.anchor);
 		if (anchorBlk >= 0 && !isNodeType(f.typeOf(anchorBlk))) throw std::runtime_error(job.anchor + " is not a node");
+		if (anchorBlk >= 0 && job.anchorAtSet) throw std::runtime_error("--anchor-at: the NIF already has " + job.anchor);
 		if (anchorBlk < 0) {
 			AVObject node;
 			node.isNode = true;
 			node.name = f.addString(job.anchor);
+			if (job.anchorAtSet) node.local = job.anchorAt;
 			Writer w;
 			node.write(w);
 			anchorBlk = f.addBlock("NiNode", w.b);
@@ -597,6 +604,7 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 		SkinData nsd;
 		nsd.skinTransform = geom.av.local;
 		nsd.bones.resize(1);
+		if (job.anchorAtSet) nsd.bones[0].skinToBone = job.anchorAt.inverse();
 		std::vector<Weights> one(gd.vertices.size(), Weights{ { 0, 1.0f } });
 		for (size_t v = 0; v < gd.vertices.size(); v++) nsd.bones[0].weights.push_back({ (uint16_t)v, 1.0f });
 		SkinInstance nsi;
@@ -1236,6 +1244,14 @@ int main(int argc, char** argv)
 		else if (a == "--proxy") { need(1); proxyCell = (float)atof(argv[++i]); }
 		else if (a == "--proxy-tris") { need(1); proxyMaxTris = atoi(argv[++i]); if (proxyCell <= 0) proxyCell = 1.0f; }
 		else if (a == "--anchor") { need(1); cur().anchor = argv[++i]; }
+		else if (a == "--anchor-at") {
+			need(12);
+			Transform& t = cur().anchorAt;
+			t.trans = { (float)atof(argv[i + 1]), (float)atof(argv[i + 2]), (float)atof(argv[i + 3]) };
+			for (int k = 0; k < 9; k++) t.rot.m[k / 3][k % 3] = (float)atof(argv[i + 4 + k]);
+			cur().anchorAtSet = true;
+			i += 12;
+		}
 		else if (a == "--top") { need(1); cur().top = (float)atof(argv[++i]); }
 		else if (a == "--angles") { need(2); cur().angles = true; cur().angleLo = (float)atof(argv[++i]); cur().angleHi = (float)atof(argv[++i]); }
 		else if (a == "--axis") { need(2); cur().axisX = (float)atof(argv[++i]); cur().axisY = (float)atof(argv[++i]); }
@@ -1491,12 +1507,13 @@ int main(int argc, char** argv)
 		for (auto& r : results) pieceFrames |= r.pieceFrame;
 		if (pieceFrames) {
 			line("\t<!-- Rigid pieces hanging against a surface (a charm on a weapon): the frame (set per constraint) has x toward the");
-			line("\t     surface, y across, z up. They swing freely along it and away from it, hardly into it; little twist. -->");
+			line("\t     surface, y across, z up. They swing freely along it, away from it and in toward it (the surface's collision");
+			line("\t     stops them there: a stop at the joint held a charm stuck on one side when a turn pushed it in); little twist. -->");
 			line("\t<generic-constraint-default name=\"piece\">");
 			line("\t\t<frameInB/>");
 			line("\t\t<linearLowerLimit x=\"0\" y=\"0\" z=\"0\"/>");
 			line("\t\t<linearUpperLimit x=\"0\" y=\"0\" z=\"0\"/>");
-			line("\t\t<angularLowerLimit x=\"-1.2\" y=\"-0.1\" z=\"-0.2\"/>");
+			line("\t\t<angularLowerLimit x=\"-1.2\" y=\"-1.2\" z=\"-0.2\"/>");
 			line("\t\t<angularUpperLimit x=\"1.2\" y=\"1.2\" z=\"0.2\"/>");
 			line("\t\t<angularStiffness x=\"0.3\" y=\"0.3\" z=\"0.3\"/>");
 			line("\t\t<angularDamping x=\"0.1\" y=\"0.1\" z=\"0.1\"/>");
