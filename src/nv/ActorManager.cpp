@@ -600,6 +600,7 @@ namespace nvsmp
 			item.skeleton = root;
 			item.model = model;
 			item.file = file;
+			item.worldObject = m_scanWorldObject;
 			if (names) item.names = *names;
 			if (lists) {
 				item.boneLists = *lists;
@@ -719,7 +720,10 @@ namespace nvsmp
 		if (!item.hairModel.empty()) creator.m_fileMeshes = (item.headPart ? HeadPart(item.hairModel.c_str()) : RaceHair(item.hairModel.c_str())).proxies;   // its collision proxies, from the NIF
 		// Waist collision 0 keeps the file's weight thresholds, 1 removes them.
 		creator.m_weightThresholdScale = 1.0f - gSettings.waistCollision;
-		creator.m_ground = gSettings.ground;
+		// The ground plane is anchored on the item's root: an actor's feet, but a placed object's own origin (a cloth's top
+		// edge, which would then hang below the plane and be shoved up through it).
+		creator.m_ground = gSettings.ground && !item.worldObject;
+		creator.m_worldObject = item.worldObject;
 		m_builtWaistCollision = gSettings.waistCollision;
 		m_builtGround = gSettings.ground;
 		logger::info("[SMP] building '{}' for {} on '{}' (try {})", file, model->GetName(), root->GetName(), item.builds);
@@ -783,6 +787,19 @@ namespace nvsmp
 		item.firstPerson = root == m_firstPersonRoot;
 		if (item.firstPerson)
 			item.system->setFirstPerson();
+		// A placed object's nodes are updated from their local transforms whenever the game updates its scene graph (a fade,
+		// a touch): the simulated bones write theirs too, so such an update keeps the physics' pose.
+		if (item.worldObject) {
+			// Actors' stand-ins collide with nothing but this tag (see updateStandIns).
+			for (auto& m : item.system->meshes()) m->m_tags.push_back("world");
+			item.worldRest.clear();
+			const RE::NiTransform toRoot = root->world.Invert();
+			for (auto& b : item.system->getBones()) {
+				auto* bone = static_cast<hdt::SkyrimBone*>(b.get());
+				bone->m_writeLocal = true;
+				item.worldRest.push_back(bone->m_node ? toRoot * bone->m_node->world : RE::NiTransform());
+			}
+		}
 		hdt::SkyrimPhysicsWorld::get()->addSkinnedMeshSystem(item.system.get());
 		logger::info("[SMP] '{}': {} bones, {} collision bodies", file, item.system->getBones().size(), item.system->meshes().size());
 
@@ -1614,6 +1631,181 @@ namespace nvsmp
 		}
 	}
 
+	// Placed objects with physics (see m_worldObjects). Looked for in the loaded cells' references every kWorldObjectRescan
+	// frames (an actor's own 3D is scanned with the actors); each found is seen every frame while its 3D is still in the
+	// scene (attached under a parent), and goes with it.
+	void ActorManager::scanWorldObjects(const RE::NiPoint3& playerPos)
+	{
+		if (m_frame >= m_worldObjectsAt) {
+			m_worldObjectsAt = m_frame + kWorldObjectRescan;
+			std::vector<WorldObject> objects;
+			const float reach2 = kWorldObjectReach * kWorldObjectReach;
+			Game::ForEachLoadedCell([&](void* cell) {
+				Game::ForEachReference(cell, [&](void* ref, uint8_t type) {
+					if (type == 0x3B || type == 0x3C) return;   // actors
+					RE::NiNode* root = Game::Get3D(ref);
+					if (!root || !root->parent || !root->extraDataCount) return;
+					const RE::NiPoint3 d = root->world.translate - playerPos;
+					if (d.x * d.x + d.y * d.y + d.z * d.z > reach2) return;
+					const char* file = root->FindStringExtra(kPhysicsKey);
+					if (file && file[0]) objects.push_back({ RE::NiPointer<RE::NiNode>(root), file });
+				});
+			});
+			if (objects.size() != m_worldObjects.size())
+				logger::info("[SMP] world objects with physics within {:.0f} units: {}", kWorldObjectReach, objects.size());
+			m_worldObjects.swap(objects);
+		}
+		m_scanWorldObject = true;
+		for (auto& o : m_worldObjects)
+			if (o.root && o.root->parent) found(o.root.get(), o.root.get(), o.file.c_str());
+		m_scanWorldObject = false;
+	}
+
+	// Stand-ins (see m_standIns): nothing at all while no world object's physics is built.
+	void ActorManager::updateStandIns(const std::vector<std::tuple<float, RE::NiNode*, void*>>& actors)
+	{
+		// Every actor gets one, whatever SMP items it wears: earrings, a charm or hair do not cover its body (an SMP armor's
+		// body shapes lie outside the capsules, so the cloth meets the armor first; animated bodies never test each other).
+		std::vector<RE::NiPoint3> cloth;
+		for (auto& [key, item] : m_items)
+			if (item.system && item.worldObject) cloth.push_back(item.skeleton->world.translate);
+		auto drop = [&](std::map<void*, StandIn>::iterator it) {
+			if (it->second.system) hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(it->second.system.get());
+			return m_standIns.erase(it);
+		};
+		if (cloth.empty() || m_raceMenu) {   // the race menu rebuilds the player's 3D: nothing of it is held there
+			if (!m_standIns.empty()) {
+				logger::info("[SMP] stand-ins: {}, {} dropped", m_raceMenu ? "race menu" : "no world object with physics", m_standIns.size());
+				for (auto it = m_standIns.begin(); it != m_standIns.end();) it = drop(it);
+			}
+			return;
+		}
+		const float reach2 = kStandInReach * kStandInReach;
+		int built = 0;
+		for (auto& a : actors) {
+			RE::NiNode* root = std::get<1>(a);
+			if (!root) continue;
+			bool inReach = false;
+			for (auto& c : cloth) {
+				const RE::NiPoint3 d = root->world.translate - c;
+				if (d.x * d.x + d.y * d.y + d.z * d.z < reach2) { inReach = true; break; }
+			}
+			if (!inReach) continue;
+			auto it = m_standIns.find(root);
+			// The model under the Weapon node (its first child), compared only.
+			auto weaponOf = [](RE::NiNode* node) -> const void* {
+				if (!node) return nullptr;
+				for (uint16_t i = 0; i < node->ChildEnd(); ++i) if (node->children[i]) return node->children[i];
+				return nullptr;
+			};
+			if (it != m_standIns.end() && weaponOf(it->second.weaponNode.get()) != it->second.weapon && built < kStandInBuildsPerFrame) {
+				drop(it);   // another weapon in hand: built again with its capsule
+				it = m_standIns.end();
+			}
+			if (it == m_standIns.end()) {
+				if (built >= kStandInBuildsPerFrame) continue;
+				++built;
+				hdt::SkyrimSystemCreator creator;
+				StandIn s;
+				if (RE::NiAVObject* w = FindOutside(root, nullptr, "Weapon")) s.weaponNode = RE::NiPointer<RE::NiNode>(w->AsNode());
+				s.weapon = weaponOf(s.weaponNode.get());
+				s.system = creator.createStandIn(root);
+				if (s.system) {
+					hdt::SkyrimPhysicsWorld::get()->addSkinnedMeshSystem(s.system.get());
+					logger::info("[SMP] stand-in for '{}': {} bone(s)", root->GetName(), s.system->getBones().size());
+				}
+				it = m_standIns.emplace(root, std::move(s)).first;   // a failed one is kept empty (not tried again while near)
+			}
+			it->second.frame = m_frame;
+		}
+		for (auto it = m_standIns.begin(); it != m_standIns.end();) {
+			if (it->second.frame != m_frame) it = drop(it);
+			else ++it;
+		}
+	}
+
+	// Projectiles through world objects' cloth (see m_projectileLast): each one's path since the last frame pushes the
+	// simulated bones near it along the shot. Run between the steps (the physics is not stepping here). Nothing at all
+	// while no world object's physics is built.
+	void ActorManager::pushByProjectiles(const std::vector<void*>& projectiles)
+	{
+		std::vector<Item*> cloth;
+		for (auto& [key, item] : m_items)
+			if (item.system && item.worldObject) cloth.push_back(&item);
+		if (cloth.empty()) { m_projectileLast.clear(); return; }
+
+		// The distance from a point to a segment.
+		auto segDist = [](const btVector3& a, const btVector3& b, const btVector3& p) {
+			const btVector3 ab = b - a;
+			const btScalar t = std::clamp((p - a).dot(ab) / std::max(ab.length2(), btScalar(1e-6)), btScalar(0), btScalar(1));
+			return (p - (a + ab * t)).length();
+		};
+		std::unordered_map<void*, RE::NiPoint3> now;
+		for (void* p : projectiles) {
+			const RE::NiPoint3 at = Game::RefPosition(p);
+			now[p] = at;
+			auto last = m_projectileLast.find(p);
+			if (last == m_projectileLast.end()) continue;
+			const btVector3 a = hdt::convertNi(last->second), b = hdt::convertNi(at);
+			const btScalar len = (b - a).length();
+			if (len < 1.0f || len > kProjectileMaxStep) continue;   // still, or not the same projectile (an address reused)
+			const btVector3 dir = (b - a) / len;
+			for (Item* item : cloth) {
+				if (segDist(a, b, hdt::convertNi(item->skeleton->world.translate)) > kProjectileReach) continue;
+				int pushed = 0;
+				for (auto& bone : item->system->getBones()) {
+					auto& rig = bone->m_rig;
+					if (rig.isStaticOrKinematicObject()) continue;
+					const btScalar d = segDist(a, b, rig.getWorldTransform().getOrigin() + hdt::SkyrimBone::s_origin);
+					if (d >= kProjectileRadius) continue;
+					rig.setLinearVelocity(rig.getLinearVelocity() + dir * (kProjectilePush * (1.0f - d / kProjectileRadius)));
+					rig.activate(true);
+					++pushed;
+				}
+				if (pushed && m_projectileHits++ < 20)
+					logger::info("[SMP] projectile (form type {:#x}) through '{}': {} bone(s) pushed", (unsigned)Game::At<uint8_t>(p, 0x04), item->model->GetName(), pushed);
+			}
+		}
+		m_projectileLast.swap(now);
+	}
+
+	// Explosions near world objects' cloth (see m_explosionsSeen): the first frame each one is in the process lists, every
+	// simulated bone within kExplosionReach times its radius is pushed away from its centre. Between the steps, as
+	// pushByProjectiles. Nothing at all while no world object's physics is built.
+	void ActorManager::pushByExplosions(const std::vector<void*>& explosions)
+	{
+		std::vector<Item*> cloth;
+		for (auto& [key, item] : m_items)
+			if (item.system && item.worldObject) cloth.push_back(&item);
+		if (cloth.empty()) { m_explosionsSeen.clear(); return; }
+
+		std::unordered_set<void*> now(explosions.begin(), explosions.end());
+		for (void* e : explosions) {
+			if (m_explosionsSeen.count(e)) continue;   // pushed already
+			const float radius = Game::ExplosionRadius(e);
+			if (!(radius > 1.0f) || radius > 10000.0f) continue;
+			const float reach = radius * kExplosionReach;
+			const btVector3 centre = hdt::convertNi(Game::RefPosition(e));
+			for (Item* item : cloth) {
+				if ((hdt::convertNi(item->skeleton->world.translate) - centre).length() > reach + kExplosionItemSize) continue;
+				int pushed = 0;
+				for (auto& bone : item->system->getBones()) {
+					auto& rig = bone->m_rig;
+					if (rig.isStaticOrKinematicObject()) continue;
+					const btVector3 away = rig.getWorldTransform().getOrigin() + hdt::SkyrimBone::s_origin - centre;
+					const btScalar d = away.length();
+					if (d >= reach || d < 1e-3f) continue;
+					rig.setLinearVelocity(rig.getLinearVelocity() + away / d * (kExplosionPush * (1.0f - d / reach)));
+					rig.activate(true);
+					++pushed;
+				}
+				if (pushed && m_explosionHits++ < 20)
+					logger::info("[SMP] explosion (radius {:.0f}) by '{}': {} bone(s) pushed", radius, item->model->GetName(), pushed);
+			}
+		}
+		m_explosionsSeen.swap(now);
+	}
+
 	void ActorManager::scanActor(RE::NiNode* root, void* ref)
 	{
 		m_scanRef = ref;
@@ -1700,7 +1892,11 @@ namespace nvsmp
 		if (playerRoot)
 			actors.push_back({ 0.0f, playerRoot, player });
 		RE::NiPoint3 playerPos = playerRoot ? playerRoot->world.translate : RE::NiPoint3{};
+		// The process lists hold projectiles too (MobileObjects in the high process): kept apart (see pushByProjectiles).
+		std::vector<void*> projectiles, explosions;
 		Game::ForEachProcessActor([&](void* ref) {
+			if (Game::IsProjectile(ref)) { projectiles.push_back(ref); return; }
+			if (Game::IsExplosion(ref)) { explosions.push_back(ref); return; }
 			if (auto* root = Game::Get3D(ref)) {
 				actors.push_back({ (root->world.translate - playerPos).Length(), root, ref });
 			}
@@ -1717,6 +1913,7 @@ namespace nvsmp
 				scan(m_firstPersonRoot, weapon, 0);
 				m_scanRef = nullptr;
 			}
+		if (!m_raceMenu) scanWorldObjects(playerPos);
 		if (!m_raceMenu && !g_menuSkins.empty()) {   // the menu closed: the hair that remains got its skin back in the scan; the rest went
 			logger::info("[SMP] race menu closed: {} hair skin(s) left with copies the menu threw away", g_menuSkins.size());
 			g_menuSkins.clear();
@@ -1773,6 +1970,9 @@ namespace nvsmp
 				roots.push_back(it->first.first);
 			++it;
 		}
+		updateStandIns(actors);
+		pushByProjectiles(projectiles);
+		pushByExplosions(explosions);
 		stats.actors = (int)roots.size();
 		stats.systems = (int)hdt::SkyrimPhysicsWorld::get()->systemCount();
 		stats.failed = failed;
@@ -1817,6 +2017,26 @@ namespace nvsmp
 				drawn, item.system->m_boundSlots.size(), world->m_averageStepMs, world->m_averageMainMs);
 			if (!most.empty())
 				logger::info("[stats]   furthest from rest: {}", most);
+			// A world object's bones are its NIF's own nodes (no anchors): how far its simulated ones are from where they rested
+			// at the build, in the physics and as drawn (their nodes), and the fastest.
+			if (item.worldObject && item.worldRest.size() == item.system->getBones().size()) {
+				int moving = 0;
+				float physics = 0, drawnOff = 0, fastest = 0;
+				const auto& bones = item.system->getBones();
+				for (size_t i = 0; i < bones.size(); ++i) {
+					auto* bone = static_cast<hdt::SkyrimBone*>(bones[i].get());
+					if (bone->m_rig.isStaticOrKinematicObject() || !bone->m_node) continue;
+					++moving;
+					const btVector3 rest = (hdt::convertNi(item.skeleton->world * item.worldRest[i]).asTransform() * bone->m_localToRig).getOrigin();
+					const btVector3 now = bone->m_rig.getWorldTransform().getOrigin() + hdt::SkyrimBone::s_origin;
+					const btVector3 drawnAt = (hdt::convertNi(bone->m_node->world).asTransform() * bone->m_localToRig).getOrigin();
+					physics = std::max(physics, (float)(now - rest).length());
+					drawnOff = std::max(drawnOff, (float)(drawnAt - rest).length());
+					fastest = std::max(fastest, (float)bone->m_rig.getLinearVelocity().length());
+				}
+				logger::info("[stats]   world object: {} simulated bone(s), furthest from rest {:.2f} units in the physics, {:.2f} as drawn; fastest {:.1f} units/s; "
+				             "the weather's wind {:.2f} (0-1)", moving, physics, drawnOff, fastest, *(float*)Game::kWindMagnitude);
+			}
 			size_t joints = item.system->constraints().size();
 			for (auto& group : item.system->constraintGroups()) joints += group->m_constraints.size();
 			float jitter = 0, rawJitter = 0;

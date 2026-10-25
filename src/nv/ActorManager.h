@@ -7,6 +7,8 @@
 
 #include <map>
 #include <memory>
+#include <tuple>
+#include <unordered_set>
 
 namespace nvsmp
 {
@@ -50,6 +52,8 @@ namespace nvsmp
 			bool failed = false;
 			bool waiting = false;                 // the game has not bound its skin yet
 			bool firstPerson = false;             // on the player's first-person model
+			bool worldObject = false;             // a placed object's own 3D (a cloth on a wall), not an actor's (see scanWorldObjects)
+			std::vector<RE::NiTransform> worldRest;   // a world object's bones at rest, in its root's frame (for the stats), by bone index
 			float jointGapPhys = 0, jointGapDrawn = 0;   // the widest a constraint's two pivots were apart since the last report
 			hdt::DefaultBBP::NameMap_t names;     // race hair: the physics file's shape names -> the game's (see RaceHairFile)
 			std::unordered_map<std::string, std::string> boneLists;   // and the "SMP Bones" lists the game stripped
@@ -114,6 +118,41 @@ namespace nvsmp
 		void refreshMenuProxies(RE::NiNode* playerRoot);
 		void dropMenuSystem(const char* why);
 		bool buildMenuSystem(RE::NiNode* root, RE::NiAVObject* shape, const std::string& model);
+		// Placed objects with physics (statics, clutter: their NIF's root carries the physics file), within kWorldObjectReach
+		// of the player in the loaded cells: looked for every kWorldObjectRescan frames, seen every frame while their 3D is
+		// in the scene. Each is an item on its own root.
+		static constexpr unsigned kWorldObjectRescan = 30;
+		static constexpr float kWorldObjectReach = 4096.0f;
+		struct WorldObject { RE::NiPointer<RE::NiNode> root; std::string file; };
+		std::vector<WorldObject> m_worldObjects;
+		unsigned m_worldObjectsAt = 0;
+		bool m_scanWorldObject = false;   // found() is given a world object
+		void scanWorldObjects(const RE::NiPoint3& playerPos);
+		// Actors' collision stand-ins for world objects' cloth (SkyrimSystemCreator::createStandIn): only while a world object's
+		// physics is built, only for actors within kStandInReach of one (whatever SMP items they wear), at most
+		// kStandInBuildsPerFrame made a frame; dropped when the actor leaves that reach or its 3D goes.
+		static constexpr float kStandInReach = 1500.0f;
+		static constexpr int kStandInBuildsPerFrame = 2;
+		// Its actor's "Weapon" node and the model under it when built: another model there (drawn, swapped) rebuilds it.
+		struct StandIn { RE::BSTSmartPointer<hdt::SkyrimSystem> system; unsigned frame = 0; RE::NiPointer<RE::NiNode> weaponNode; const void* weapon = nullptr; };
+		std::map<void*, StandIn> m_standIns;   // by actor 3D root
+		void updateStandIns(const std::vector<std::tuple<float, RE::NiNode*, void*>>& actors);
+		// Projectiles through world objects' cloth: a bone within kProjectileRadius of a projectile's path since the last frame
+		// gets up to kProjectilePush (units/s) along it; paths longer than kProjectileMaxStep are not the same projectile, and
+		// cloth farther than kProjectileReach from the path is not looked at.
+		// The radius is wider than a cloth's bone spacing (a drape's are about 23 across, 57 down): a shot anywhere through the
+		// cloth reaches a bone.
+		static constexpr float kProjectileRadius = 45.0f, kProjectilePush = 900.0f, kProjectileMaxStep = 3000.0f, kProjectileReach = 400.0f;
+		std::unordered_map<void*, RE::NiPoint3> m_projectileLast;   // each projectile's place last frame
+		unsigned m_projectileHits = 0;                              // for the log
+		void pushByProjectiles(const std::vector<void*>& projectiles);
+		// Explosions: a bone within kExplosionReach times the explosion's radius gets up to kExplosionPush (units/s) away from its
+		// centre, once, the first frame the explosion is seen; cloth whose root is farther than that plus kExplosionItemSize is
+		// not looked at.
+		static constexpr float kExplosionReach = 1.5f, kExplosionPush = 4000.0f, kExplosionItemSize = 400.0f;
+		std::unordered_set<void*> m_explosionsSeen;   // last frame's explosions (each pushes once)
+		unsigned m_explosionHits = 0;                 // for the log
+		void pushByExplosions(const std::vector<void*>& explosions);
 		// Head parts with physics in the race menu, as race hair: the player's copies (skin off, see g_menuHeadPartSkins)
 		// skinned each frame (skinMenuHeadParts) on a system of their own per head part file, on the same stand-in skeleton.
 		struct MenuHeadPart { RE::NiAVObject* shape; RE::NiNode* root; std::string model, key; };   // key: its lower-case game name

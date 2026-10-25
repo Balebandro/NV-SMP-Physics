@@ -367,7 +367,7 @@ namespace hdt
 						return found;
 				return nullptr;
 			}
-		} search{ m_model };
+		} search{ m_worldObject ? nullptr : m_model };   // a placed object's bones are its own nodes
 		if (!m_skeletonNodes.empty()) {
 			auto it = m_skeletonNodes.find(Lower(name.c_str()));
 			return it != m_skeletonNodes.end() ? it->second : nullptr;
@@ -621,7 +621,7 @@ namespace hdt
 		m_boundNodes.clear();
 		m_listedShapes = 0;
 		m_staleSlots = 0;
-		collectExtraBones(model);
+		if (!m_worldObject) collectExtraBones(model);
 
 		try {
 			while (m_reader->Inspect()) {
@@ -884,6 +884,270 @@ namespace hdt
 		logger::info("[SMP] ground plane added at the actor's feet");
 	}
 
+	// Tapered capsules (a radius at each end, straight between), each a closed low-poly mesh skinned to its bone, into one
+	// per-triangle shape: the virtual legs' collision and the stand-ins'. One capsule per bone.
+	void SkyrimSystemCreator::AddCapsules(SkyrimBody* body, PerTriangleShape* shape, const std::vector<CapsuleSegment>& capsules)
+	{
+		const int around = 10;
+		for (auto& s : capsules) {
+			// The capsule in the world, then into its bone's space (the body is skinned in bone space).
+			RE::NiPoint3 axis = s.b - s.a;
+			float len = axis.Length();
+			axis = len > 1e-4f ? axis * (1.0f / len) : RE::NiPoint3{ 0, 0, -1 };
+			RE::NiPoint3 ref = std::fabs(axis.z) < 0.9f ? RE::NiPoint3{ 0, 0, 1 } : RE::NiPoint3{ 1, 0, 0 };
+			RE::NiPoint3 u{ axis.y * ref.z - axis.z * ref.y, axis.z * ref.x - axis.x * ref.z, axis.x * ref.y - axis.y * ref.x };
+			u = u * (1.0f / u.Length());
+			RE::NiPoint3 v{ axis.y * u.z - axis.z * u.y, axis.z * u.x - axis.x * u.z, axis.x * u.y - axis.y * u.x };
+			RE::NiTransform toBone = s.bone->m_node->world.Invert();
+			int boneIdx = body->addBone(s.bone, btQsTransform(), BoundingSphere(convertNi(toBone * ((s.a + s.b) * 0.5f)), len * 0.5f + std::max(s.ra, s.rb)));
+			int first = (int)body->m_vertices.size();
+			auto add = [&](const RE::NiPoint3& world) {
+				Vertex vx;
+				vx.m_skinPos = convertNi(toBone * world);
+				vx.m_weight[0] = 1.0f;
+				vx.m_boneIdx[0] = boneIdx;
+				for (int k = 1; k < 4; k++) { vx.m_weight[k] = 0.0f; vx.m_boneIdx[k] = boneIdx; }
+				body->m_vertices.push_back(vx);
+			};
+			// Rings: each end cap as two latitude rings, the cylinder between; then the two poles' rings.
+			const float caps[] = { -0.866f, -0.5f, 0.0f };   // sin of -60, -30, 0 degrees
+			struct Ring { RE::NiPoint3 c; float r; };
+			std::vector<Ring> rings;
+			for (float sn : caps) rings.push_back({ s.a + axis * (sn * s.ra), s.ra * std::sqrt(1 - sn * sn) });
+			for (int i = 2; i >= 0; i--) rings.push_back({ s.b + axis * (-caps[i] * s.rb), s.rb * std::sqrt(1 - caps[i] * caps[i]) });
+			add(s.a - axis * s.ra);   // the poles
+			add(s.b + axis * s.rb);
+			for (auto& r : rings)
+				for (int k = 0; k < around; k++) {
+					float ang = 6.2831853f * k / around;
+					add(r.c + (u * std::cos(ang) + v * std::sin(ang)) * r.r);
+				}
+			// Triangles, wound so their normals point outward: away from the nearest point of the axis segment.
+			btVector3 A = convertNi(toBone * s.a), B = convertNi(toBone * s.b);
+			auto tri = [&](int i0, int i1, int i2) {
+				auto P = [&](int i) { return body->m_vertices[first + i].m_skinPos; };
+				btVector3 n = (P(i1) - P(i0)).cross(P(i2) - P(i0));
+				btVector3 c = (P(i0) + P(i1) + P(i2)) / 3.0f;
+				btVector3 ab = B - A;
+				float t = std::clamp((c - A).dot(ab) / std::max(ab.length2(), 1e-6f), 0.0f, 1.0f);
+				if (n.dot(c - (A + ab * t)) < 0) std::swap(i1, i2);
+				shape->addTriangle(first + i0, first + i1, first + i2);
+			};
+			const int ringCount = (int)rings.size();
+			auto ringV = [&](int r, int k) { return 2 + r * around + (k % around); };
+			for (int k = 0; k < around; k++) {
+				tri(0, ringV(0, k), ringV(0, k + 1));
+				tri(1, ringV(ringCount - 1, k + 1), ringV(ringCount - 1, k));
+				for (int r = 0; r + 1 < ringCount; r++) {
+					tri(ringV(r, k), ringV(r + 1, k), ringV(r + 1, k + 1));
+					tri(ringV(r, k), ringV(r + 1, k + 1), ringV(r, k + 1));
+				}
+			}
+		}
+	}
+
+	// A stand-in's capsules fitted to what the actor wears, as the virtual legs are to the legs: every skinned shape under its
+	// root (body, armour, gloves, the FaceGen head), posed by its skin, sampled to about 1500 vertices a shape; each vertex
+	// to its nearest capsule (counted only beside it, not past its ends); each end's radius the median distance of the
+	// vertices in that end's third (the whole
+	// capsule's if fewer than 8 there), kept within 0.6 to 1.8 times the preset. A capsule with fewer than 12 keeps its preset.
+	void SkyrimSystemCreator::fitStandIn(RE::NiNode* actorRoot, std::vector<CapsuleSegment>& capsules)
+	{
+		auto segDist = [](const CapsuleSegment& s, const RE::NiPoint3& p, float& along) {
+			RE::NiPoint3 ab = s.b - s.a, ap = p - s.a;
+			float len2 = std::max(ab.x * ab.x + ab.y * ab.y + ab.z * ab.z, 1e-6f);
+			along = std::clamp((ap.x * ab.x + ap.y * ab.y + ap.z * ab.z) / len2, 0.0f, 1.0f);
+			return (p - (s.a + ab * along)).Length();
+		};
+		std::vector<std::vector<std::pair<float, float>>> d(capsules.size());   // per capsule: (where along, distance)
+		int shapes = 0;
+		std::function<void(RE::NiAVObject*, int)> walk = [&](RE::NiAVObject* obj, int depth) {
+			if (!obj || depth > 64) return;
+			if (auto* g = castNiGeometry(obj)) {
+				std::vector<std::vector<std::pair<int, float>>> weights;
+				if (!g->skinInstance || !g->skinInstance->skinData || !g->skinInstance->bones || !g->data || !g->data->vertices || !CollectWeights(g, weights))
+					return;
+				auto* skin = g->skinInstance;
+				const int count = g->data->vertexCount, stride = std::max(1, count / 1500);
+				++shapes;
+				for (int v = 0; v < count; v += stride) {
+					RE::NiPoint3 p{};
+					for (auto& [slot, w] : weights[v])
+						if (slot < (int)skin->boneCount && skin->bones[slot])
+							p = p + (skin->bones[slot]->world * skin->skinData->boneData[slot].skinToBone) * g->data->vertices[v] * w;
+					int best = -1;
+					float bestD = FLT_MAX, bestT = 0;
+					for (size_t i = 0; i < capsules.size(); ++i) {
+						float t;
+						if (float dist = segDist(capsules[i], p, t); dist < bestD) { bestD = dist; bestT = t; best = (int)i; }
+					}
+					// Only beside a capsule, not past its ends (a hand beyond the forearm's would swell its wrist).
+					if (best >= 0 && bestT > 0.0f && bestT < 1.0f) d[best].push_back({ bestT, bestD });
+				}
+				return;
+			}
+			if (auto* node = obj->AsNode())
+				for (uint16_t i = 0; i < node->ChildEnd(); ++i) walk(node->children[i], depth + 1);
+		};
+		walk(actorRoot, 0);
+		auto median = [](std::vector<float> v) { std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end()); return v[v.size() / 2]; };
+		int fitted = 0;
+		for (size_t i = 0; i < capsules.size(); ++i) {
+			auto& c = capsules[i];
+			if (d[i].size() < 12) continue;
+			std::vector<float> all, nearA, nearB;
+			for (auto& [t, dist] : d[i]) {
+				all.push_back(dist);
+				if (t < 0.33f) nearA.push_back(dist);
+				if (t > 0.67f) nearB.push_back(dist);
+			}
+			const float whole = median(all);
+			c.ra = std::clamp(nearA.size() >= 8 ? median(nearA) : whole, c.ra * 0.6f, c.ra * 1.8f);
+			c.rb = std::clamp(nearB.size() >= 8 ? median(nearB) : whole, c.rb * 0.6f, c.rb * 1.8f);
+			++fitted;
+		}
+		std::string radii;
+		for (auto& c : capsules) radii += std::format("{} {:.1f}/{:.1f}; ", c.bone->m_name.c_str(), c.ra, c.rb);
+		logger::info("[SMP] stand-in for '{}': {} of {} capsule(s) fitted to {} skinned shape(s): {}", actorRoot->GetName(), fitted, capsules.size(), shapes, radii);
+	}
+
+	// The weapon the actor holds (its model under the skeleton's "Weapon" node, drawn or holstered): one capsule along the
+	// longest side of its own geometry's box in that node's frame (a blade, a haft, a barrel; not a charm hung on it, not
+	// SMP proxies), its radius half the next longest
+	// side (1.5 to 10 units), on that node so it follows the swing. After the fitting, which it takes no part in.
+	void SkyrimSystemCreator::addWeaponCapsule(std::vector<CapsuleSegment>& capsules)
+	{
+		RE::NiNode* weapon = findObjectByName("Weapon");
+		if (!weapon || !weapon->ChildEnd()) return;
+		const RE::NiTransform toWeapon = weapon->world.Invert();
+		RE::NiPoint3 lo{ FLT_MAX, FLT_MAX, FLT_MAX }, hi{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+		int count = 0;
+		std::function<void(RE::NiAVObject*, int)> walk = [&](RE::NiAVObject* obj, int depth) {
+			if (!obj || depth > 32) return;
+			if (auto* g = castNiGeometry(obj)) {
+				// Not a charm hung on it (skinned) or SMP proxies (hidden collision shapes): the weapon's own geometry.
+				if (!g->data || !g->data->vertices || g->skinInstance || (g->m_name && !_strnicmp(g->m_name, "SMP ", 4))) return;
+				const RE::NiTransform toLocal = toWeapon * g->world;
+				const int n = g->data->vertexCount, stride = std::max(1, n / 500);
+				for (int v = 0; v < n; v += stride) {
+					const RE::NiPoint3 p = toLocal * g->data->vertices[v];
+					lo = { std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z) };
+					hi = { std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z) };
+					++count;
+				}
+				return;
+			}
+			if (auto* node = obj->AsNode())
+				for (uint16_t i = 0; i < node->ChildEnd(); ++i) walk(node->children[i], depth + 1);
+		};
+		for (uint16_t i = 0; i < weapon->ChildEnd(); ++i) walk(weapon->children[i], 0);
+		if (count < 8) return;
+		const float ext[3] = { hi.x - lo.x, hi.y - lo.y, hi.z - lo.z };
+		const int axis = ext[0] >= ext[1] && ext[0] >= ext[2] ? 0 : (ext[1] >= ext[2] ? 1 : 2);
+		const float second = std::max(ext[(axis + 1) % 3], ext[(axis + 2) % 3]);
+		const float radius = std::clamp(second * 0.5f, 1.5f, 10.0f);
+		if (ext[axis] < 4.0f) return;
+		RE::NiPoint3 centre = (lo + hi) * 0.5f, a = centre, b = centre;
+		const float half = std::max(0.0f, ext[axis] * 0.5f - radius);
+		float* pa = &a.x, * pb = &b.x;
+		pa[axis] -= half;
+		pb[axis] += half;
+		SkyrimBone* bone = getOrCreateBone("Weapon");
+		if (!bone) return;
+		capsules.push_back({ bone, weapon->world * a, weapon->world * b, radius, radius });
+		logger::info("[SMP] stand-in: weapon capsule {:.0f} units long, radius {:.1f}", ext[axis], radius);
+	}
+
+	// New Vegas: a stand-in for an actor without SMP collision of its own (an NPC in plain clothes, a creature, a robot), for
+	// placed objects' cloth to collide with: animated (kinematic) capsules on its bones, as one per-triangle body tagged
+	// body, colliding with nothing but shapes tagged world (see ActorManager: every world object's shapes get it). A
+	// humanoid (a Bip01 skeleton with legs and arms) gets its torso, thighs, shins, upper arms and forearms, and its shoulders,
+	// feet and head where the skeleton has them; anything else
+	// one upright capsule from its feet, sized by its bounding sphere, on its root. Built from nothing but the skeleton.
+	RE::BSTSmartPointer<SkyrimSystem> SkyrimSystemCreator::createStandIn(RE::NiNode* actorRoot)
+	{
+		m_skeleton = actorRoot;
+		m_model = actorRoot;
+		m_reader = nullptr;
+		m_boneTemplates.clear();   // the default template: mass 0, kinematic
+		m_worldObject = true;      // bones by name anywhere under the root (it is the skeleton and the model)
+		m_mesh = RE::make_smart<SkyrimSystem>(actorRoot);
+		m_mesh->m_model = actorRoot;
+		m_boneIndex.clear();
+		m_extraBones.clear();
+		m_createdNodes.clear();
+		m_createdAnchors.clear();
+		m_boundNodes.clear();
+		m_listedShapes = 0;
+		m_staleSlots = 0;
+
+		const float scale = actorRoot->world.scale > 0.01f ? actorRoot->world.scale : 1.0f;
+		// Radii for the game's human (about 128 units tall), at each end; optional ones are left out if a skeleton lacks them.
+		struct Preset { const char* from; const char* to; float ra, rb; bool optional; };
+		static const Preset kHumanoid[] = {
+			{ "Bip01 Pelvis", "Bip01 Spine2", 14.0f, 14.0f, false }, { "Bip01 Spine2", "Bip01 Neck1", 14.0f, 7.0f, false },
+			{ "Bip01 L Thigh", "Bip01 L Calf", 9.0f, 6.0f, false }, { "Bip01 L Calf", "Bip01 L Foot", 5.5f, 4.0f, false },
+			{ "Bip01 R Thigh", "Bip01 R Calf", 9.0f, 6.0f, false }, { "Bip01 R Calf", "Bip01 R Foot", 5.5f, 4.0f, false },
+			{ "Bip01 L UpperArm", "Bip01 L Forearm", 5.0f, 4.0f, false }, { "Bip01 L Forearm", "Bip01 L Hand", 4.0f, 3.3f, false },
+			{ "Bip01 R UpperArm", "Bip01 R Forearm", 5.0f, 4.0f, false }, { "Bip01 R Forearm", "Bip01 R Hand", 4.0f, 3.3f, false },
+			{ "Bip01 L Clavicle", "Bip01 L UpperArm", 6.0f, 5.5f, true }, { "Bip01 R Clavicle", "Bip01 R UpperArm", 6.0f, 5.5f, true },
+			{ "Bip01 L Foot", "Bip01 L Toe0", 3.5f, 3.0f, true }, { "Bip01 R Foot", "Bip01 R Toe0", 3.5f, 3.0f, true },
+		};
+		std::vector<CapsuleSegment> capsules;
+		bool humanoid = true;
+		for (auto& p : kHumanoid)
+			if (!p.optional && (!findObjectByName(p.from) || !findObjectByName(p.to))) { humanoid = false; break; }
+		if (humanoid) {
+			for (auto& p : kHumanoid) {
+				auto* from = findObjectByName(p.from);
+				auto* to = findObjectByName(p.to);
+				if (!from || !to) continue;   // an optional one
+				SkyrimBone* bone = getOrCreateBone(p.from);
+				if (!bone) return nullptr;
+				capsules.push_back({ bone, from->world.translate, to->world.translate, p.ra * scale, p.rb * scale });
+			}
+			// The head: from its bone up 10 units the way the neck points, radius 8.
+			if (auto* head = findObjectByName("Bip01 Head"))
+				if (auto* neck = findObjectByName("Bip01 Neck1"))
+					if (SkyrimBone* bone = getOrCreateBone("Bip01 Head")) {
+						RE::NiPoint3 up = head->world.translate - neck->world.translate;
+						const float l = up.Length();
+						up = l > 0.5f ? up * (1.0f / l) : RE::NiPoint3{ 0, 0, 1 };
+						capsules.push_back({ bone, head->world.translate, head->world.translate + up * (10.0f * scale), 8.0f * scale, 8.0f * scale });
+					}
+			fitStandIn(actorRoot, capsules);
+			addWeaponCapsule(capsules);
+		} else {
+			// The bounding sphere (NiAVObject's world bound, through its pointer at +0x20): its centre's height above the
+			// root as half the height, a radius of under half the sphere's.
+			const auto* bound = *reinterpret_cast<RE::NiBound* const*>(reinterpret_cast<const uint8_t*>(actorRoot) + 0x20);
+			if (!bound || !(bound->radius > 1.0f) || !actorRoot->m_name) return nullptr;
+			const RE::NiPoint3 base = actorRoot->world.translate;
+			const float height = std::clamp((bound->center.z - base.z) * 2.0f, 20.0f, 600.0f);
+			const float radius = std::clamp(bound->radius * 0.45f, 6.0f, std::max(6.0f, height * 0.5f));
+			SkyrimBone* bone = getOrCreateBone(actorRoot->m_name);
+			if (!bone) return nullptr;
+			capsules.push_back({ bone, base + RE::NiPoint3{ 0, 0, radius }, base + RE::NiPoint3{ 0, 0, std::max(radius, height - radius) }, radius, radius });
+		}
+
+		auto body = RE::make_smart<SkyrimBody>();
+		body->m_name = "SMP Stand-in";
+		auto shape = RE::make_smart<PerTriangleShape>(body.get());
+		AddCapsules(body.get(), shape.get(), capsules);
+		shape->m_shapeProp.margin = 0.5f;
+		shape->m_shapeProp.penetration = 3.0f;
+		body->m_tags.push_back("body");
+		body->m_canCollideWithTags.insert("world");
+		body->finishBuild();
+		m_mesh->m_meshes.push_back(body);
+		body->m_mesh = m_mesh.get();
+		m_mesh->m_skeleton = hdt::make_nismart(m_skeleton);
+		std::sort(m_mesh->m_bones.begin(), m_mesh->m_bones.end(), [](const auto& a, const auto& b) {
+			return static_cast<SkyrimBone*>(a.get())->m_depth < static_cast<SkyrimBone*>(b.get())->m_depth;
+		});
+		return m_mesh->valid() ? m_mesh : nullptr;
+	}
+
 	// New Vegas: <nv-virtual-legs fit="Legs" scale="0.9"> - smooth collision for the legs, in place of their
 	// mesh. A capsule along each thigh (hip to knee) and shin (knee to ankle), a closed low-poly mesh skinned to
 	// that bone, as one per-triangle body. Each radius is fitted to the shape(s) named in "fit" (comma
@@ -973,64 +1237,12 @@ namespace hdt
 		auto body = RE::make_smart<SkyrimBody>();
 		body->m_name = "SMP Virtual Legs";
 		auto shape = RE::make_smart<PerTriangleShape>(body.get());
-		const int around = 10;
+		std::vector<CapsuleSegment> capsules;
 		for (auto& s : segs) {
-			// The capsule in the world, then into its bone's space (the body is skinned in bone space).
-			RE::NiPoint3 axis = s.b - s.a;
-			float len = axis.Length();
-			axis = len > 1e-4f ? axis * (1.0f / len) : RE::NiPoint3{ 0, 0, -1 };
-			RE::NiPoint3 ref = std::fabs(axis.z) < 0.9f ? RE::NiPoint3{ 0, 0, 1 } : RE::NiPoint3{ 1, 0, 0 };
-			RE::NiPoint3 u{ axis.y * ref.z - axis.z * ref.y, axis.z * ref.x - axis.x * ref.z, axis.x * ref.y - axis.y * ref.x };
-			u = u * (1.0f / u.Length());
-			RE::NiPoint3 v{ axis.y * u.z - axis.z * u.y, axis.z * u.x - axis.x * u.z, axis.x * u.y - axis.y * u.x };
-			RE::NiTransform toBone = s.bone->m_node->world.Invert();
-			int boneIdx = body->addBone(s.bone, btQsTransform(), BoundingSphere(convertNi(toBone * ((s.a + s.b) * 0.5f)), len * 0.5f + std::max(s.ra, s.rb)));
-			int first = (int)body->m_vertices.size();
-			auto add = [&](const RE::NiPoint3& world) {
-				Vertex vx;
-				vx.m_skinPos = convertNi(toBone * world);
-				vx.m_weight[0] = 1.0f;
-				vx.m_boneIdx[0] = boneIdx;
-				for (int k = 1; k < 4; k++) { vx.m_weight[k] = 0.0f; vx.m_boneIdx[k] = boneIdx; }
-				body->m_vertices.push_back(vx);
-			};
-			// Rings: each end cap as two latitude rings, the cylinder between; then the two poles' rings.
-			const float caps[] = { -0.866f, -0.5f, 0.0f };   // sin of -60, -30, 0 degrees
-			struct Ring { RE::NiPoint3 c; float r; };
-			std::vector<Ring> rings;
-			for (float sn : caps) rings.push_back({ s.a + axis * (sn * s.ra), s.ra * std::sqrt(1 - sn * sn) });
-			for (int i = 2; i >= 0; i--) rings.push_back({ s.b + axis * (-caps[i] * s.rb), s.rb * std::sqrt(1 - caps[i] * caps[i]) });
-			add(s.a - axis * s.ra);   // the poles
-			add(s.b + axis * s.rb);
-			for (auto& r : rings)
-				for (int k = 0; k < around; k++) {
-					float ang = 6.2831853f * k / around;
-					add(r.c + (u * std::cos(ang) + v * std::sin(ang)) * r.r);
-				}
-			// Triangles, wound so their normals point outward: away from the nearest point of the axis segment.
-			btVector3 A = convertNi(toBone * s.a), B = convertNi(toBone * s.b);
-			auto tri = [&](int i0, int i1, int i2) {
-				auto P = [&](int i) { return body->m_vertices[first + i].m_skinPos; };
-				btVector3 n = (P(i1) - P(i0)).cross(P(i2) - P(i0));
-				btVector3 c = (P(i0) + P(i1) + P(i2)) / 3.0f;
-				btVector3 ab = B - A;
-				float t = std::clamp((c - A).dot(ab) / std::max(ab.length2(), 1e-6f), 0.0f, 1.0f);
-				if (n.dot(c - (A + ab * t)) < 0) std::swap(i1, i2);
-				shape->addTriangle(first + i0, first + i1, first + i2);
-			};
-			const int ringCount = (int)rings.size();
-			auto ringV = [&](int r, int k) { return 2 + r * around + (k % around); };
-			for (int k = 0; k < around; k++) {
-				tri(0, ringV(0, k), ringV(0, k + 1));
-				tri(1, ringV(ringCount - 1, k + 1), ringV(ringCount - 1, k));
-				for (int r = 0; r + 1 < ringCount; r++) {
-					tri(ringV(r, k), ringV(r + 1, k), ringV(r + 1, k + 1));
-					tri(ringV(r, k), ringV(r + 1, k + 1), ringV(r, k + 1));
-				}
-			}
+			capsules.push_back({ s.bone, s.a, s.b, s.ra, s.rb });
 			logger::info("[SMP] virtual legs: {} to {}, radius {:.1f} to {:.1f}{}", s.from, s.to, s.ra, s.rb, s.d.size() >= 20 ? "" : " (default, nothing fitted)");
 		}
-
+		AddCapsules(body.get(), shape.get(), capsules);
 		shape->m_shapeProp.margin = 0.5f;
 		shape->m_shapeProp.penetration = 3.0f;
 		while (m_reader->Inspect()) {
@@ -1052,7 +1264,7 @@ namespace hdt
 
 	bool SkyrimSystemCreator::complete()
 	{
-		if (m_listedShapes && m_extraBones.empty())
+		if (m_listedShapes && m_extraBones.empty() && !m_worldObject)
 			return false;   // shapes list bones but none had a skin to bind them to
 		int missing = 0;
 		for (auto& [key, uses] : m_extraBones)

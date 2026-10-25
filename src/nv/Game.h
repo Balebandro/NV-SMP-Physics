@@ -80,6 +80,22 @@ namespace Game
 		}
 	}
 
+	// A reference's place (TESObjectREFR +0x30).
+	inline RE::NiPoint3 RefPosition(const void* ref) { return At<RE::NiPoint3>(ref, 0x30); }
+
+	// A projectile reference, by its form type (+0x04): missile (bullets) 0x3D, grenade 0x3E, beam 0x3F, flame 0x40,
+	// continuous beam 0x69.
+	inline bool IsProjectile(const void* ref)
+	{
+		const uint8_t type = At<uint8_t>(ref, 0x04);
+		return (type >= 0x3D && type <= 0x40) || type == 0x69;
+	}
+
+	// An explosion (a MobileObject in the process lists, by its vtable, Explosion::vftable 0x108EE04), and its radius in
+	// game units (+0x94, from BGSExplosion::GetRadiusBSUnits; fAge at +0x88, the object 0x104 bytes).
+	inline bool IsExplosion(const void* ref) { return At<uint32_t>(ref, 0x00) == 0x108EE04; }
+	inline float ExplosionRadius(const void* ref) { return At<float>(ref, 0x94); }
+
 	inline RE::NiNode* Get3D(void* ref)
 	{
 		typedef RE::NiAVObject*(__thiscall * Get3D_t)(void*);
@@ -112,5 +128,36 @@ namespace Game
 				if (objs[i] && objs[i] != Player())
 					f(objs[i]);
 		}
+	}
+
+	// The loaded cells: the interior one (TES +0x34), else the exterior grid's (TES::pGridCellArray +0x08: its size a side
+	// at +0x0C, its cells at +0x10, a TESObjectCELL* each).
+	template <class F>
+	inline void ForEachLoadedCell(F&& f)
+	{
+		void* tes = *(void**)kTES;
+		if (!tes) return;
+		if (void* interior = At<void*>(tes, 0x34)) { f(interior); return; }
+		void* grid = At<void*>(tes, 0x08);
+		if (!grid) return;
+		const uint32_t side = At<uint32_t>(grid, 0x0C);
+		void** cells = At<void**>(grid, 0x10);
+		if (!cells || side > 32) return;
+		for (uint32_t i = 0; i < side * side; ++i)
+			if (cells[i]) f(cells[i]);
+	}
+
+	// A cell's references (TESObjectCELL::kReferences, a BSSimpleList at +0xAC: data, next), walked under the cell's own
+	// lock (CellRefLockEnter 0x541AC0 / CellRefLockLeave 0x541AE0): the game adds and removes them on its loading threads.
+	// The form type at +0x04 is passed too (0x3B a character, 0x3C a creature).
+	template <class F>
+	inline void ForEachReference(void* cell, F&& f)
+	{
+		typedef void(__thiscall * Lock_t)(void*);
+		((Lock_t)0x541AC0)(cell);
+		struct Node { void* data; Node* next; };
+		for (const Node* n = (const Node*)((char*)cell + 0xAC); n; n = n->next)
+			if (n->data) f(n->data, At<uint8_t>(n->data, 0x04));
+		((Lock_t)0x541AE0)(cell);
 	}
 }

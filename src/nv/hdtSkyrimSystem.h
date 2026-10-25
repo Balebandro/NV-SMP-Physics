@@ -16,6 +16,7 @@
 namespace hdt
 {
 	class PerVertexShape;
+	class PerTriangleShape;
 	class SkyrimSystem : public SkinnedMeshSystem
 	{
 		friend class SkyrimSystemCreator;
@@ -103,6 +104,8 @@ namespace hdt
 		SkyrimSystemCreator();
 
 		RE::BSTSmartPointer<SkyrimSystem> createOrUpdateSystem(RE::NiNode* skeleton, RE::NiAVObject* model, DefaultBBP::PhysicsFile_t* file, std::unordered_map<RE::BSFixedString, RE::BSFixedString>&& renameMap, SkyrimSystem* old_system);
+		// New Vegas: an actor's collision stand-in for placed objects' cloth (see the definition).
+		RE::BSTSmartPointer<SkyrimSystem> createStandIn(RE::NiNode* actorRoot);
 
 		// After a build: whether every bone the item lists got its node. An item caught halfway through
 		// the game attaching it can be missing them; the caller builds it again a little later.
@@ -115,6 +118,10 @@ namespace hdt
 		// New Vegas: a ground plane at the actor's feet for the cloth to rest on (see addGroundPlane), raised
 		// or lowered by the offset (game units).
 		bool m_ground = true;
+		// New Vegas: a placed object (its own 3D is the skeleton and the item at once). Unlike a worn item's, its NIF's bone
+		// nodes are kept and its skin bound to them: they are used as they are (found by name in it, as FSMP finds a
+		// skeleton's), none made from the "SMP Bones" list.
+		bool m_worldObject = false;
 		float m_groundOffset = 0.0f;
 
 		// New Vegas: "SMP Bones" lists by shape name (lower case), for shapes the game stripped their extra data from
@@ -328,6 +335,10 @@ namespace hdt
 		void addRigidPieceCollision();
 		void addGroundPlane();
 		RE::BSTSmartPointer<SkyrimBody> readVirtualLegs();
+		struct CapsuleSegment { SkyrimBone* bone; RE::NiPoint3 a, b; float ra, rb; };   // world ends, a radius at each
+		static void AddCapsules(SkyrimBody* body, PerTriangleShape* shape, const std::vector<CapsuleSegment>& capsules);
+		static void fitStandIn(RE::NiNode* actorRoot, std::vector<CapsuleSegment>& capsules);
+		void addWeaponCapsule(std::vector<CapsuleSegment>& capsules);
 		RE::NiNode* createExtraBoneNode(const std::string& name, RE::NiTransform& anchorToNode, RE::NiNode*& anchor);
 		std::string skinSlotName(RE::NiGeometry* geometry, uint32_t slot);
 	};
