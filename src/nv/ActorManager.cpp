@@ -418,6 +418,27 @@ namespace nvsmp
 		return f;
 	}
 
+	// Of the head parts models[0..n) with physics, the one a FaceGen accessory shape is drawn from (-1 if none), and its
+	// shape's game name in it: the same vertex count, and the file's vertices nearest on average (two head parts can be one
+	// mesh mirrored: a pair of teeth).
+	static int NearestHeadPart(const RE::NiGeometryData* d, const char* const* models, int n, std::string& game)
+	{
+		int best = -1;
+		float bestDistance = FLT_MAX;
+		for (int i = 0; i < n; ++i) {
+			const RaceHairFile& f = HeadPart(models[i]);
+			if (f.physics.empty()) continue;
+			for (auto& [name, nifName] : f.nifName) {
+				auto base = f.base.find(name);
+				if (!f.lists.count(name) || base == f.base.end() || base->second.size() != d->vertexCount || !d->vertices) continue;
+				float sum = 0;
+				for (uint16_t v = 0; v < d->vertexCount; v += 8) sum += (d->vertices[v] - base->second[v]).Length();
+				if (sum < bestDistance) { bestDistance = sum; best = i; game = name; }
+			}
+		}
+		return best;
+	}
+
 	// The model path of an actor's hair (TESNPC::hair at 0x1B8, TESHair's TESModel at 0x24, its path at +4), under SEH.
 	static const char* HairModel(void* ref)
 	{
@@ -1530,22 +1551,15 @@ namespace nvsmp
 			if (auto* g = hdt::castNiGeometry(obj); g && g->data && (g->skinInstance || g_menuHeadPartSkins.count(obj))) {
 				const char* models[32];
 				const int n = HeadPartModelList(m_scanRef, models, 32);
-				bool done = false;
-				for (int i = 0; i < n && !done; ++i) {
-					const RaceHairFile& f = HeadPart(models[i]);
-					if (f.physics.empty()) continue;
-					for (auto& [game, nifName] : f.nifName) {
-						if (!f.verts.count(game) || f.verts.at(game) != g->data->vertexCount || !f.lists.count(game)) continue;
-						if (g->skinInstance) {
-							g_menuHeadPartSkins[g] = g->skinInstance;
-							g->skinInstance = nullptr;
-							g->data->dirtyFlags |= 1;
-							logger::info("[SMP] race menu: head part {} copy {:p}: its skin off (skinned here)", models[i], (void*)g);
-						}
-						m_menuHeadParts.push_back({ obj, root, models[i], game });
-						done = true;
-						break;
+				std::string game;
+				if (const int i = NearestHeadPart(g->data, models, n, game); i >= 0) {
+					if (g->skinInstance) {
+						g_menuHeadPartSkins[g] = g->skinInstance;
+						g->skinInstance = nullptr;
+						g->data->dirtyFlags |= 1;
+						logger::info("[SMP] race menu: head part {} copy {:p}: its skin off (skinned here)", models[i], (void*)g);
 					}
+					m_menuHeadParts.push_back({ obj, root, models[i], game });
 				}
 			}
 		if (m_scanRef && !m_raceMenu && obj->m_name && !_strnicmp(obj->m_name, "FaceGenAccessory", 16) && obj->parent) {
@@ -1566,27 +1580,32 @@ namespace nvsmp
 			// A shape renamed here has its skin off while its physics runs (skinned on the CPU, see build): still one.
 			const bool renamed = !_strnicmp(obj->m_name, kHeadPartPrefix, strlen(kHeadPartPrefix));
 			const int n = g && g->data && (g->skinInstance || renamed) ? HeadPartModelList(m_scanRef, models, 32) : 0;
-			bool done = false;
-			for (int i = 0; i < n && !done; ++i) {
-				const RaceHairFile& f = HeadPart(models[i]);
-				if (f.physics.empty()) continue;
-				for (auto& [game, nifName] : f.nifName) {
-					if (!f.verts.count(game) || f.verts.at(game) != g->data->vertexCount) continue;
-					const std::string want = kHeadPartPrefix + nifName;
-					if (_stricmp(obj->m_name, want.c_str()) != 0) {
-						if (_stricmp(obj->m_name, "FaceGenAccessory") != 0) continue;   // another head part's, renamed
-						hdt::setName(obj, want.c_str());
-						g_renamedHeadParts.push_back(RE::NiPointer<RE::NiAVObject>(obj));
-						logger::info("[SMP] head part {}: its FaceGen shape {:p} ({} vertices) named '{}'", models[i], (void*)obj, g->data->vertexCount, want);
-					}
-					auto* sk = g->skinInstance;
-					const uint32_t headSlot = HeadSlot(f.lists.at(game));
-					const bool bound = !sk || (sk->bones && headSlot < sk->boneCount && sk->bones[headSlot] && IsLiveBone(sk->bones[headSlot], root, obj->parent));
-					if (bound || BindHairSkin(g, root, models[i], true))
-						found(root, obj->parent, f.physics.c_str(), &f.names, &f.lists, obj, models[i]);
-					done = true;
-					break;
+			// Renamed: the head part of that name (its vertices are the physics' while it runs). Else the nearest file's.
+			int pick = -1;
+			std::string game;
+			if (renamed) {
+				for (int i = 0; i < n && pick < 0; ++i) {
+					const RaceHairFile& f = HeadPart(models[i]);
+					if (f.physics.empty()) continue;
+					for (auto& [name, nifName] : f.nifName)
+						if (f.verts.count(name) && f.verts.at(name) == g->data->vertexCount && f.lists.count(name) &&
+							_stricmp(obj->m_name, (kHeadPartPrefix + nifName).c_str()) == 0) { pick = i; game = name; break; }
 				}
+			} else if (n > 0 && !_stricmp(obj->m_name, "FaceGenAccessory"))
+				pick = NearestHeadPart(g->data, models, n, game);
+			if (pick >= 0) {
+				const RaceHairFile& f = HeadPart(models[pick]);
+				const std::string want = kHeadPartPrefix + f.nifName.at(game);
+				if (_stricmp(obj->m_name, want.c_str()) != 0) {
+					hdt::setName(obj, want.c_str());
+					g_renamedHeadParts.push_back(RE::NiPointer<RE::NiAVObject>(obj));
+					logger::info("[SMP] head part {}: its FaceGen shape {:p} ({} vertices) named '{}'", models[pick], (void*)obj, g->data->vertexCount, want);
+				}
+				auto* sk = g->skinInstance;
+				const uint32_t headSlot = HeadSlot(f.lists.at(game));
+				const bool bound = !sk || (sk->bones && headSlot < sk->boneCount && sk->bones[headSlot] && IsLiveBone(sk->bones[headSlot], root, obj->parent));
+				if (bound || BindHairSkin(g, root, models[pick], true))
+					found(root, obj->parent, f.physics.c_str(), &f.names, &f.lists, obj, models[pick]);
 			}
 		}
 		if (auto* node = obj->AsNode()) {
