@@ -70,12 +70,40 @@ namespace xmledit
 		float sway = 0, origSway = 0;
 	};
 
+	// A collision shape's tags (a per-vertex-shape or per-triangle-shape): what it is (<tag>), what it ignores
+	// (<no-collide-with-tag>) and, when set, the only tags it collides with (<can-collide-with-tag>). Edited, its tag
+	// lines are written afresh after its start tag; nothing else in it changes.
+	struct TagShape
+	{
+		std::string kind, name;                    // "per-vertex-shape", "SMP Proxy:Tooth"
+		enum { kTags, kIgnores, kOnly, kLists };
+		std::vector<std::string> lists[kLists], original[kLists];
+		size_t insertAt = 0;                       // where its tag lines are written: where the first was, else after its start tag
+		std::vector<std::pair<size_t, size_t>> lines;   // its tag lines in the text (each whole line), removed when edited
+		std::string indent = "\t\t";
+
+		bool Edited() const { for (int k = 0; k < kLists; k++) if (lists[k] != original[k]) return true; return false; }
+
+		// The plugin's rule (SkinnedMeshBody::canCollideWith): with "only" tags, it collides with a shape carrying one
+		// of them; else with any shape carrying none of its ignored tags. Two shapes collide when both allow it (and
+		// not both are animated, which the file does not say).
+		bool Allows(const std::vector<std::string>& otherTags) const
+		{
+			auto has = [](const std::vector<std::string>& v, const std::string& s) { return std::find(v.begin(), v.end(), s) != v.end(); };
+			if (!lists[kOnly].empty()) { for (auto& t : otherTags) if (has(lists[kOnly], t)) return true; return false; }
+			for (auto& t : otherTags) if (has(lists[kIgnores], t)) return false;
+			return true;
+		}
+		bool CollidesWith(const TagShape& o) const { return Allows(o.lists[kTags]) && o.Allows(lists[kTags]); }
+	};
+
 	struct Doc
 	{
 		std::string text;         // the file as read
 		std::vector<Slot> slots;
 		std::vector<Block> blocks;
 		std::vector<Chain> chains;
+		std::vector<TagShape> shapes;
 		int version = 0;          // counts the files parsed (the master sliders start again at the middle for each)
 
 		bool Edited() const
@@ -84,6 +112,7 @@ namespace xmledit
 			for (auto& c : chains) {
 				for (auto& l : c.links) if (l.removed || l.stiff != l.origStiff || l.lively != l.origLively || l.sway != l.origSway) return true;
 			}
+			for (auto& s : shapes) if (s.Edited()) return true;
 			return false;
 		}
 
@@ -94,6 +123,68 @@ namespace xmledit
 				c.stiff = c.origStiff; c.lively = c.origLively; c.sway = c.origSway;
 				for (auto& l : c.links) { l.removed = false; l.stiff = l.origStiff; l.lively = l.origLively; l.sway = l.origSway; }
 			}
+			for (auto& s : shapes) for (int k = 0; k < TagShape::kLists; k++) s.lists[k] = s.original[k];
+		}
+
+		static constexpr const char* kTagElements[TagShape::kLists] = { "tag", "no-collide-with-tag", "can-collide-with-tag" };
+
+		void ParseShapes()
+		{
+			shapes.clear();
+			auto lineStart = [&](size_t p) { while (p > 0 && text[p - 1] != '\n') p--; return p; };
+			auto lineEnd = [&](size_t p) { size_t e = text.find('\n', p); return e == std::string::npos ? text.size() : e + 1; };
+			for (const char* kind : { "per-vertex-shape", "per-triangle-shape" }) {
+				const std::string open = std::string("<") + kind + " ", close = std::string("</") + kind + ">";
+				for (size_t i = 0; (i = text.find(open, i)) != std::string::npos;) {
+					const size_t tagEnd = text.find('>', i), end = text.find(close, i);
+					if (tagEnd == std::string::npos || end == std::string::npos) break;
+					const size_t c = text.rfind("<!--", i);   // inside a comment: skipped
+					if (c != std::string::npos && text.find("-->", c) > i) { i = end; continue; }
+					TagShape s;
+					s.kind = kind;
+					const size_t n = text.find("name=\"", i);
+					if (n != std::string::npos && n < tagEnd) s.name = text.substr(n + 6, text.find('"', n + 6) - (n + 6));
+					s.insertAt = lineEnd(tagEnd);
+					for (int k = 0; k < TagShape::kLists; k++) {
+						const std::string a = std::string("<") + kTagElements[k] + ">", b = std::string("</") + kTagElements[k] + ">";
+						for (size_t p = tagEnd; (p = text.find(a, p)) != std::string::npos && p < end;) {
+							const size_t q = text.find(b, p);
+							if (q == std::string::npos || q > end) break;
+							std::string v = text.substr(p + a.size(), q - p - a.size());
+							while (!v.empty() && isspace((unsigned char)v.back())) v.pop_back();
+							while (!v.empty() && isspace((unsigned char)v.front())) v.erase(v.begin());
+							s.lists[k].push_back(v);
+							const size_t ls = lineStart(p);
+							if (s.lines.empty()) s.indent = text.substr(ls, p - ls);
+							s.lines.push_back({ ls, lineEnd(q) });
+							p = q;
+						}
+						s.original[k] = s.lists[k];
+					}
+					if (s.lines.empty()) {   // no tag lines yet: one level in from the start tag
+						const size_t ls = lineStart(i);
+						s.indent = text.substr(ls, i - ls) + "\t";
+					}
+					std::sort(s.lines.begin(), s.lines.end());
+					if (!s.lines.empty()) s.insertAt = s.lines.front().first;   // where its tags were
+					else {   // before its weight thresholds, if any
+						const size_t w = text.find("<weight-threshold", tagEnd);
+						if (w != std::string::npos && w < end) s.insertAt = lineStart(w);
+					}
+					shapes.push_back(s);
+					i = end;
+				}
+			}
+		}
+
+		// An edited shape's tag lines, as written.
+		std::string TagLines(const TagShape& s) const
+		{
+			const std::string nl = text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+			std::string out;
+			for (int k = 0; k < TagShape::kLists; k++)
+				for (auto& v : s.lists[k]) out += s.indent + "<" + kTagElements[k] + ">" + v + "</" + kTagElements[k] + ">" + nl;
+			return out;
 		}
 
 		// A template's x/y/z field as it is now ("generic-constraint-default warp", "angularStiffness").
@@ -181,7 +272,14 @@ namespace xmledit
 						edits.push_back({ l.start, l.end - l.start, LinkElement(l) });
 				}
 			}
-			std::sort(edits.begin(), edits.end(), [](const Edit& a, const Edit& b) { return a.at < b.at; });
+			// An edited shape's tag lines: the old ones removed, the new ones written after its start tag.
+			for (auto& s : shapes) {
+				if (!s.Edited()) continue;
+				edits.push_back({ s.insertAt, 0, TagLines(s) });
+				for (auto& [a, e] : s.lines) edits.push_back({ a, e - a, "" });
+			}
+			// By place; an insertion before a removal at the same place.
+			std::sort(edits.begin(), edits.end(), [](const Edit& a, const Edit& b) { return a.at != b.at ? a.at < b.at : a.len < b.len; });
 			std::string out;
 			out.reserve(text.size() + 64);
 			size_t pos = 0;
@@ -375,6 +473,7 @@ namespace xmledit
 			for (auto& b : blocks) if (!b.fields.empty()) kept.push_back(b);
 			blocks.swap(kept);
 			ParseChains();
+			ParseShapes();
 		}
 	};
 

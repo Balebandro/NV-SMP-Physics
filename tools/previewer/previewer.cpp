@@ -2309,6 +2309,70 @@ static void Panels(float fps)
 				}
 				ImGui::TreePop();
 			}
+
+			// Collision tags: what each collision shape is, what it ignores, and the only tags it collides with; with
+			// what it then collides, in this file and on other items (the usual cloth and body shapes).
+			if (!gXml.shapes.empty() && ImGui::TreeNode("Collision tags", "Collision tags (%zu shapes)", gXml.shapes.size())) {
+				Help("Each collision shape's tags, as the plugin reads them. Tags: what the shape is. Ignores: it never collides with a shape carrying "
+				     "one of these. Only with: if set, it collides with nothing but shapes carrying one of these (Ignores is then not used). Two shapes "
+				     "collide when each allows the other (and not both are animated). Separate tags with spaces or commas; Enter or clicking away applies "
+				     "and rebuilds. Other items: what this shape does with another item's cloth (tag cloth, ignoring cloth) and its body shapes "
+				     "(tag body, ignoring body), the way smpdress and smpify write them: a weapon's wall that collides with other items' cloth "
+				     "shoves a poncho around while the weapon is holstered under it.");
+				static std::map<std::string, std::string> drafts;   // the text being typed, per shape and list
+				static int draftsFor = -1;
+				if (draftsFor != gXml.version) { drafts.clear(); draftsFor = gXml.version; }
+				auto join = [](const std::vector<std::string>& v) { std::string s; for (auto& t : v) s += (s.empty() ? "" : " ") + t; return s; };
+				auto split = [](const std::string& s) {
+					std::vector<std::string> out;
+					std::string cur;
+					for (char ch : s + " ") {
+						if (ch == ' ' || ch == ',' || ch == '\t') { if (!cur.empty()) out.push_back(cur); cur.clear(); }
+						else cur += ch;
+					}
+					return out;
+				};
+				xmledit::TagShape cloth, body;   // other items' usual shapes
+				cloth.lists[xmledit::TagShape::kTags] = cloth.lists[xmledit::TagShape::kIgnores] = { "cloth" };
+				body.lists[xmledit::TagShape::kTags] = body.lists[xmledit::TagShape::kIgnores] = { "body" };
+				static const char* kListLabels[xmledit::TagShape::kLists] = { "Tags", "Ignores", "Only with" };
+				for (size_t si = 0; si < gXml.shapes.size(); si++) {
+					auto& s = gXml.shapes[si];
+					ImGui::PushID((int)si);
+					const bool edited = s.Edited();
+					if (edited) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.8f, 0.4f, 1));
+					const bool open = ImGui::TreeNode("##shape", "%s %s%s", s.kind == "per-vertex-shape" ? "vertices" : "triangles", s.name.c_str(), edited ? "  *" : "");
+					if (edited) ImGui::PopStyleColor();
+					if (open) {
+						for (int k = 0; k < xmledit::TagShape::kLists; k++) {
+							ImGui::PushID(k);
+							const std::string key = std::to_string(si) + "/" + std::to_string(k);
+							auto d = drafts.find(key);
+							if (d == drafts.end()) d = drafts.emplace(key, join(s.lists[k])).first;
+							char buf[256];
+							snprintf(buf, sizeof buf, "%s", d->second.c_str());
+							ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 9);
+							if (ImGui::InputText(kListLabels[k], buf, sizeof buf)) d->second = buf;
+							if (ImGui::IsItemDeactivatedAfterEdit()) { s.lists[k] = split(d->second); d->second = join(s.lists[k]); rebuild = true; }
+							if (UndoButton("undo", s.lists[k] != s.original[k], "the file's: " + (s.original[k].empty() ? std::string("none") : join(s.original[k])))) {
+								s.lists[k] = s.original[k];
+								d->second = join(s.lists[k]);
+								rebuild = true;
+							}
+							ImGui::PopID();
+						}
+						std::string with;
+						for (auto& o : gXml.shapes)
+							if (&o != &s && s.CollidesWith(o)) with += (with.empty() ? "" : ", ") + o.name;
+						ImGui::TextDisabled("collides with: %s", with.empty() ? "nothing in this file" : with.c_str());
+						ImGui::TextDisabled("other items: cloth %s, body %s", s.CollidesWith(cloth) ? "collides" : "passes through",
+						                    s.CollidesWith(body) ? "collides" : "passes through");
+						ImGui::TreePop();
+					}
+					ImGui::PopID();
+				}
+				ImGui::TreePop();
+			}
 			ImGui::Separator();
 			ImGui::PushItemWidth(-ImGui::GetFontSize() * 14);   // room for the longer labels (angularLowerLimit) and the undo
 			for (size_t b = 0; b < gXml.blocks.size(); b++) {
