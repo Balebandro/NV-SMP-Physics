@@ -372,6 +372,7 @@ struct Item
 	RE::NiNode *pelvis = nullptr, *lThigh = nullptr, *rThigh = nullptr, *lCalf = nullptr, *rCalf = nullptr;
 	RE::NiTransform pelvis0, lThigh0, rThigh0, lCalf0, rCalf0;
 } gItem;
+static bool gFirstPerson = false;    // a weapon with physics on the first-person skeleton, seen from its Camera1st
 
 static std::unordered_map<std::string, IDirect3DTexture9*> gTextureCache;
 
@@ -632,10 +633,10 @@ struct Anim
 	std::string customPath;
 	bool wasAnimating = false;
 } gAnim;
+static std::string gAnimOverride;   // --anim-override folder: an AnimGroupOverride set played first (FindAnimation)
 static V3 gFar;   // --far x y z: the actor that far from the world origin (float precision as in the game)
 static float gSweepRate = 7.0f, gSweepPeriod = 1.2f;   // "Turn back and forth": the fastest turn (rad/s) and a cycle (s); --sweep rate period
 static bool gStanceForced = false;   // --stance: kept over a weapon's own (its folder's)
-static bool gFirstPerson = false;    // a weapon with physics on the first-person skeleton, seen from its Camera1st
 
 struct Motion
 {
@@ -690,6 +691,14 @@ static std::string FindAnimation(const std::string& action, const char* prefix)
 	// folder in mods; vanilla keeps much of that in characters\_male too. Both are tried, the usual one first.
 	bool top = action.rfind("jump", 0) == 0 || action == "aim" || std::string(prefix).rfind("sneak", 0) == 0;
 	std::error_code ec;
+	// --anim-override: that AnimGroupOverride folder first, as the game plays a weapon's own set over the stance's.
+	if (!gAnimOverride.empty())
+		for (auto& root : gItem.roots.folders) {
+			fs::path d = fs::path(root) / "meshes" / "AnimGroupOverride" / gAnimOverride;
+			const char* set = gFirstPerson ? "_1stperson" : "_male";
+			fs::path p = top ? d / set / file : d / set / "locomotion" / file;
+			if (fs::exists(p, ec)) return p.string();
+		}
 	// Loose files, then the archives (datafiles::Resolve), the per-gender path first.
 	// First person: the _1stperson set (its stances' aims in the folder itself, the moves in its locomotion folder).
 	const std::string male = gFirstPerson ? "meshes\\characters\\_1stperson\\" : "meshes\\characters\\_male\\", loco = male + "locomotion\\";
@@ -2756,6 +2765,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--stance") { gAnim.stance = std::clamp(atoi(next().c_str()), 0, IM_ARRAYSIZE(kStances) - 1); gStanceForced = true; }
 		else if (a == "--first-person") gFirstPerson = true;   // testing: the First person box ticked (a weapon with physics)
 		else if (a == "--kf") { gAnim.customPath = next(); gS.preset = kCustom; }
+		else if (a == "--anim-override") gAnimOverride = next();
 		else if (a == "--exit") exitAfter = true;
 		else if (a == "--log") logOut = next();   // testing: the log, written to this file on exit
 		else if (a == "--maker") maker::gM.open = true;
@@ -3145,9 +3155,25 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 				}
 				jointWorst = std::max(jointWorst, widest);
 				jointSum += widest;
+				// The last simulated bone (a charm's tip) in the item's own frame: how far it gets each way along each axis.
+				static RE::NiPoint3 tipLo{ 1e9f, 1e9f, 1e9f }, tipHi{ -1e9f, -1e9f, -1e9f };
+				static std::string tipName;
+				if (RE::NiAVObject* model = gItem.scene.model) {
+					hdt::SkyrimBone* tip = nullptr;
+					for (auto& b : gItem.system->getBones())
+						if (!b->m_rig.isStaticOrKinematicObject()) tip = static_cast<hdt::SkyrimBone*>(b.get());
+					if (tip && tip->m_node) {
+						const RE::NiPoint3 q = model->world.Invert() * tip->m_node->world.translate;
+						tipLo = { std::min(tipLo.x, q.x), std::min(tipLo.y, q.y), std::min(tipLo.z, q.z) };
+						tipHi = { std::max(tipHi.x, q.x), std::max(tipHi.y, q.y), std::max(tipHi.z, q.z) };
+						tipName = tip->m_name.c_str();
+					}
+				}
 				if (++jointFrames == 720) {
 					if (FILE* f = fopen(jointsOut.c_str(), "w")) {
 						fprintf(f, "joints apart: worst %.3f, mean of each frame's widest %.3f (%zu joints, %d frames)\n", jointWorst, jointSum / jointFrames, all.size(), jointFrames);
+						if (!tipName.empty())
+							fprintf(f, "%s on the item: x %.2f..%.2f, y %.2f..%.2f, z %.2f..%.2f\n", tipName.c_str(), tipLo.x, tipHi.x, tipLo.y, tipHi.y, tipLo.z, tipHi.z);
 						// The plugin's own jitter measure (SkyrimBone::m_jitter), as its stats line gives it: the bones' worst.
 						float jitter = 0, rawJitter = 0;
 						for (auto& b : gItem.system->getBones()) {

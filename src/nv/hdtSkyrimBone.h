@@ -30,8 +30,6 @@ namespace hdt
 		// the game's own update of the node later in the frame keeps it (the player's first-person model, which the game
 		// moves into camera space for its draw). See SkyrimSystem::setFirstPerson.
 		bool m_writeLocal = false;
-		// New Vegas: an animated bone's pose read as the skeleton root's world times the locals below it (see readTransform).
-		bool m_preciseInput = false;
 
 		// New Vegas: the jitter filter. A simulated bone's drawn place, relative to the node it hangs from, goes through
 		// a One Euro filter (Casiez et al. 2012): an adaptive low-pass whose cutoff rises with the bone's speed, so a

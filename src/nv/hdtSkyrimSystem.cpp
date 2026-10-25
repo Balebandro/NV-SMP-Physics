@@ -240,7 +240,6 @@ namespace hdt
 			auto* bone = static_cast<SkyrimBone*>(b.get());
 			bone->m_isolation = this;
 			bone->m_writeLocal = true;
-			bone->m_preciseInput = true;
 			RE::NiNode* node = bone->m_node.get();
 			if (!node || node->parent || !bone->m_anchor)
 				continue;
