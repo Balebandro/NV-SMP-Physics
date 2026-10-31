@@ -429,4 +429,30 @@ namespace nifclean
 		rep.ok = true;
 		return rep;
 	}
+
+	// The game hangs an outfit under a node of its own only when its root's second child is a shape
+	// (BipedAnim::AttachSkinnedObject 0x4AD4A0); otherwise the shapes go loose under the actor and taking the item off
+	// removes only the first, the rest staying on the body. Puts the root's shapes before its other children (each kept
+	// in its order). Returns whether that was needed: false when the layout already works or the root holds fewer than
+	// two shapes (no order fixes that). dryRun only checks.
+	inline bool shapesFirst(File& f, bool dryRun)
+	{
+		if (f.roots.empty() || f.roots[0] < 0 || !isNodeType(f.typeOf(f.roots[0]))) return false;
+		const int root = f.roots[0];
+		Reader r(f.blocks[root].data(), f.blocks[root].size());
+		AVObject o;
+		o.read(r, true);
+		auto isShape = [&](int32_t c) { return c >= 0 && c < (int)f.blocks.size() && (f.typeOf(c) == "NiTriShape" || f.typeOf(c) == "NiTriStrips"); };
+		std::vector<int32_t> shapes, rest;
+		for (int32_t c : o.children) (isShape(c) ? shapes : rest).push_back(c);
+		if (shapes.size() < 2 || isShape(o.children[1])) return false;
+		if (dryRun) return true;
+		o.children = shapes;
+		o.children.insert(o.children.end(), rest.begin(), rest.end());
+		Writer w;
+		o.write(w);
+		w.raw(f.blocks[root].data() + o.tailPos, f.blocks[root].size() - o.tailPos);
+		f.blocks[root] = w.b;
+		return true;
+	}
 }

@@ -1329,6 +1329,9 @@ int main(int argc, char** argv)
 		Bytes rootTail(f.blocks[f.roots[0]].begin() + root.tailPos, f.blocks[f.roots[0]].end());
 		std::vector<int> newNodeBlocks;
 		std::vector<JobResult> results;
+		bool rigidItem = false;   // a shape skinned here (a weapon charm, a rigid prop; see runJob): its bones go first (below)
+		for (auto& j : jobs)
+			if (int b = findBlockByName(f, j.shape); b >= 0) { Geometry g; g.read(f.blocks[b]); rigidItem |= g.skin < 0; }
 		for (auto& j : jobs) results.push_back(runJob(f, root, j, physicsPath, newNodeBlocks));
 
 		// --proxy: each collider's stand-in goes beside it (same parent); the physics file names the stand-in.
@@ -1376,10 +1379,13 @@ int main(int argc, char** argv)
 		}
 
 		// The bone nodes under the root (a valid tree for NifSkope; the game drops an armor's, the plugin rebuilds them; a
-		// weapon keeps its own). Before the shapes: the game's selective update (the first-person model) recomputes a skinned
-		// shape's bound from its bones when it reaches the shape, so bones after it gave a bound from last frame's places and
-		// the charm was culled while the gun moved.
-		root.children.insert(root.children.begin(), newNodeBlocks.begin(), newNodeBlocks.end());
+		// weapon keeps its own). A weapon's before the shapes: the game's selective update (the first-person model) recomputes
+		// a skinned shape's bound from its bones when it reaches the shape, so bones after it gave a bound from last frame's
+		// places and the charm was culled while the gun moved. An armour's after them: the game attaches an outfit under a
+		// node of its own only when its root's second child is a shape (BipedAnim::AttachSkinnedObject 0x4AD4A0); with bone
+		// nodes first its shapes went loose under the actor and unequipping took off only the first (2026-10-31 user: the
+		// White Glove attire's dress stayed on).
+		root.children.insert(rigidItem ? root.children.begin() : root.children.end(), newNodeBlocks.begin(), newNodeBlocks.end());
 		if (!proxyOnly) addStringExtra(f, root, "HDT Skinned Mesh Physics Object", physicsPath);
 		{
 			Writer w;

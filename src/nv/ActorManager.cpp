@@ -1590,7 +1590,11 @@ namespace nvsmp
 	{
 		if (!obj || depth > 48)
 			return;
-		if (obj->extraDataCount) {
+		// Not the actor's own root: an outfit the game attaches without a node of its own (its shapes straight under the root)
+		// has its NIF root's extra data copied onto the actor's root, the physics file with it, and left there after it is
+		// unequipped (2026-10-31 user: the White Glove attire's dress stayed on; logged: its item was the actor's root, for
+		// good). Such an outfit is found by its shapes instead, which carry the file too and go when it is unequipped.
+		if (obj->extraDataCount && obj != root) {
 			if (const char* file = obj->FindStringExtra(kPhysicsKey)) {
 				// On a shape, the item is the node holding it.
 				RE::NiAVObject* model = obj->AsNode() ? obj : (obj->parent ? static_cast<RE::NiAVObject*>(obj->parent) : obj);

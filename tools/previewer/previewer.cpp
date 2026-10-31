@@ -1141,6 +1141,45 @@ static void RemoveCopiedSkeleton()
 	LoadItem(gItem.nifPath);
 }
 
+// The outfit's shapes would go loose under the actor in game and stay on after it is taken off (nifclean::shapesFirst).
+static bool gLooseOutfit = false;
+
+static void CheckLooseOutfit()
+{
+	gLooseOutfit = false;
+	// Only an outfit: a weapon and a placed object are not attached by the biped.
+	if (!gItem.loaded || gItem.scene.weapon || gItem.scene.worldObject) return;
+	try {
+		nif::File f;
+		f.load(gItem.nifPath);
+		gLooseOutfit = nifclean::shapesFirst(f, true);
+		if (gLooseOutfit)
+			AddLog(3, "the NIF root's second child is not a shape: in game the item's shapes go loose on the actor and all but the first "
+			          "stay on after it is taken off; 'Put the shapes first' fixes it");
+	} catch (const std::exception& e) {
+		AddLog(3, std::string("outfit layout check: ") + e.what());
+	}
+}
+
+// Puts the root's shapes first (nifclean::shapesFirst), keeping the old NIF as .bak, and reloads.
+static void PutShapesFirst()
+{
+	try {
+		nif::File f;
+		f.load(gItem.nifPath);
+		if (!nifclean::shapesFirst(f, false)) { AddLog(2, "the shapes are already first"); return; }
+		std::string err;
+		std::string kept = backup::keep(gItem.nifPath, &err);
+		if (!err.empty()) { AddLog(4, "could not back up " + gItem.nifPath + ": " + err + " (not changed)"); return; }
+		f.save(gItem.nifPath);
+		AddLog(2, "put the NIF root's shapes first; the NIF as it was: " + kept);
+	} catch (const std::exception& e) {
+		AddLog(4, std::string("could not reorder the NIF: ") + e.what());
+		return;
+	}
+	LoadItem(gItem.nifPath);
+}
+
 // --- deleting and tagging shapes (the Shapes list) ----------------------------------------------------------------
 
 // Which of the shapes sharing shape i's name it is, counting in list order (tree order, as nifclean finds them).
@@ -1492,6 +1531,7 @@ static void LoadItem(const std::string& path)
 	for (auto& n : r.notes) AddLog(3, n);
 	BuildSystem();
 	CheckCopiedSkeleton();
+	CheckLooseOutfit();
 }
 
 static void OpenDialog()
@@ -2201,6 +2241,15 @@ static void Panels(float fps)
 			Help("Takes out the skeleton nodes nothing in the item uses (in game they end up in the actor beside the real skeleton, can catch the "
 			     "item's bones by name and draw it off the body). The skeleton bones the skins use stay, moved onto the NIF's root at their place; "
 			     "the item's own bones, shapes and colliders stay as they are. The old NIF is kept as .bak; then it reloads.");
+		}
+		if (gLooseOutfit) {
+			ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "Parts of this outfit will stay on after it is taken off in game");
+			ImGui::BeginDisabled(maker::gM.running);
+			if (ImGui::Button("Put the shapes first")) PutShapesFirst();
+			ImGui::EndDisabled();
+			Help("The game hangs an outfit under a node of its own only when the NIF root's second child is a shape. Here it is not, so the "
+			     "shapes go loose on the actor and unequipping takes off only the first. Moves the root's shapes before its other children "
+			     "(nothing else changes). The old NIF is kept as .bak; then it reloads.");
 		}
 		if (!gMissingBoneLists.empty()) {
 			ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "%zu shape(s) have bones the game drops (no SMP Bones list):", gMissingBoneLists.size());
@@ -3024,7 +3073,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	std::string jointsOut;     // --joints file: how far the constraints come apart (see below)
 	std::string recipe;   // --recipe file: the Make SMP window loads it (with --maker-build: and builds it, for testing)
 	bool addBoneLists = false;
-	bool genProxies = false, useProxies = false, fixXmlPath = false, removeSkeleton = false;
+	bool genProxies = false, useProxies = false, fixXmlPath = false, removeSkeleton = false, shapesFirst = false;
 	int xmlCollision = -1;          // --xml-collision k [shape]: the XML's collision shape k pointed at shape, or "-" deleted (testing)
 	std::string xmlCollisionTo, xmlAdd, xmlAddShape, toggleProxy;
 	std::vector<std::string> proxyShapes;   // --proxy-shape: the Shapes list's Generate proxies button, for these, pressed once
@@ -3084,6 +3133,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 		else if (a == "--use-proxies") useProxies = true;   // testing: the Point the XML at them button, pressed once
 		else if (a == "--fix-xml-path") fixXmlPath = true;   // testing: the Point the NIF at this XML button, pressed once
 		else if (a == "--remove-skeleton") removeSkeleton = true;   // testing: the Remove the copied skeleton button, pressed once
+		else if (a == "--shapes-first") shapesFirst = true;   // testing: the Put the shapes first button, pressed once
 		else if (a == "--xml-add") { xmlAdd = next(); xmlAddShape = next(); }   // testing: --xml-add body|cloth shape
 		else if (a == "--toggle-proxy") toggleProxy = next();   // testing: the shape's Proxy / Unproxy button, pressed once
 		else if (a == "--xml-collision") { xmlCollision = atoi(next().c_str()); xmlCollisionTo = next(); if (xmlCollisionTo == "-") xmlCollisionTo.clear(); }
@@ -3107,6 +3157,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 	if (useProxies && gItem.loaded) UseProxiesInXml();
 	if (fixXmlPath && gItem.loaded && !gXmlFixPath.empty()) FixXmlPath();
 	if (removeSkeleton && gItem.loaded && gCopiedSkeleton.ok && !gCopiedSkeleton.removed.empty()) RemoveCopiedSkeleton();
+	if (shapesFirst && gItem.loaded && gLooseOutfit) PutShapesFirst();
 	if (!xmlAdd.empty() && gItem.loaded && !gItem.xmlPath.empty()) AddXmlCollision(xmlAdd == "body", xmlAddShape);
 	if (!toggleProxy.empty() && gItem.loaded) ToggleProxy(toggleProxy, 0);
 	if (xmlCollision >= 0 && gItem.loaded && !gItem.xmlPath.empty()) EditXmlCollision(xmlCollision, xmlCollisionTo);
