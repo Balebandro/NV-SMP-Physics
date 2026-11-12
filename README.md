@@ -134,8 +134,7 @@ window) makes a plain armour an SMP item without the command line. Open the armo
   from is picked from what the start of the stroke was weighted to, the links from its length, and its rigging
   (swing limits, springs, mass, damping, wind) from two sliders, Stiffness and Weight. The brush's soft edge blends
   into the mesh's own weights. Tick what the chains collide with, then **Build and preview**.
-- **Outfit**: cloth grids, rope chains and collision options, `smpdress` with every option as a form.
-- **Coat or skirt**: `smpify`. **Fix after Outfit Studio**: `smprepair`.
+- **Fix after Outfit Studio**: `smprepair`.
 
 The output is a folder laid out as `Data` (point it at an empty MO2 mod to install it directly); files it replaces
 are kept as `.bak`. Each build saves its settings beside the XML (`*_smp.xml.smprecipe`, with the painted chains

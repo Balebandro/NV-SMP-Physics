@@ -22,7 +22,6 @@ namespace maker
 	enum Mode { Outfit, Coat, Repair };
 	enum Role { None, Cloth, Chains, Collider, VirtualLegs };   // Cloth is smpify's coat in Coat mode
 	static const char* kOutfitRoles[] = { "Leave as is", "Cloth", "Chains", "Collider" };
-	static const char* kCoatRoles[] = { "Leave as is", "Coat or skirt", "-", "Collider", "Virtual legs" };
 
 	static std::string Lower(std::string s) { for (auto& c : s) c = (char)tolower((unsigned char)c); return s; }
 	static std::string Num(float v) { char b[32]; snprintf(b, sizeof b, "%g", v); return b; }
@@ -1418,7 +1417,7 @@ namespace maker
 			if (ImGui::IsItemHovered()) gHighlightShape = s.name;
 		}
 		ImGui::Checkbox("Low-poly collision proxies", &gM.proxy);
-		Help("The colliders collide through simplified copies hidden in the NIF: far cheaper in game. More collision options: the Outfit tab.");
+		Help("The colliders collide through simplified copies hidden in the NIF: far cheaper in game. The margins and penetration keep their defaults.");
 		OutputRows();
 		BuildButtons(false);
 	}
@@ -1455,111 +1454,6 @@ namespace maker
 		}
 		if (help) Help(help);
 		ImGui::PopID();
-	}
-
-	static void ClothOptions(ShapeRow& s)
-	{
-		BoneCombo("Hangs from", s.anchor, gM.skeleton);
-		Help("The bone the cloth's top row is anchored on: Bip01 Pelvis for a skirt or coat tail, Bip01 Spine2 for a cape or poncho.");
-		ImGui::DragInt2("Columns, rows", &s.cols, 0.1f, 2, 40);
-		Help("The cloth bone grid: columns around the body, rows down to the hem. More is smoother and costs more.");
-		ImGui::Checkbox("Rows by distance from the neck", &s.radial);
-		Help("For a cape draped over the shoulders: rows follow its surface from the collar down, instead of by height.");
-		if (s.radial) {
-			ImGui::SliderFloat("Collar", &s.collar, 0, 40, "%.1f");
-			Help("The top row's distance from the neck; vertices closer than this keep their weights (they sit on the shoulders).");
-		} else {
-			ImGui::Checkbox("Top row height: automatic", &s.autoTop);
-			Help("Automatic: 80% up the shape. Above the top row the vertices keep their weights.");
-			if (!s.autoTop) {
-				ImGui::SliderFloat("Top row height", &s.top, s.zMin, s.zMax, "%.1f");
-				Help("Height of the top row (the anchors), in the shape's own units.");
-			}
-		}
-		ImGui::Checkbox("Spread around the body: automatic", &s.autoAngles);
-		Help("Automatic: as far around as the shape goes.");
-		if (!s.autoAngles) {
-			ImGui::DragFloat2("From, to (degrees)", &s.angleLo, 1.0f, -360, 360, "%.0f");
-			Help("0 = the back, 90 = the body's right side, -90 the left; may wrap past 180 for a poncho.");
-		}
-		ImGui::SliderInt("Rows that don't collide", &s.fixedRows, 0, 4);
-		Help("The top rows sit on the body; colliding them would push them off it. 1 = only the anchors.");
-		if (ImGui::TreeNode("Arm under the cloth", "Arm under the cloth (%zu)", s.detach.size())) {
-			ImGui::TextWrapped("Hand an arm bone's weights to another bone first (e.g. the upper arm onto the clavicle), so the arm moves under the cloth instead of dragging it.");
-			for (size_t i = 0; i < s.detach.size(); i++) {
-				ImGui::PushID((int)i);
-				ImGui::SetNextItemWidth(150); BoneCombo("##from", s.detach[i].first, s.skinBones);
-				ImGui::SameLine(); ImGui::TextUnformatted("->"); ImGui::SameLine();
-				ImGui::SetNextItemWidth(150); BoneCombo("##to", s.detach[i].second, s.skinBones);
-				ImGui::SameLine();
-				bool del = ImGui::SmallButton("x");
-				ImGui::PopID();
-				if (del) { s.detach.erase(s.detach.begin() + i); break; }
-			}
-			if (ImGui::SmallButton("+ add")) s.detach.push_back({});
-			ImGui::TreePop();
-		}
-		if (ImGui::TreeNode("Pinned under armour", "Pinned under armour (%zu)", s.keep.size())) {
-			ImGui::TextWrapped("Cloth under a bone's armour (a shoulder guard) stays still: vertices weighted to the bone keep their weights from the second weight up, blending into the cloth from the first.");
-			for (size_t i = 0; i < s.keep.size(); i++) {
-				ImGui::PushID((int)i);
-				ImGui::SetNextItemWidth(150); BoneCombo("##bone", s.keep[i].bone, s.skinBones);
-				ImGui::SameLine(); ImGui::SetNextItemWidth(110); ImGui::DragFloat2("##w", &s.keep[i].w0, 0.005f, 0, 1, "%.2f");
-				ImGui::SameLine();
-				bool del = ImGui::SmallButton("x");
-				ImGui::PopID();
-				if (del) { s.keep.erase(s.keep.begin() + i); break; }
-			}
-			if (ImGui::SmallButton("+ add")) s.keep.push_back({});
-			ImGui::TreePop();
-		}
-	}
-
-	static void ChainOptions(ShapeRow& s)
-	{
-		BoneCombo("Hangs from", s.anchor, gM.skeleton);
-		Help("The bone the strands are tied on.");
-		ImGui::SliderInt("Links per strand", &s.links, 1, 10);
-		Help("Every piece of the mesh reaching the top and longer than 4 units is a strand: a chain of this many bones. Other pieces (bottles, charms, tags) hang rigid on the nearest strand's end.");
-		ImGui::Checkbox("Knot stays still", &s.keepTop);
-		Help("The strands' top keeps its own weights (where they are tied on), blending into the links below.");
-		if (s.keepTop) { ImGui::DragFloat2("Still, blend to (units)", &s.keepTopA, 0.05f, 0, 20, "%.2f"); }
-	}
-
-	static void ShapesTable()
-	{
-		if (gM.shapes.empty()) { ImGui::TextDisabled("No shapes."); return; }
-		ImGui::TextDisabled("Hover a shape to see it in white.");
-		for (auto& s : gM.shapes) {
-			ImGui::PushID(s.name.c_str());
-			ImGui::SetNextItemWidth(130);
-			if (gM.mode == Coat) {
-				if (s.role == Chains) s.role = None;
-				if (ImGui::BeginCombo("##role", kCoatRoles[s.role])) {
-					for (int r : { (int)None, (int)Cloth, (int)Collider, (int)VirtualLegs })
-						if (ImGui::Selectable(kCoatRoles[r], s.role == r)) {
-							if (r == Cloth || r == VirtualLegs) for (auto& o : gM.shapes) if (o.role == r) o.role = None;   // one of each
-							s.role = r;
-						}
-					ImGui::EndCombo();
-				}
-			} else {
-				if (s.role == VirtualLegs) s.role = Collider;
-				ImGui::Combo("##role", &s.role, kOutfitRoles, IM_ARRAYSIZE(kOutfitRoles));
-			}
-			ImGui::SameLine();
-			ImGui::Text("%s", s.name.c_str());
-			if (ImGui::IsItemHovered()) { gHighlightShape = s.name; ImGui::SetTooltip("%d vertices, height %.1f to %.1f, %zu skin bones", s.verts, s.zMin, s.zMax, s.skinBones.size()); }
-			ImGui::SameLine();
-			ImGui::TextDisabled("%d verts", s.verts);
-			if (gM.mode == Outfit && (s.role == Cloth || s.role == Chains)) {
-				ImGui::Indent();
-				if (s.role == Cloth) ClothOptions(s); else ChainOptions(s);
-				ImGui::Unindent();
-				ImGui::Separator();
-			}
-			ImGui::PopID();
-		}
 	}
 
 	static void OutputRows()
@@ -1628,7 +1522,7 @@ namespace maker
 					if (ImGui::Button("Edit its chains")) LoadRecipe(recipe);
 					Help("Loads its recipe: the original NIF opens with the chains, their points and the settings; Build makes the SMP version again (the old one kept as .bak).");
 				} else
-					ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "This NIF already has SMP physics, not made in the Maker (no recipe beside\nits XML). Build from the original armour; here, only collision proxies can\nbe added (Outfit, colliders only).");
+					ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "This NIF already has SMP physics, not made in the Maker (no recipe beside\nits XML). Build from the original armour; collision proxies can be added\nfrom the Shapes list in the main window.");
 			}
 		}
 
@@ -1638,69 +1532,6 @@ namespace maker
 				gM.mode = Outfit;
 				gM.paintTab = true;
 				PaintTab();
-				ImGui::EndTabItem();
-			}
-			if (ImGui::BeginTabItem("Outfit")) {
-				gM.mode = Outfit;
-				ImGui::TextWrapped("Capes, ponchos, skirts (Cloth), ropes and straps with things hanging on them (Chains), and what they collide with (Collider). smpdress.");
-				if (!gM.source.empty()) {
-					ImGui::SeparatorText("Shapes");
-					ShapesTable();
-					ImGui::SeparatorText("Collision");
-					ImGui::Checkbox("Low-poly collision proxies", &gM.proxy);
-					Help("The colliders collide through simplified copies hidden in the NIF: far cheaper in game, about the same result.");
-					if (gM.proxy) { ImGui::SameLine(); ImGui::SetNextItemWidth(120); ImGui::SliderFloat("cell", &gM.proxyCell, 1, 8, "%.1f"); Help("How coarse the proxies are (units): 2-4 is usual."); }
-					std::set<std::string> colliderBones;
-					for (auto& s : gM.shapes) if (s.role == Collider) colliderBones.insert(s.skinBones.begin(), s.skinBones.end());
-					if (ImGui::TreeNode("Skip", "Parts the cloth never reaches (%zu skipped)", gM.collideSkip.size())) {
-						ImGui::TextWrapped("Triangles weighted only to these bones are left out of the colliders: lower legs, forearms and hands cost time and are rarely touched.");
-						if (ImGui::SmallButton("Suggest")) {
-							for (auto& b : colliderBones) {
-								std::string l = Lower(b);
-								for (const char* k : { "calf", "foot", "toe", "forearm", "foretwist", "hand", "finger", "thumb" }) if (l.find(k) != std::string::npos) gM.collideSkip.insert(b);
-							}
-						}
-						ImGui::SameLine();
-						if (ImGui::SmallButton("None")) gM.collideSkip.clear();
-						for (auto& b : colliderBones) {
-							bool on = gM.collideSkip.count(b) > 0;
-							if (ImGui::Checkbox(b.c_str(), &on)) { if (on) gM.collideSkip.insert(b); else gM.collideSkip.erase(b); }
-						}
-						if (colliderBones.empty()) ImGui::TextDisabled("Give a shape the role Collider first.");
-						ImGui::TreePop();
-					}
-					ImGui::SliderFloat("Cloth margin", &gM.clothMargin, 0, 3, "%.2f");
-					ImGui::SliderFloat("Body margin", &gM.bodyMargin, 0, 3, "%.2f");
-					ImGui::SliderFloat("Penetration", &gM.penetration, 0.05f, 6, "%.2f");
-					Help("How deep a contact may go before it pushes. Against thin armour shells keep it below the shell's thickness (e.g. 0.3), or the inner face grabs cloth resting on the outer one.");
-					ImGui::SeparatorText("Cloth feel");
-					ImGui::SliderFloat("Bend", &gM.bend, 0.2f, 4, "%.2f"); Help("How far the cloth links may swing (x the defaults). A cape modelled in a T pose needs room to drape down.");
-					ImGui::SliderFloat("Stiffness", &gM.stiffness, 0, 3, "%.2f"); Help("The springs back to the modelled shape (x the defaults).");
-					ImGui::SliderFloat("Friction", &gM.friction, 0, 1, "%.2f"); Help("Low lets a flap slide off the shoulder and drape.");
-					ImGui::SliderFloat("Mass", &gM.mass, 0.005f, 0.2f, "%.3f");
-					ImGui::SliderFloat("Bounce", &gM.restitution, 0, 1, "%.2f");
-					ImGui::DragFloat2("Damping (move, turn)", &gM.dampL, 0.005f, 0, 0.999f, "%.3f"); Help("Higher is heavier cloth that sways less (0.95 0.97 for a heavy poncho).");
-					ImGui::Checkbox("Links across columns", &gM.weft); Help("Off: neighbouring columns move freely, so a flap modelled spread out doesn't stand out like a shelf.");
-					ImGui::TextDisabled("Fine tuning after the build: Bone values in the main window.");
-					OutputRows();
-					BuildButtons(false);
-				}
-				ImGui::EndTabItem();
-			}
-			if (ImGui::BeginTabItem("Coat or skirt")) {
-				gM.mode = Coat;
-				ImGui::TextWrapped("One coat tail or skirt on the pelvis, the quick way. smpify.");
-				if (!gM.source.empty()) {
-					ImGui::SeparatorText("Shapes");
-					ShapesTable();
-					ImGui::SeparatorText("Cloth");
-					ImGui::DragInt2("Columns, rows", &gM.coatCols, 0.1f, 2, 40);
-					ImGui::SliderFloat("Waist height", &gM.coatTop, 0, 140, "%.1f"); Help("Height of the waist row (the anchors on the pelvis); the coat above it keeps its weights.");
-					ImGui::SliderFloat("Spread (degrees)", &gM.coatAngle, 30, 180, "%.0f"); Help("The grid spans -this..+this around the body from the back: 140 leaves the front open, 180 goes all round.");
-					ImGui::TextDisabled("Virtual legs: smooth leg capsules fitted to that shape instead of its mesh (better at the hips).");
-					OutputRows();
-					BuildButtons(false);
-				}
 				ImGui::EndTabItem();
 			}
 			if (ImGui::BeginTabItem("Fix after Outfit Studio")) {
