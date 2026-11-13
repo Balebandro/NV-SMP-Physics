@@ -90,7 +90,7 @@ Visual Studio 2022 C++ build tools (x86).
 ```
 build.bat                  the plugin: build\NVSMPPhysics.dll
 tools\build_tools.bat         smpify, smpdress, smprepair, nifcheck, nifdump, NVSMPPrepare and systemtest
-tools\build_previewer.bat     build\NVSMPPreviewer.exe and build\NVSMPMaker.exe
+tools\build_previewer.bat     build\NVSMPPreviewer.exe and build\NVSMPMaker.exe (smpdress, smpify, smprepair, smpclean built in)
 tools\build_rigpreviewer.bat  build\NVRigPreviewer.exe
 ```
 
@@ -139,7 +139,9 @@ window) makes a plain armour an SMP item without the command line. Open the armo
 The output is a folder laid out as `Data` (point it at an empty MO2 mod to install it directly); files it replaces
 are kept as `.bak`. Each build saves its settings beside the XML (`*_smp.xml.smprecipe`, with the painted chains
 in `*.smppaint`); **Load recipe...** brings them back to rebuild or change. **Copy command** gives the command line.
-The Maker runs `smpdress.exe`, `smpify.exe` and `smprepair.exe` from its own folder.
+`smpdress`, `smpify`, `smprepair` and `smpclean` are built into the previewer: the Maker runs it again with the
+tool's name first, and so can you (`NVSMPPreviewer.exe smpdress ...`, its output in the console it was started from;
+use `start /wait` in cmd to wait for it).
 
 ### The command-line tools
 

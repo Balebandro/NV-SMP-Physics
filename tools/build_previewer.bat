@@ -19,6 +19,8 @@ cl %FLAGS% %INCLUDES% ^
 	"%ROOT%src\fsmp\hdtSkinnedMesh\*.cpp" "%ROOT%src\fsmp\XmlReader.cpp" "%ROOT%src\nv\hdtConvertNi.cpp" "%ROOT%src\nv\hdtSkyrimBody.cpp" "%ROOT%src\nv\hdtSkyrimBone.cpp" "%ROOT%src\nv\hdtSkyrimPhysicsWorld.cpp" "%ROOT%src\nv\hdtSkyrimSystem.cpp" ^
 	"%ROOT%tools\scene.cpp" "%ROOT%tools\kf.cpp" "%ROOT%tools\previewer\datafiles.cpp" "%ROOT%tools\previewer\bsa.cpp" "%ROOT%tools\previewer\inflate.cpp" "%ROOT%tools\previewer\previewer.cpp" ^
 	"%IMGUI%\imgui.cpp" "%IMGUI%\imgui_draw.cpp" "%IMGUI%\imgui_tables.cpp" "%IMGUI%\imgui_widgets.cpp" "%IMGUI%\imgui_impl_dx9.cpp" "%IMGUI%\imgui_impl_win32.cpp" || (popd & exit /b 1)
+rem The command-line tools built in (NVSMPPreviewer.exe smpdress ...): one exe to ship, the Maker runs itself.
+for %%t in (smpdress smpify smprepair smpclean) do cl /nologo /O2 /EHsc /MT /std:c++17 /W3 /wd4244 /wd4267 /wd4996 /Dmain=%%t_main /c "%ROOT%tools\%%t.cpp" /Fo:tool_%%t.obj || (popd & exit /b 1)
 link /nologo /DEBUG /LTCG /SUBSYSTEM:WINDOWS /OUT:"%OUT%\NVSMPPreviewer.exe" *.obj "%OUT%\bullet.lib" || (popd & exit /b 1)
 rem The Maker: previewer.cpp again with NVSMP_MAKER, linked with everything else above.
 if exist "%OUT%\makerobj\objs.rsp" del "%OUT%\makerobj\objs.rsp"

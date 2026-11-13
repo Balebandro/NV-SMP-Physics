@@ -69,6 +69,8 @@
 #include <sstream>
 using namespace nif;
 
+namespace {   // internal: the previewer links this tool in (NVSMPPreviewer.exe smpdress ...)
+
 static const float PI = 3.14159265f;
 static const int MaxBonesPerPartition = 16;
 
@@ -1224,6 +1226,8 @@ static JobResult runJob(File& f, AVObject& root, const Job& job, const std::stri
 	f.blocks[si.partition] = np.write();
 	stripsToShape(f, shapeBlock);   // the partition is a triangle list: a strips shape would not be drawn
 	return res;
+}
+
 }
 
 int main(int argc, char** argv)

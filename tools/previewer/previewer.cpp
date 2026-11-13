@@ -3016,8 +3016,51 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
+// The command-line tools, linked in (build_previewer.bat compiles each with main renamed): NVSMPPreviewer.exe smpdress ...
+int smpdress_main(int, char**);
+int smpify_main(int, char**);
+int smprepair_main(int, char**);
+int smpclean_main(int, char**);
+
+// When the first argument names a tool, runs it and gives its exit code.
+static bool RunTool(int argc, LPWSTR* argvW, int& code)
+{
+	static const struct { const wchar_t* name; int (*fn)(int, char**); } kTools[] = {
+		{ L"smpdress", smpdress_main }, { L"smpify", smpify_main }, { L"smprepair", smprepair_main }, { L"smpclean", smpclean_main } };
+	if (argc < 2) return false;
+	for (auto& t : kTools) {
+		if (_wcsicmp(argvW[1], t.name) != 0) continue;
+		// Started from a console (not by the Maker, which hands over a pipe): print into that console.
+		if (!GetStdHandle(STD_OUTPUT_HANDLE) && AttachConsole(ATTACH_PARENT_PROCESS)) {
+			freopen("CONOUT$", "w", stdout);
+			freopen("CONOUT$", "w", stderr);
+		}
+		std::vector<std::string> args;
+		for (int i = 1; i < argc; i++) {
+			char buf[1024];
+			WideCharToMultiByte(CP_ACP, 0, argvW[i], -1, buf, sizeof buf, nullptr, nullptr);
+			args.push_back(buf);
+		}
+		std::vector<char*> argv;
+		for (auto& a : args) argv.push_back(a.data());
+		argv.push_back(nullptr);
+		code = t.fn((int)args.size(), argv.data());
+		fflush(stdout);
+		fflush(stderr);
+		return true;
+	}
+	return false;
+}
+
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 {
+	{
+		int argc = 0, code = 0;
+		LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+		bool tool = RunTool(argc, argv, code);
+		LocalFree(argv);
+		if (tool) return code;
+	}
 	char exe[MAX_PATH];
 	GetModuleFileNameA(nullptr, exe, MAX_PATH);
 #ifdef NVSMP_MAKER

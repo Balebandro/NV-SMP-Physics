@@ -29,6 +29,8 @@
 #include <set>
 using namespace nif;
 
+namespace {   // internal: the previewer links this tool in (NVSMPPreviewer.exe smpify ...)
+
 static const float PI = 3.14159265f;
 static const int MaxBonesPerPartition = 16;
 
@@ -97,6 +99,8 @@ static void addSmpBones(File& f, AVObject& av, const std::string& list)
 		addStringExtra(f, av, piece == 1 ? "SMP Bones" : "SMP Bones " + std::to_string(piece), list.substr(at, end - at));
 		at = end;
 	}
+}
+
 }
 
 int main(int argc, char** argv)

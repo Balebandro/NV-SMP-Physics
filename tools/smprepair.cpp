@@ -22,6 +22,8 @@
 using namespace nif;
 namespace fs = std::filesystem;
 
+namespace {   // internal: the previewer links this tool in (NVSMPPreviewer.exe smprepair ...)
+
 static std::string strName(const File& f, int block)
 {
 	if (block < 0 || block >= (int)f.blocks.size()) return "";
@@ -109,6 +111,8 @@ static int listMode(const char* in, const char* skeletonPath, const char* out)
 	f.save(out);
 	printf("wrote %s (%zu shape(s))\n", out, done.size());
 	return 0;
+}
+
 }
 
 int main(int argc, char** argv)

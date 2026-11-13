@@ -27,7 +27,6 @@ namespace maker
 	static std::string Num(float v) { char b[32]; snprintf(b, sizeof b, "%g", v); return b; }
 	static void Copy(char* dst, size_t n, const std::string& s) { strncpy_s(dst, n, s.c_str(), _TRUNCATE); }
 	static std::string ToolDir() { char exe[MAX_PATH]; GetModuleFileNameA(nullptr, exe, MAX_PATH); return fs::path(exe).parent_path().string(); }
-	static std::string ToolPath(const char* name) { return (fs::path(ToolDir()) / name).string(); }
 
 	struct KeepRow { std::string bone; float w0 = 0.05f, w1 = 0.2f; };
 
@@ -403,9 +402,10 @@ namespace maker
 
 	static void Run(const char* tool, const std::vector<std::string>& args, const std::string& resultNif, const std::string& recipePath)
 	{
-		std::string exe = ToolPath(tool);
-		if (!fs::exists(exe)) { AddLog(4, std::string(tool) + " not found beside the previewer: " + exe); return; }
-		std::string cmd = Quote(exe);
+		// The tools are built into this exe: it runs itself with the tool's name first (RunTool in previewer.cpp).
+		char self[MAX_PATH];
+		GetModuleFileNameA(nullptr, self, MAX_PATH);
+		std::string cmd = Quote(self) + " " + fs::path(tool).stem().string();
 		for (auto& a : args) cmd += " " + Quote(a);
 		gM.lastCommand = cmd;
 		gM.afterSuccess = nullptr;
