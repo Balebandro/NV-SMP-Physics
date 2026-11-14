@@ -476,6 +476,10 @@ static std::vector<std::pair<std::string, std::string>> UnusedProxies(const std:
 	return out;
 }
 
+// (2026-11-14) An edit made on a Maker build's output (proxies, shapes, the XML's collisions), kept in its recipe and done
+// again after every rebuild from the source (maker.h; a no-op on other NIFs and while the Maker replays them).
+namespace maker { static void RecordEdit(const std::string& e); }
+
 // Points the XML's collision shapes at the NIF's proxies (gProxyRenames), keeping the file as it was in .bak.
 static void BuildSystem();
 static void UseProxiesInXml()
@@ -500,6 +504,7 @@ static void UseProxiesInXml()
 	if (!o) { AddLog(4, "could not write " + gItem.xmlPath); return; }
 	o.close();
 	AddLog(2, "pointed " + std::to_string(renamed) + " collision shape(s) in " + gItem.xmlPath + " at the NIF's proxies (the file as it was: " + bak + ")");
+	maker::RecordEdit("useproxies");
 	BuildSystem();
 }
 
@@ -1276,6 +1281,7 @@ static void EditXmlCollision(int index, const std::string& to)
 	if (!SaveXml(text)) return;
 	AddLog(2, to.empty() ? "took the collision shape " + c.name + " out of " + gItem.xmlPath
 	                     : "the collision shape " + c.name + " in " + gItem.xmlPath + " now uses " + to);
+	maker::RecordEdit("xmlcol|" + c.name + "|" + to);
 	LoadItem(gItem.nifPath);
 }
 
@@ -1296,6 +1302,7 @@ static void AddXmlCollision(bool perTriangle, const std::string& shape)
 	text.insert(at, e);
 	if (!SaveXml(text)) return;
 	AddLog(2, std::string("added a ") + (perTriangle ? "body" : "cloth") + " collision shape on " + shape + " to " + gItem.xmlPath);
+	maker::RecordEdit(std::string("xmladd|") + (perTriangle ? "body" : "cloth") + "|" + shape);
 	LoadItem(gItem.nifPath);
 }
 
@@ -1344,6 +1351,7 @@ static void ToggleProxy(const std::string& name, int occurrence)
 		if (!err.empty()) { AddLog(4, "could not back up " + gItem.nifPath + ": " + err + " (nothing renamed)"); return; }
 		f.save(gItem.nifPath);
 		AddLog(2, name + (unmark ? " is no longer a proxy: " : " marked as a proxy: ") + to + " (the NIF as it was: " + kept + ")");
+		maker::RecordEdit("proxyflag|" + name + "|" + std::to_string(occurrence));
 		if (!gItem.xmlPath.empty() && nifclean::findShape(f, name, 0) < 0) {
 			std::string text = ReadText(gItem.xmlPath);
 			auto list = XmlCollisions(text);
@@ -1374,6 +1382,7 @@ static void DeleteShapes(const std::vector<std::pair<std::string, int>>& targets
 		std::string names;
 		for (auto& [name, k] : targets) names += (names.empty() ? "" : ", ") + name;
 		AddLog(2, "deleted " + names + " (" + std::to_string(rep.blocksBefore) + " blocks -> " + std::to_string(rep.blocksAfter) + "); the NIF as it was: " + kept);
+		for (auto& [name, k] : targets) maker::RecordEdit("delete|" + name + "|" + std::to_string(k));
 		if (!gItem.xmlPath.empty()) {
 			std::string text = ReadText(gItem.xmlPath);
 			int back = 0;
@@ -3746,6 +3755,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
 				forced = frameNo <= 120 ? 1 : 0;
 				if (frameNo == 121 && buildAfterStroke) maker::gM.buildOnOpen = true;
 			}
+			// After it, the brush rests (not pressed) a quarter along the stroke until frame 200: the heat map shows the weights
+			// of the chain point nearest the brush (2026-11-14), for --shots to catch.
+			else if (stroke[0] >= 0 && frameNo > 121 && frameNo <= 200) { mx = stroke[0] + (stroke[2] - stroke[0]) * 0.25f; my = stroke[1] + (stroke[3] - stroke[1]) * 0.25f; forced = 0; }
 			float nx = mx * 2 - 1, ny = 1 - my * 2;
 			maker::Mouse(eye, Norm(z * -1.0f + x * (nx * th * aspect) + y * (ny * th)), forced);
 		}

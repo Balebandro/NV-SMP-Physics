@@ -66,6 +66,7 @@ namespace maker
 		std::string anchor;
 		int links = 4;
 		float stiffness = 0.4f, weight = 0.4f;
+		bool hidden = false;                // (2026-11-14) its square in the list clicked: lines, points and paint not drawn (view only, not saved)
 	};
 
 	struct State
@@ -83,6 +84,10 @@ namespace maker
 		int point = -1;                     // the selected chain's selected point (0 where it is tied on), -1 none
 		float reach = 8, amount = 0.25f;    // grow / fade around the point: how far, how much per click
 		V3 dragPlane, dragNormal;           // Move points: the plane the dragged point moves in (facing the camera)
+		// (2026-11-14 user: move several points at once) Move points: the points picked together (chain, point; Ctrl+click
+		// adds or takes one out), dragged as one; where each was when the drag began (world), and the grabbed one's.
+		std::vector<std::pair<int, int>> group;
+		std::vector<V3> groupStart;
 		struct Snapshot { std::vector<PaintChain> chains; int selected, point; std::map<std::string, std::set<int>> masks; };
 		std::deque<Snapshot> undo;          // the chains before each edit, newest last (Ctrl+Z), at most kUndo
 		std::deque<Snapshot> redo;          // what Ctrl+Z took back, newest last (Ctrl+Y); a new edit clears it
@@ -120,6 +125,11 @@ namespace maker
 		std::string resultNif, recipeToSave, lastCommand, lastResult;
 		std::function<void()> afterSuccess;   // runs once the tool succeeded, before the result is opened
 		bool buildOnOpen = false;           // --maker-build (testing): build once the window has a source
+		// (2026-11-14 user: a rebuild lost the proxy and shape edits made on the output.) Edits made in the previewer on the
+		// build's output ("kind|arg|..."; RecordEdit), kept in the recipe and done again, in order, after every build.
+		std::vector<std::string> edits;
+		std::deque<std::string> replay;     // the edits still to redo after this build
+		bool replaying = false, replayAfterBuild = false;
 	};
 	static State gM;
 
@@ -231,7 +241,7 @@ namespace maker
 	{
 		std::vector<ShapeRow> old = std::move(gM.shapes);
 		gM.shapes.clear();
-		if (gItem.nifPath != gM.source) { gM.chains.clear(); gM.selected = -1; gM.point = -1; gM.masks.clear(); gM.undo.clear(); gM.redo.clear(); }   // another NIF: its chains, masks and history go
+		if (gItem.nifPath != gM.source) { gM.chains.clear(); gM.selected = -1; gM.point = -1; gM.masks.clear(); gM.undo.clear(); gM.redo.clear(); gM.edits.clear(); }   // another NIF: its chains, masks, history and kept edits go
 		gM.source = gItem.nifPath;
 		gM.sourceHasPhysics = !gItem.scene.physicsFile.empty();
 		for (auto& s : gItem.shapes) {
@@ -272,6 +282,7 @@ namespace maker
 		o << "mass=" << Num(gM.mass) << "\nrestitution=" << Num(gM.restitution) << "\ndamping=" << Num(gM.dampL) << " " << Num(gM.dampA) << "\n";
 		o << "coatgrid=" << gM.coatCols << " " << gM.coatRows << "\ncoattop=" << Num(gM.coatTop) << "\ncoatangle=" << Num(gM.coatAngle) << "\n";
 		if (!gM.chains.empty()) o << "paint=" << OutXml() << ".smppaint\n";
+		for (auto& e : gM.edits) o << "edit=" << e << "\n";   // done again on the output after every build
 		for (auto& s : gM.shapes) {
 			if (s.role == None) continue;
 			o << "\n[shape]\nname=" << s.name << "\nrole=" << s.role << "\nanchor=" << s.anchor << "\ngrid=" << s.cols << " " << s.rows << "\n";
@@ -310,7 +321,7 @@ namespace maker
 			size_t eq = line.find('=');
 			if (eq == std::string::npos) continue;
 			auto kv = std::make_pair(line.substr(0, eq), line.substr(eq + 1));
-			(inShape ? shapes.back() : top).push_back(kv);
+			(inShape && kv.first != "edit" ? shapes.back() : top).push_back(kv);   // (edits appended after a build land after the shapes)
 		}
 		std::string source;
 		for (auto& [k, v] : top) if (k == "source") source = v;
@@ -320,9 +331,11 @@ namespace maker
 		gM.physics[0] = gM.outDir[0] = 0;
 		Capture();
 		gM.collideSkip.clear();
+		gM.edits.clear();
 		for (auto& [k, v] : top) {
 			float a = 0, b = 0;
 			if (k == "mode") gM.mode = atoi(v.c_str());
+			else if (k == "edit") gM.edits.push_back(v);
 			else if (k == "physics") Copy(gM.physics, sizeof gM.physics, v);
 			else if (k == "outdir") Copy(gM.outDir, sizeof gM.outDir, v);
 			else if (k == "proxy") gM.proxy = v == "1";
@@ -464,6 +477,8 @@ namespace maker
 		});
 	}
 
+	static void ReplayNext();
+
 	// Each frame: the tool's output into the log; when it is done, the result opened.
 	static void Pump()
 	{
@@ -473,15 +488,20 @@ namespace maker
 			if (!gM.pending.empty()) gLogScroll = true;
 			gM.pending.clear();
 		}
+		// The build's kept edits, one at a time (a proxy generation runs a tool: the next waits for it).
+		if (gM.replaying && !gM.running) { ReplayNext(); return; }
 		if (!gM.finished || !gM.worker.joinable()) return;
 		gM.worker.join();
 		gM.running = false;
 		gM.finished = false;
 		auto after = std::move(gM.afterSuccess);
 		gM.afterSuccess = nullptr;
+		const bool replayNow = gM.replayAfterBuild;
+		gM.replayAfterBuild = false;
 		if (gM.exitCode != 0) {
 			gM.lastResult = "failed (see the log)";
 			AddLog(4, "the build failed: nothing was opened");
+			if (gM.replaying) AddLog(3, "a kept edit failed; going on with the rest");
 			return;
 		}
 		if (!gM.recipeToSave.empty()) {
@@ -491,6 +511,11 @@ namespace maker
 		if (after) after();
 		gM.lastResult = "done: " + gM.resultNif;
 		LoadItem(gM.resultNif);
+		if (replayNow && !gM.edits.empty() && gItem.loaded) {
+			gM.replay.assign(gM.edits.begin(), gM.edits.end());
+			gM.replaying = true;
+			AddLog(2, "doing again the " + std::to_string(gM.edits.size()) + " edit(s) made on the last build (proxies, shapes, collisions)");
+		}
 	}
 
 	static void BuildOutfit()
@@ -563,7 +588,9 @@ namespace maker
 		fs::create_directories(fs::path(xml).parent_path(), ec);
 		Backup(nif);
 		if (gM.mode == Coat || jobs) Backup(xml);
+		gM.replay.clear(); gM.replaying = false;
 		Run(gM.mode == Coat ? "smpify.exe" : "smpdress.exe", a, nif, (gM.mode == Coat || jobs) ? xml + ".smprecipe" : std::string());
+		gM.replayAfterBuild = gM.running;   // (Run could not start it: nothing to redo)
 	}
 
 	/* Low-poly collision proxies for an armour that collides with its full meshes: smpdress's proxy-only mode adds a
@@ -584,7 +611,10 @@ namespace maker
 		if (maxTris > 0) { a.push_back("--proxy-tris"); a.push_back(std::to_string(maxTris)); }
 		Run("smpdress.exe", a, nif, {});
 		if (!gM.running) return;   // could not start it
-		gM.afterSuccess = [xml, shapes]() {
+		gM.afterSuccess = [xml, shapes, cell, maxTris]() {
+			std::string e = "proxies|" + Num(cell) + "|" + std::to_string(maxTris);
+			for (auto& s : shapes) e += "|" + s;
+			RecordEdit(e);
 			if (xml.empty()) return;
 			std::ifstream in(xml, std::ios::binary);
 			std::string text((std::istreambuf_iterator<char>(in)), {});
@@ -609,6 +639,51 @@ namespace maker
 			std::ofstream(xml, std::ios::binary) << text;
 			AddLog(2, "the XML collides with the proxies now (" + std::to_string(renamed) + " collision shape(s) renamed): " + xml);
 		};
+	}
+
+	static bool SamePath(const std::string& a, const std::string& b)
+	{
+		return !a.empty() && !b.empty() && Lower(fs::path(a).lexically_normal().string()) == Lower(fs::path(b).lexically_normal().string());
+	}
+
+	// An edit made in the previewer on a Maker build's output (its recipe beside its XML): added to that recipe on disk
+	// and, when it is this session's build, to the kept edits, so the next build does it again. Not while replaying them.
+	static void RecordEdit(const std::string& e)
+	{
+		if (gM.replaying) return;
+		const std::string recipe = RecipeOf(gItem.xmlPath);
+		if (recipe.empty()) return;   // not a Maker build: nothing rebuilds it
+		std::ofstream(recipe, std::ios::app) << "edit=" << e << "\n";
+		if (!gM.source.empty() && SamePath(gItem.nifPath, OutNif())) gM.edits.push_back(e);
+		AddLog(2, "kept for the next build: " + e);
+	}
+
+	// One kept edit done again on the fresh build (open in the view), as the previewer did it. A proxy generation runs a
+	// tool: Pump calls this again once it is done.
+	static void ReplayNext()
+	{
+		if (gM.replay.empty()) { gM.replaying = false; AddLog(2, "the kept edits are done again"); return; }
+		const std::string e = gM.replay.front();
+		gM.replay.pop_front();
+		std::vector<std::string> p;
+		for (size_t a = 0, b; ; a = b + 1) { b = e.find('|', a); p.push_back(e.substr(a, b == std::string::npos ? std::string::npos : b - a)); if (b == std::string::npos) break; }
+		const std::string& kind = p[0];
+		AddLog(2, "again: " + e);
+		if (kind == "proxies" && p.size() >= 4)
+			GenerateProxies(gItem.nifPath, gItem.xmlPath, std::vector<std::string>(p.begin() + 3, p.end()), (float)atof(p[1].c_str()), atoi(p[2].c_str()));
+		else if (kind == "proxyflag" && p.size() >= 3) ToggleProxy(p[1], atoi(p[2].c_str()));
+		else if (kind == "delete" && p.size() >= 3) DeleteShapes({ { p[1], atoi(p[2].c_str()) } });
+		else if (kind == "xmladd" && p.size() >= 3) AddXmlCollision(p[1] == "body", p[2]);
+		else if (kind == "useproxies") UseProxiesInXml();
+		else if (kind == "xmlcol" && p.size() >= 3) {
+			// by the collision shape's name (its place in the list can differ in the new XML)
+			auto list = XmlCollisions(ReadText(gItem.xmlPath));
+			int k = -1;
+			for (int i = 0; i < (int)list.size() && k < 0; i++) if (_stricmp(list[i].name.c_str(), p[1].c_str()) == 0) k = i;
+			if (k >= 0) EditXmlCollision(k, p[2]);
+			else AddLog(3, "the new XML has no collision shape " + p[1] + ": skipped");
+		}
+		else AddLog(3, "unknown kept edit, skipped: " + e);
 	}
 
 	// Writes the missing "SMP Bones" lists into the NIF (smprepair --list, the game's skeleton deciding which bones are
@@ -778,6 +853,32 @@ namespace maker
 		c.links--;
 		c.points.clear();
 		for (int j = 1; j <= c.links; j++) { RE::NiPoint3 p = toSkin * RE::NiPoint3{ bones[j].x, bones[j].y, bones[j].z }; c.points[j] = V3(p.x, p.y, p.z); }
+	}
+
+	// (2026-11-14 user: chains come out jagged, evening every point by hand is tedious.) The chain's middle points (not
+	// the tie-on, not the end) moved, as moved points: the paint stays.
+	// Smooth: each halfway to its neighbours' midpoint (zig-zags iron out; each click a bit more, the chain straightening
+	// towards the line between its ends). Even: spread at equal distances along the path the points make now (its shape kept).
+	static void RelaxPoints(PaintChain& c, const ShapeDraw& s, bool even)
+	{
+		const std::vector<V3> pts = PlannedBones(s, c);
+		const int n = (int)pts.size() - 1;
+		if (n < 2 || n != c.links) return;
+		std::vector<V3> out = pts;
+		if (!even)
+			for (int k = 1; k < n; k++) out[k] = pts[k] + ((pts[k - 1] + pts[k + 1]) * 0.5f - pts[k]) * 0.5f;
+		else {
+			std::vector<float> at(n + 1, 0.0f);
+			for (int k = 1; k <= n; k++) { V3 d = pts[k] - pts[k - 1]; at[k] = at[k - 1] + std::sqrt(Dot(d, d)); }
+			for (int k = 1, i = 1; k < n; k++) {
+				const float want = at[n] * k / n;
+				while (i < n && at[i] < want) i++;
+				const float t = at[i] > at[i - 1] ? (want - at[i - 1]) / (at[i] - at[i - 1]) : 0.0f;
+				out[k] = pts[i - 1] + (pts[i] - pts[i - 1]) * t;
+			}
+		}
+		const RE::NiTransform toSkin = SkinToWorld(s).Invert();
+		for (int k = 1; k < n; k++) { RE::NiPoint3 p = toSkin * RE::NiPoint3{ out[k].x, out[k].y, out[k].z }; c.points[k] = V3(p.x, p.y, p.z); }
 	}
 
 	// The paint of a chain at a vertex (0 where it is not painted).
@@ -1010,36 +1111,47 @@ namespace maker
 		}
 	}
 
+	// A point of the Move points group still there (its chain and point not deleted since).
+	static bool GroupValid(const std::pair<int, int>& g) { return g.first >= 0 && g.first < (int)gM.chains.size() && g.second >= 0 && g.second <= gM.chains[g.first].links; }
+	static bool InGroup(int ci, int k) { return std::find(gM.group.begin(), gM.group.end(), std::make_pair(ci, k)) != gM.group.end(); }
+
 	// Move points: a click near a chain's point (the selected chain's first) picks it up; dragging moves it in the plane
-	// through it facing the camera. Only the bone moves: the mesh stays, and the build weights it to the bones where
-	// they are. On the NIF's pose only (what the build reads).
+	// through it facing the camera. Ctrl+click adds a point to the group or takes it out (2026-11-14): dragging any point of
+	// the group moves them all by as much; a plain click on a point outside it starts a group of that one. Only the bones
+	// move: the mesh stays, and the build weights it to the bones where they are. On the NIF's pose only (what the build reads).
 	static void MovePoints(V3 eye, V3 dir, bool overUi, int forced)
 	{
 		ImGuiIO& io = ImGui::GetIO();
 		bool down = forced >= 0 ? forced == 1 : ImGui::IsMouseDown(ImGuiMouseButton_Left) && !io.KeyCtrl;
 		bool clicked = forced >= 0 ? forced == 1 : ImGui::IsMouseClicked(ImGuiMouseButton_Left);
 		if (gM.stroking) {
-			if (!down || gM.selected < 0 || gM.point < 0) { gM.stroking = false; return; }
-			PaintChain& c = gM.chains[gM.selected];
-			int si = ShapeIndex(c.shape);
-			if (si < 0) { gM.stroking = false; return; }
+			if (!down || gM.group.empty()) { gM.stroking = false; return; }
 			float dn = Dot(dir, gM.dragNormal);
 			if (std::fabs(dn) < 1e-6f) return;
 			float along = Dot(gM.dragPlane - eye, gM.dragNormal) / dn;
 			if (along <= 0) return;
-			V3 w = eye + dir * along;
-			RE::NiPoint3 p = SkinToWorld(gItem.shapes[si]).Invert() * RE::NiPoint3{ w.x, w.y, w.z };
-			c.points[gM.point] = V3(p.x, p.y, p.z);
+			const V3 delta = eye + dir * along - gM.dragPlane;   // how far the grabbed point went: every one in the group goes as far
+			for (size_t i = 0; i < gM.group.size() && i < gM.groupStart.size(); i++) {
+				if (!GroupValid(gM.group[i])) continue;
+				PaintChain& c = gM.chains[gM.group[i].first];
+				int si = ShapeIndex(c.shape);
+				if (si < 0) continue;
+				const V3 w = gM.groupStart[i] + delta;
+				RE::NiPoint3 p = SkinToWorld(gItem.shapes[si]).Invert() * RE::NiPoint3{ w.x, w.y, w.z };
+				c.points[gM.group[i].second] = V3(p.x, p.y, p.z);
+			}
 			return;
 		}
-		if (overUi || !down || !clicked) return;
+		// Ctrl+click picks points into the group (down leaves Ctrl out: a Ctrl+click never drags)
+		const bool ctrlClick = forced < 0 && io.KeyCtrl && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+		if (overUi || !clicked || (!down && !ctrlClick)) return;
 		if (!gM.nifPose) { AddLog(3, "moving points works on the NIF's pose: turn on Show the NIF's pose"); return; }
 		float best = 1e30f;
 		int bc = -1, bk = -1;
 		V3 bp;
 		for (size_t ci = 0; ci < gM.chains.size(); ci++) {
 			int si = ShapeIndex(gM.chains[ci].shape);
-			if (si < 0) continue;
+			if (si < 0 || gM.chains[ci].hidden) continue;   // (a hidden chain's points are not drawn: not picked either)
 			auto pts = PlannedBones(gItem.shapes[si], gM.chains[ci]);
 			for (size_t k = 0; k < pts.size(); k++) {
 				V3 q = pts[k] - eye;
@@ -1052,7 +1164,24 @@ namespace maker
 				if (score < best) { best = score; bc = (int)ci; bk = (int)k; bp = pts[k]; }
 			}
 		}
-		if (bc < 0) return;
+		gM.group.erase(std::remove_if(gM.group.begin(), gM.group.end(), [](const std::pair<int, int>& g) { return !GroupValid(g); }), gM.group.end());
+		if (bc < 0) { if (!ctrlClick) gM.group.clear(); return; }   // a click on nothing: the group goes
+		if (ctrlClick) {
+			// the point already picked joins first, so Ctrl+click after a plain click makes a group of two
+			if (gM.group.empty() && gM.selected >= 0 && gM.point >= 0 && !(gM.selected == bc && gM.point == bk)) gM.group.push_back({ gM.selected, gM.point });
+			auto it = std::find(gM.group.begin(), gM.group.end(), std::make_pair(bc, bk));
+			if (it != gM.group.end()) gM.group.erase(it); else gM.group.push_back({ bc, bk });
+			gM.selected = bc;
+			gM.point = bk;
+			return;
+		}
+		if (!InGroup(bc, bk)) gM.group = { { bc, bk } };
+		gM.groupStart.clear();
+		for (auto& g : gM.group) {
+			int si = ShapeIndex(gM.chains[g.first].shape);
+			auto pts = si >= 0 ? PlannedBones(gItem.shapes[si], gM.chains[g.first]) : std::vector<V3>();
+			gM.groupStart.push_back(g.second < (int)pts.size() ? pts[g.second] : bp);
+		}
 		PushUndo();
 		gM.selected = bc;
 		gM.point = bk;
@@ -1164,14 +1293,36 @@ namespace maker
 		if (hovered) std::fill(r.begin(), r.end(), 0.95f), std::fill(g.begin(), g.end(), 0.95f), std::fill(b.begin(), b.end(), 0.95f);
 		// The selected chain's shape: its paint as a weights heat map (as the rig previewer's: dark blue none, blue little,
 		// yellow half, red all), masked vertices dark grey. Other shapes, or no chain selected: each chain in its colour.
-		const bool heat = gM.selected >= 0 && gM.selected < (int)gM.chains.size() && gM.chains[gM.selected].shape == name;
+		const bool heat = gM.selected >= 0 && gM.selected < (int)gM.chains.size() && gM.chains[gM.selected].shape == name && !gM.chains[gM.selected].hidden;
 		if (heat) {
 			// With a point selected: that point's own weights (what moving it changes), redone every frame.
+			// (2026-11-14 user: the paint alone is all red where painted fully; "the preview should show the weight value of
+			// every point".) No point selected: every point's weights at once, each vertex its largest weight on any one point
+			// (red at the points, yellow halfway between two where the weight splits, blue where the paint is soft; the
+			// points' weights add up to the paint, so a sum would be red again). The paint alone while the chain has no
+			// points yet (a new stroke still being drawn).
+			// (2026-11-14) Several points picked (Move points, Ctrl+click) and the selected one among them: each picked point's
+			// own weights (every picked point on this shape, of any chain), each vertex its largest weight on any one of them
+			// (user: a sum turned neighbours all red; "the accurate representation of the points").
 			const PaintChain& c = gM.chains[gM.selected];
 			const bool one = gM.point >= 0 && gM.point <= c.links;
-			const std::vector<float> pw = one ? PointWeights(s, c, gM.point) : std::vector<float>();
+			const bool several = one && gM.group.size() > 1 && InGroup(gM.selected, gM.point);
+			std::vector<float> pw;
+			if (several) {
+				pw.assign(s.verts.size(), 0.0f);
+				for (auto& gp : gM.group) {
+					if (!GroupValid(gp) || gM.chains[gp.first].shape != name || gM.chains[gp.first].hidden) continue;
+					const std::vector<float> w = PointWeights(s, gM.chains[gp.first], gp.second);
+					for (size_t v = 0; v < pw.size(); v++) pw[v] = std::max(pw[v], w[v]);
+				}
+			}
+			else if (one) pw = PointWeights(s, c, gM.point);
+			else if (c.links >= 1) {
+				pw.assign(s.verts.size(), 0.0f);
+				for (int k = 0; k <= c.links; k++) { const std::vector<float> w = PointWeights(s, c, k); for (size_t v = 0; v < pw.size(); v++) pw[v] = std::max(pw[v], w[v]); }
+			}
 			for (size_t v = 0; v < s.verts.size(); v++) {
-				D3DCOLOR col = Heat(one ? pw[v] : PaintAt(c, (int)v));
+				D3DCOLOR col = Heat(!pw.empty() ? pw[v] : PaintAt(c, (int)v));
 				r[v] = ((col >> 16) & 255) / 255.0f; g[v] = ((col >> 8) & 255) / 255.0f; b[v] = (col & 255) / 255.0f;
 			}
 			if (auto it = gM.masks.find(name); it != gM.masks.end())
@@ -1180,7 +1331,7 @@ namespace maker
 		}
 		for (size_t ci = 0; ci < gM.chains.size() && !heat; ci++) {
 			auto& c = gM.chains[ci];
-			if (c.shape != name) continue;
+			if (c.shape != name || c.hidden) continue;
 			D3DCOLOR col = ChainColor(ci);
 			float cr = ((col >> 16) & 255) / 255.0f, cg = ((col >> 8) & 255) / 255.0f, cb = (col & 255) / 255.0f;
 			float boost = (int)ci == gM.selected ? 1.0f : 0.8f;
@@ -1222,13 +1373,16 @@ namespace maker
 		std::vector<LineVertex> lines, points;
 		for (size_t ci = 0; ci < gM.chains.size(); ci++) {
 			auto& c = gM.chains[ci];
+			if (c.hidden) continue;
 			int si = ShapeIndex(c.shape);
 			if (si < 0) continue;
 			const ShapeDraw& s = gItem.shapes[si];
 			D3DCOLOR col = (int)ci == gM.selected ? D3DCOLOR_ARGB(255, 255, 255, 255) : ChainColor(ci);
 			auto bones = PlannedBones(s, c);
 			for (size_t k = 0; k < bones.size(); k++) {
-				points.push_back({ bones[k].x, bones[k].y, bones[k].z, c.points.count((int)k) ? D3DCOLOR_ARGB(255, 90, 255, 255) : k == 0 ? D3DCOLOR_ARGB(255, 150, 160, 180) : col });
+				// (Move points' group, Ctrl+click: yellow)
+				points.push_back({ bones[k].x, bones[k].y, bones[k].z, gM.tool == 6 && gM.group.size() > 1 && InGroup((int)ci, (int)k) ? D3DCOLOR_ARGB(255, 255, 230, 40) :
+					c.points.count((int)k) ? D3DCOLOR_ARGB(255, 90, 255, 255) : k == 0 ? D3DCOLOR_ARGB(255, 150, 160, 180) : col });
 				if (k) { lines.push_back({ bones[k - 1].x, bones[k - 1].y, bones[k - 1].z, col }); lines.push_back({ bones[k].x, bones[k].y, bones[k].z, col }); }
 			}
 			// The selected point: a yellow cross and its reach as a ring facing the camera.
@@ -1300,7 +1454,7 @@ namespace maker
 			if (m.empty()) gM.masks.erase(invertOn);
 		}
 		ImGui::EndDisabled();
-		Help("Mask: brush over vertices to protect them (dark blue): no brush, smoothing or grow / fade changes their paint. Unmask frees them. Ctrl+click with either: the whole element under the mouse (the connected piece of the mesh) at once. Invert: on the selected chain's shape (or the last one under the brush), masks what is free and frees what is masked, to work only on a part. Move points: drag a chain's point (its bone) to where it should be; the mesh stays, and builds weighted to the bones where they are (moved points show cyan).");
+		Help("Mask: brush over vertices to protect them (dark blue): no brush, smoothing or grow / fade changes their paint. Unmask frees them. Ctrl+click with either: the whole element under the mouse (the connected piece of the mesh) at once. Invert: on the selected chain's shape (or the last one under the brush), masks what is free and frees what is masked, to work only on a part. Move points: drag a chain's point (its bone) to where it should be; the mesh stays, and builds weighted to the bones where they are (moved points show cyan). Ctrl+click points to pick several (yellow), then drag any of them: they all move together; a click on empty space lets them go.");
 		Help("New chain: each stroke is a new chain, laid along the stroke. Add: paints more of the mesh onto the selected chain (its bones stay). Erase: takes paint off the selected chain. Smooth: evens out the selected chain's paint under the brush (hard edges blend, spots fill in).");
 		ImGui::BeginDisabled(gM.undo.empty());
 		if (ImGui::Button("Undo")) Undo();
@@ -1317,8 +1471,12 @@ namespace maker
 		for (size_t i = 0; i < gM.chains.size(); i++) {
 			auto& c = gM.chains[i];
 			ImGui::PushID((int)i);
+			// Its square: a click hides or shows the whole chain in the view (lines, points, paint); hidden, it is dim.
 			D3DCOLOR col = ChainColor(i);
-			ImGui::ColorButton("##c", ImVec4(((col >> 16) & 255) / 255.0f, ((col >> 8) & 255) / 255.0f, (col & 255) / 255.0f, 1), ImGuiColorEditFlags_NoTooltip, ImVec2(14, 14));
+			const float dim = c.hidden ? 0.25f : 1.0f;
+			if (ImGui::ColorButton("##c", ImVec4(((col >> 16) & 255) / 255.0f * dim, ((col >> 8) & 255) / 255.0f * dim, (col & 255) / 255.0f * dim, 1), ImGuiColorEditFlags_NoTooltip, ImVec2(14, 14)))
+				c.hidden = !c.hidden;
+			if (ImGui::IsItemHovered()) ImGui::SetTooltip(c.hidden ? "Hidden: click to show this chain" : "Click to hide this chain (its lines, points and paint)");
 			ImGui::SameLine();
 			char label[160];
 			snprintf(label, sizeof label, "Chain %zu on %s (%zu vertices)", i + 1, c.shape.c_str(), c.paint.size());
@@ -1336,6 +1494,23 @@ namespace maker
 				Help("0 swings freely like a rope or a tassel; 0.4 a strap or a flap; 0.8 and up holds its modelled shape and only bounces (a stiff collar, a holster flap).");
 				ImGui::SliderFloat("Weight", &c.weight, 0, 1, "%.2f");
 				Help("0 light and lively (ribbons, hair; the wind moves it); 1 heavy and calm (leather, chain, a weighted end).");
+				// (2026-11-14 user: every chain with the same number of points)
+				ImGui::BeginDisabled(gM.chains.size() < 2);
+				if (ImGui::SmallButton("Same number of points on every chain")) {
+					PushUndo();
+					int changed = 0, relaid = 0;
+					for (auto& o : gM.chains) {
+						if (&o == &c || o.links == c.links) continue;
+						o.links = c.links;   // as the Links slider: other points now, moved ones back on the stroke
+						if (!o.points.empty()) relaid++;
+						o.points.clear();
+						changed++;
+					}
+					AddLog(2, std::to_string(changed) + " chain(s) now have " + std::to_string(c.links) + " links (" + std::to_string(c.links + 1) + " points with the tie-on)" +
+						(relaid ? "; " + std::to_string(relaid) + " of them had moved points, put back on the stroke" : ""));
+				}
+				ImGui::EndDisabled();
+				Help("Gives every other chain as many points as this one (its Links); stiffness, weight and what each hangs from stay their own. A chain whose count changes gets new points along its stroke, as with the Links slider: its moved points go back on the stroke. Ctrl+Z undoes it.");
 
 				// Weights: how much of the mesh follows the chain (the paint), evened out or grown and faded by its points.
 				ImGui::SeparatorText("Weights");
@@ -1351,7 +1526,8 @@ namespace maker
 					}
 					ImGui::Dummy(ImVec2(w, h));
 					ImGui::TextDisabled("none   little (blue)   half (yellow)   all (red)");
-					ImGui::TextDisabled(gM.point >= 0 ? "Showing the selected point's weights." : "Showing the chain's paint; select a point to see its weights.");
+					ImGui::TextDisabled(gM.point >= 0 && gM.group.size() > 1 && InGroup((int)i, gM.point) ? "Showing each picked point's weights (red at a point, yellow where two share a vertex)." :
+						gM.point >= 0 ? "Showing the selected point's weights." :"Showing every point's weights (red at a point, yellow where two share a vertex); select a point to see only its own.");
 				}
 				if (si >= 0 && ImGui::Button("Smooth the whole chain")) {
 					PushUndo();
@@ -1373,6 +1549,12 @@ namespace maker
 				if (ImGui::SmallButton("Delete point")) { PushUndo(); DeletePoint(c, gItem.shapes[si], gM.point); gM.point = -1; }
 				ImGui::EndDisabled();
 				Help("Takes the selected point (and its bone) out of the chain: one link fewer. The other points stay where they are, so they count as moved. Not the tie-on, nor the last link.");
+			ImGui::BeginDisabled(si < 0 || c.links < 2);
+			if (ImGui::SmallButton("Smooth points")) { PushUndo(); RelaxPoints(c, gItem.shapes[si], false); }
+			ImGui::SameLine();
+			if (ImGui::SmallButton("Even spacing")) { PushUndo(); RelaxPoints(c, gItem.shapes[si], true); }
+			ImGui::EndDisabled();
+			Help("Moves the chain's points, not its paint; the tie-on and the end stay. Smooth points: each middle point halfway to the middle of its neighbours (zig-zags iron out; click again for more, the chain straightens). Even spacing: the middle points spread at equal distances along the chain's path, its shape kept. Ctrl+Z undoes either.");
 				if (!c.points.empty()) {
 					ImGui::BeginDisabled(gM.point < 0 || !c.points.count(gM.point));
 					if (ImGui::SmallButton("Reset point")) { PushUndo(); c.points.erase(gM.point); }
@@ -1481,6 +1663,25 @@ namespace maker
 		ImGui::EndDisabled();
 		Help("The last build's command line, for running the tool yourself.");
 		if (!gM.lastResult.empty()) ImGui::TextWrapped("Last build: %s", gM.lastResult.c_str());
+		// The edits made on the output in the previewer, done again after each build (RecordEdit / ReplayNext).
+		if (!repair && !gM.edits.empty()) {
+			const std::string recipe = OutXml() + ".smprecipe";
+			bool changed = false;
+			if (ImGui::TreeNode("kept", "Kept edits (%zu): done again after every build", gM.edits.size())) {
+				for (size_t i = 0; i < gM.edits.size(); i++) {
+					ImGui::PushID((int)i);
+					if (ImGui::SmallButton("x")) { gM.edits.erase(gM.edits.begin() + i); changed = true; ImGui::PopID(); break; }
+					ImGui::SameLine();
+					ImGui::TextUnformatted(gM.edits[i].c_str());
+					ImGui::PopID();
+				}
+				if (ImGui::SmallButton("Forget them all")) { gM.edits.clear(); changed = true; }
+				ImGui::TreePop();
+			}
+			Help("Proxies generated, shapes marked as proxies or deleted, and the XML's collision shapes added, removed or pointed elsewhere, on the built NIF in the previewer: the next build from the source does them again, in this order. x: not any more.");
+			std::error_code ec;
+			if (changed && fs::exists(recipe, ec)) std::ofstream(recipe) << RecipeText();
+		}
 	}
 
 	static void Window()
