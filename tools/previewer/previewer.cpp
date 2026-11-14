@@ -478,7 +478,7 @@ static std::vector<std::pair<std::string, std::string>> UnusedProxies(const std:
 
 // (2026-11-14) An edit made on a Maker build's output (proxies, shapes, the XML's collisions), kept in its recipe and done
 // again after every rebuild from the source (maker.h; a no-op on other NIFs and while the Maker replays them).
-namespace maker { static void RecordEdit(const std::string& e); }
+namespace maker { static void RecordEdit(const std::string& e); static void RecordValues(const std::string& xml, const xmledit::Doc& now); }
 
 // Points the XML's collision shapes at the NIF's proxies (gProxyRenames), keeping the file as it was in .bak.
 static void BuildSystem();
@@ -1784,19 +1784,28 @@ static int gPinChain = -1;   // --chain N: the chain pinned at start (for screen
 static bool gRealtime = false;   // --realtime: measuring (--jitter, --clip...) at the real frame time instead of a fixed 120 Hz
 static float gMeasureStep = 1.0f / 120.0f;   // --step s: the fixed frame time when measuring
 
-// A shape's weight on the heat-map bone, or on the highlighted chain's bones together, per vertex (several skin
-// slots can name the same bone).
+// A shape's weight on the heat-map bone per vertex (several skin slots can name the same bone). The highlighted chain's
+// bones: the largest weight on any one of them (2026-11-14 user: a chain's bones together are all red where it moves the
+// mesh, their weights adding up; each bone's own falloff shows with the largest).
 static float HeatWeight(const ShapeDraw& s, int v)
 {
+	if (!gHighlightBones.empty()) {
+		std::map<std::string, float> perBone;
+		for (auto& [slot, wt] : s.weights[v]) {
+			const char* n = SkinBoneName(s, slot);
+			if (!n) continue;
+			std::string l = n;
+			for (auto& c : l) c = (char)tolower((unsigned char)c);
+			if (gHighlightBones.count(l)) perBone[l] += wt;
+		}
+		float w = 0;
+		for (auto& [b, x] : perBone) w = std::max(w, x);
+		return w;
+	}
 	float w = 0;
 	for (auto& [slot, wt] : s.weights[v]) {
 		const char* n = SkinBoneName(s, slot);
-		if (!n) continue;
-		if (!gHighlightBones.empty()) {
-			std::string l = n;
-			for (auto& c : l) c = (char)tolower((unsigned char)c);
-			if (gHighlightBones.count(l)) w += wt;
-		} else if (_stricmp(n, gS.heatBone.c_str()) == 0) w += wt;
+		if (n && _stricmp(n, gS.heatBone.c_str()) == 0) w += wt;
 	}
 	return w;
 }
@@ -2426,6 +2435,7 @@ static void Panels(float fps)
 					o << gXml.Compose();
 					o.close();
 					AddLog(2, "saved the bone values to " + gItem.xmlPath + " (the file as it was: " + bak + ")");
+					maker::RecordValues(gItem.xmlPath, gXml);   // a Maker build: kept for its next rebuild
 					rebuild = true;   // reads the saved file afresh: its values become the new originals
 				} else AddLog(4, "could not write " + gItem.xmlPath);
 			}
@@ -2494,6 +2504,7 @@ static void Panels(float fps)
 				static int pinned = -1, pinnedFor = -1;
 				if (pinnedFor != gXml.version) { pinned = gPinChain; pinnedFor = gXml.version; }
 				int focus = -1;
+				std::pair<int, int> hoveredLink = { -1, -1 };   // (chain, constraint) whose row the mouse is over this frame
 				static int shown = -1;   // last frame's highlighted chain, to colour its row
 				for (size_t ci = 0; ci < gXml.chains.size(); ci++) {
 					auto& c = gXml.chains[ci];
@@ -2568,6 +2579,7 @@ static void Panels(float fps)
 						for (size_t li = 0; li < c.links.size(); li++) {
 							auto& l = c.links[li];
 							ImGui::PushID((int)li);
+							ImGui::BeginGroup();   // (the row hovered: only this constraint's bones in the view, below)
 							bool on = !l.removed;
 							std::string label = l.bodyA + "  ->  " + l.bodyB;
 							if (ImGui::Checkbox(label.c_str(), &on)) { l.removed = !on; rebuild = true; }
@@ -2583,6 +2595,8 @@ static void Panels(float fps)
 								if (slider("##lsway", "side sway", l.sway, 1.0f, l.sway != l.origSway, was(l.origSway), kSwayTip) == 2) l.sway = l.origSway;
 								ImGui::Unindent();
 							}
+							ImGui::EndGroup();
+							if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) hoveredLink = { (int)ci, (int)li };
 							ImGui::PopID();
 						}
 						ImGui::TreePop();
@@ -2594,7 +2608,11 @@ static void Panels(float fps)
 				shown = focus >= 0 ? focus : pinned;
 				if (shown >= 0 && shown < (int)gXml.chains.size()) {
 					auto lower = [](std::string s) { for (auto& ch : s) ch = (char)tolower((unsigned char)ch); return s; };
-					for (auto& l : gXml.chains[shown].links) {
+					// a constraint's row hovered: its two bones only (2026-11-14 user: the constraint hovered, not the whole chain)
+					const bool one = hoveredLink.first == shown && hoveredLink.second >= 0 && hoveredLink.second < (int)gXml.chains[shown].links.size();
+					for (size_t li = 0; li < gXml.chains[shown].links.size(); li++) {
+						if (one && (int)li != hoveredLink.second) continue;
+						auto& l = gXml.chains[shown].links[li];
 						gHighlightBones.insert(lower(l.bodyA));
 						gHighlightBones.insert(lower(l.bodyB));
 						gHighlightLinks.push_back({ lower(l.bodyA), lower(l.bodyB) });

@@ -458,7 +458,20 @@ static int buildProxy(File& f, int shapeBlock, float cell, const std::string& pr
 
 	Geometry pg = g;
 	pg.av.name = f.addString(proxyName);
-	pg.av.extraData.clear();
+	// Its extra data goes, but for the shape's "SMP Bones" list (copies): the stand-in has the same skin bone slots, and
+	// without the list the game drops an SMP shape's own bones, so a proxy of SMP cloth lost its cloth bones and its
+	// vertices fell towards the skin's origin (2026-11-14 user: proxies of an SMP clothed mesh came out all broken).
+	{
+		std::vector<int32_t> keep;
+		for (int32_t e : g.av.extraData) {
+			if (e < 0 || f.typeOf(e) != "NiStringExtraData") continue;
+			Reader r(f.blocks[e].data(), f.blocks[e].size());
+			const uint32_t n = r.u32();
+			const std::string key = n < f.strings.size() ? f.strings[n] : "";
+			if (key == "SMP Bones" || key.rfind("SMP Bones ", 0) == 0) { Bytes copy = f.blocks[e]; keep.push_back(f.addBlock("NiStringExtraData", copy)); }
+		}
+		pg.av.extraData = keep;
+	}
 	pg.av.flags &= ~1u;   // never app-culled: a proxy culled before the game binds its skin never collides (2026-10-19)
 	{
 		// NiAlphaProperty: alpha test on (bit 9), test NEVER (7 << 10), no blending; replaces the shape's own. The

@@ -728,4 +728,97 @@ namespace xmledit
 		}
 		return out;
 	}
+
+	// (2026-11-14 user: rebuilds should remember the Bone values changes.) Every editable value of a file by a name that
+	// a rebuild keeps (the Maker builds the same names again), as text:
+	//   s|<block>#<n>|<field>#<m>|<k>   a number (the n-th block of that label, its m-th field of that label, component k)
+	//   l|<bodyA>|<bodyB>                a chain constraint: "stiff lively sway removed"
+	//   t|<kind>|<shape>                 a collision shape's tags: "tags;ignores;only", each comma separated
+	//   b|<bone>                         a bone's impact sounds: "light files;hard files;speed,hard speed,volume;set flags"
+	inline std::map<std::string, std::string> Values(const Doc& d)
+	{
+		std::map<std::string, std::string> out;
+		char b[96];
+		std::map<std::string, int> blockSeen;
+		for (auto& bl : d.blocks) {
+			const int n = blockSeen[bl.label]++;
+			std::map<std::string, int> fieldSeen;
+			for (auto& f : bl.fields) {
+				const int m = fieldSeen[f.label]++;
+				for (size_t k = 0; k < f.slots.size(); k++) {
+					snprintf(b, sizeof b, "%g", d.slots[f.slots[k]].value);
+					out["s|" + bl.label + "#" + std::to_string(n) + "|" + f.label + "#" + std::to_string(m) + "|" + std::to_string(k)] = b;
+				}
+			}
+		}
+		for (auto& c : d.chains)
+			for (auto& l : c.links) {
+				snprintf(b, sizeof b, "%g %g %g %d", l.stiff, l.lively, l.sway, l.removed ? 1 : 0);
+				out["l|" + l.bodyA + "|" + l.bodyB] = b;
+			}
+		auto join = [](const std::vector<std::string>& v) { std::string s; for (auto& x : v) s += (s.empty() ? "" : ",") + x; return s; };
+		for (auto& s : d.shapes) out["t|" + s.kind + "|" + s.name] = join(s.lists[0]) + ";" + join(s.lists[1]) + ";" + join(s.lists[2]);
+		for (auto& s : d.sounds) {
+			if (!s.editable) continue;
+			snprintf(b, sizeof b, "%g,%g,%g;%d%d%d", s.values[0], s.values[1], s.values[2], s.set[0], s.set[1], s.set[2]);
+			out["b|" + s.name] = join(s.files[0]) + ";" + join(s.files[1]) + ";" + b;
+		}
+		return out;
+	}
+
+	// Puts named values (Values' form) into a file just read: each that it has, by its name. Returns how many were put
+	// in; `missing` counts the names it does not have (a shape or chain no longer built).
+	inline int ApplyValues(Doc& d, const std::map<std::string, std::string>& values, int& missing)
+	{
+		auto split = [](const std::string& s, char sep) { std::vector<std::string> v; size_t a = 0; for (size_t e; (e = s.find(sep, a)) != std::string::npos; a = e + 1) v.push_back(s.substr(a, e - a)); v.push_back(s.substr(a)); return v; };
+		auto list = [&](const std::string& s) { std::vector<std::string> v; if (!s.empty()) v = split(s, ','); return v; };
+		std::map<std::string, std::string> left = values;
+		int applied = 0;
+		std::map<std::string, int> blockSeen;
+		for (auto& bl : d.blocks) {
+			const int n = blockSeen[bl.label]++;
+			std::map<std::string, int> fieldSeen;
+			for (auto& f : bl.fields) {
+				const int m = fieldSeen[f.label]++;
+				for (size_t k = 0; k < f.slots.size(); k++) {
+					auto it = left.find("s|" + bl.label + "#" + std::to_string(n) + "|" + f.label + "#" + std::to_string(m) + "|" + std::to_string(k));
+					if (it == left.end()) continue;
+					d.slots[f.slots[k]].value = (float)atof(it->second.c_str());
+					left.erase(it); applied++;
+				}
+			}
+		}
+		for (auto& c : d.chains) {
+			for (auto& l : c.links) {
+				auto it = left.find("l|" + l.bodyA + "|" + l.bodyB);
+				if (it == left.end()) continue;
+				int removed = 0;
+				sscanf_s(it->second.c_str(), "%f %f %f %d", &l.stiff, &l.lively, &l.sway, &removed);
+				l.removed = removed != 0;
+				left.erase(it); applied++;
+			}
+			if (!c.links.empty()) { c.stiff = c.links[0].stiff; c.lively = c.links[0].lively; c.sway = c.links[0].sway; }   // the chain sliders show its first link's
+		}
+		for (auto& s : d.shapes) {
+			auto it = left.find("t|" + s.kind + "|" + s.name);
+			if (it == left.end()) continue;
+			auto p = split(it->second, ';');
+			for (int k = 0; k < TagShape::kLists && k < (int)p.size(); k++) s.lists[k] = list(p[k]);
+			left.erase(it); applied++;
+		}
+		for (auto& s : d.sounds) {
+			if (!s.editable) continue;
+			auto it = left.find("b|" + s.name);
+			if (it == left.end()) continue;
+			auto p = split(it->second, ';');
+			if (p.size() >= 4) {
+				s.files[0] = list(p[0]); s.files[1] = list(p[1]);
+				sscanf_s(p[2].c_str(), "%f,%f,%f", &s.values[0], &s.values[1], &s.values[2]);
+				for (int k = 0; k < SoundBone::kValues && k < (int)p[3].size(); k++) s.set[k] = p[3][k] == '1';
+			}
+			left.erase(it); applied++;
+		}
+		missing = (int)left.size();
+		return applied;
+	}
 }

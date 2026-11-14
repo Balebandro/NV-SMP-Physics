@@ -130,6 +130,7 @@ namespace maker
 		std::vector<std::string> edits;
 		std::deque<std::string> replay;     // the edits still to redo after this build
 		bool replaying = false, replayAfterBuild = false;
+		bool valuesAfterBuild = false;      // once the kept edits are done again: the kept Bone values put in (ApplyKeptValues)
 	};
 	static State gM;
 
@@ -478,6 +479,7 @@ namespace maker
 	}
 
 	static void ReplayNext();
+	static void ApplyKeptValues();
 
 	// Each frame: the tool's output into the log; when it is done, the result opened.
 	static void Pump()
@@ -490,6 +492,8 @@ namespace maker
 		}
 		// The build's kept edits, one at a time (a proxy generation runs a tool: the next waits for it).
 		if (gM.replaying && !gM.running) { ReplayNext(); return; }
+		// then the kept Bone values (they may be on shapes the kept edits add)
+		if (gM.valuesAfterBuild && !gM.running && !gM.replaying) { gM.valuesAfterBuild = false; ApplyKeptValues(); return; }
 		if (!gM.finished || !gM.worker.joinable()) return;
 		gM.worker.join();
 		gM.running = false;
@@ -516,6 +520,7 @@ namespace maker
 			gM.replaying = true;
 			AddLog(2, "doing again the " + std::to_string(gM.edits.size()) + " edit(s) made on the last build (proxies, shapes, collisions)");
 		}
+		if (replayNow && gItem.loaded) gM.valuesAfterBuild = true;
 	}
 
 	static void BuildOutfit()
@@ -684,6 +689,72 @@ namespace maker
 			else AddLog(3, "the new XML has no collision shape " + p[1] + ": skipped");
 		}
 		else AddLog(3, "unknown kept edit, skipped: " + e);
+	}
+
+	// --- Bone values kept across rebuilds (2026-11-14 user: rebuilds should remember the Bone values changes) ----------
+	// A build's XML as built (its kept edits done again) is kept as <xml>.smpbuilt; the values saved from Bone values that
+	// differ from it, by name (xmledit::Values), go in <xml>.smpvalues; after the next build they are put back in.
+	static std::string ReadAll(const std::string& path) { std::ifstream in(path, std::ios::binary); return std::string((std::istreambuf_iterator<char>(in)), {}); }
+	static std::map<std::string, std::string> ReadKeptValues(const std::string& xml)
+	{
+		std::map<std::string, std::string> v;
+		std::ifstream in(xml + ".smpvalues");
+		std::string line;
+		while (std::getline(in, line)) {
+			if (!line.empty() && line.back() == '\r') line.pop_back();
+			const size_t tab = line.find('\t');
+			if (tab != std::string::npos) v[line.substr(0, tab)] = line.substr(tab + 1);
+		}
+		return v;
+	}
+
+	// Save to XML on a Maker build (its recipe beside the XML): what differs from the build is kept for the next one.
+	static void RecordValues(const std::string& xml, const xmledit::Doc& now)
+	{
+		if (RecipeOf(xml).empty()) return;
+		std::error_code ec;
+		std::string base = xml + ".smpbuilt";
+		if (!fs::exists(base, ec)) {
+			// built before this was kept: the file as it was before the first save from Bone values
+			base = xml + ".bak";
+			if (!fs::exists(base, ec)) { AddLog(3, "the bone values are not kept for the next build: build once more first (nothing to tell them from)"); return; }
+			AddLog(3, "comparing the bone values with " + base + " (this build is older than kept bone values)");
+		}
+		xmledit::Doc b;
+		b.Parse(ReadAll(base));
+		const auto was = xmledit::Values(b), is = xmledit::Values(now);
+		std::ofstream out(xml + ".smpvalues", std::ios::binary);
+		int n = 0;
+		for (auto& [k, v] : is) {
+			auto it = was.find(k);
+			if (it != was.end() && it->second == v) continue;
+			out << k << "\t" << v << "\n";
+			n++;
+		}
+		out.close();
+		if (!n) fs::remove(xml + ".smpvalues", ec);
+		AddLog(2, n ? "kept for the next build: " + std::to_string(n) + " bone value(s) changed from the build" : "no bone values differ from the build: none kept");
+	}
+
+	// After a build (and its kept edits): the XML as built kept, then the kept bone values put in.
+	static void ApplyKeptValues()
+	{
+		const std::string xml = gItem.xmlPath;
+		if (xml.empty() || !SamePath(gItem.nifPath, OutNif())) return;
+		std::error_code ec;
+		fs::copy_file(xml, xml + ".smpbuilt", fs::copy_options::overwrite_existing, ec);
+		const auto kept = ReadKeptValues(xml);
+		if (kept.empty()) return;
+		xmledit::Doc d;
+		d.Parse(ReadAll(xml));
+		int missing = 0;
+		const int applied = xmledit::ApplyValues(d, kept, missing);
+		if (applied) {
+			std::ofstream(xml, std::ios::binary) << d.Compose();
+			LoadItem(gItem.nifPath);
+		}
+		AddLog(missing ? 3 : 2, "the kept bone values are back: " + std::to_string(applied) + " put in" +
+			(missing ? ", " + std::to_string(missing) + " not found in the new build (a chain or shape no longer built)" : ""));
 	}
 
 	// Writes the missing "SMP Bones" lists into the NIF (smprepair --list, the game's skeleton deciding which bones are
@@ -1663,6 +1734,17 @@ namespace maker
 		ImGui::EndDisabled();
 		Help("The last build's command line, for running the tool yourself.");
 		if (!gM.lastResult.empty()) ImGui::TextWrapped("Last build: %s", gM.lastResult.c_str());
+		// The bone values saved from Bone values on the output, put back after each build (RecordValues / ApplyKeptValues).
+		if (!repair && !gM.source.empty()) {
+			std::error_code ec;
+			const std::string vf = OutXml() + ".smpvalues";
+			if (fs::exists(vf, ec)) {
+				ImGui::Text("Kept bone values: %zu, put back after every build", ReadKeptValues(OutXml()).size());
+				ImGui::SameLine();
+				if (ImGui::SmallButton("Forget them")) { fs::remove(vf, ec); AddLog(2, "the kept bone values are forgotten: the next build keeps its own"); }
+				Help("Values changed in Bone values and saved to the XML on the built NIF (bone and constraint settings, chain sliders, removed constraints, collision tags, impact sounds), as changes from what the build wrote. The next build puts them back by name; the build's own values stay wherever you did not change them.");
+			}
+		}
 		// The edits made on the output in the previewer, done again after each build (RecordEdit / ReplayNext).
 		if (!repair && !gM.edits.empty()) {
 			const std::string recipe = OutXml() + ".smprecipe";
