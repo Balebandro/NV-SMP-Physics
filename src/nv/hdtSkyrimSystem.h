@@ -131,6 +131,9 @@ namespace hdt
 		// New Vegas: meshes by name (lower case) for shapes the physics file names that are not in the item (see FileMesh).
 		std::unordered_map<std::string, FileMesh> m_fileMeshes;
 
+		// New Vegas: bones a script switched off (SMPSetBonePhysics): built kinematic whatever the file gives them.
+		std::function<bool(const char*)> m_forceKinematic;
+
 	protected:
 		struct PooledStringHash
 		{

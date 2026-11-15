@@ -463,6 +463,7 @@ struct NVSEInterface
 	void* setOpcodeBase;
 	void* (*QueryInterface)(uint32_t id);
 	uint32_t (*GetPluginHandle)();
+	void* registerTypedCommand;
 };
 
 struct NVSEDataInterface
@@ -485,7 +486,7 @@ struct NVSEMessagingInterface
 	bool (*RegisterListener)(uint32_t listener, const char* sender, void (*handler)(NVSEMessage*));
 };
 
-static constexpr uint32_t kInterface_Messaging = 2, kInterface_Data = 7, kNVSEData_DIHookControl = 1;
+static constexpr uint32_t kInterface_Messaging = 2, kInterface_StringVar = 4, kInterface_Data = 7, kNVSEData_DIHookControl = 1;
 enum : uint32_t { kMessage_ExitToMainMenu = 2, kMessage_PreLoadGame = 6, kMessage_PostLoadGame = 8, kMessage_NewGame = 14 };
 
 // A load replaces every actor's 3D, partly on the loading thread: the systems go while the old 3D is
@@ -498,6 +499,7 @@ static void OnNVSEMessage(NVSEMessage* msg)
 	case kMessage_ExitToMainMenu:
 		gLoading = true;
 		ActorManager::instance()->clear();
+		ActorManager::instance()->clearScriptRules();
 		Log("%s: physics cleared", msg->type == kMessage_PreLoadGame ? "loading a save" : "main menu");
 		break;
 	case kMessage_PostLoadGame:
@@ -507,6 +509,7 @@ static void OnNVSEMessage(NVSEMessage* msg)
 		break;
 	}
 }
+namespace nvsmp::Script { void Register(void* registerCommand, void* registerTypedCommand, void* setOpcodeBase, void* stringVarInterface); }
 static HMODULE gSelf = nullptr;
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID)
@@ -523,20 +526,24 @@ extern "C"
 		info->infoVersion = PluginInfo::kInfoVersion;
 		info->name = "NV SMP Physics";
 		info->version = 1;
-		return !nvse->isEditor && (nvse->runtimeVersion & ~1u) == 0x040020D0;   // 1.4.0.525 (and its no-gore build)
+		// The GECK (1.4.0.518) loads it only for the script commands, so scripts using them compile.
+		return nvse->isEditor ? nvse->editorVersion == 0x04002060 : (nvse->runtimeVersion & ~1u) == 0x040020D0;   // 1.4.0.525 (and its no-gore build)
 	}
 
 	__declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface* nvse)
 	{
 		using namespace nvsmp;
-		if (nvse->isEditor)
-			return false;
+		if (nvse->isEditor) {
+			Script::Register(nvse->registerCommand, nvse->registerTypedCommand, nvse->setOpcodeBase, nvse->QueryInterface(kInterface_StringVar));
+			return true;
+		}
 		GetModuleFileNameA(gSelf, gIniPath, MAX_PATH);
 		if (char* dot = strrchr(gIniPath, '.'))
 			strcpy_s(dot, gIniPath + MAX_PATH - dot, ".ini");
 		gLog = _fsopen("NVSMPPhysics.log", "w", _SH_DENYWR);   // readable while the game runs
 		LoadSettings();
 		Log("NV SMP Physics 1 loaded (FSMP physics core, Bullet %d)", btGetVersion());
+		Script::Register(nvse->registerCommand, nvse->registerTypedCommand, nvse->setOpcodeBase, nvse->QueryInterface(kInterface_StringVar));
 		if (auto data = (NVSEDataInterface*)nvse->QueryInterface(kInterface_Data))
 			Menu::SetInputHook(data->GetSingleton(kNVSEData_DIHookControl));
 		if (auto messaging = (NVSEMessagingInterface*)nvse->QueryInterface(kInterface_Messaging))

@@ -654,10 +654,16 @@ namespace nvsmp
 	void ActorManager::found(RE::NiNode* root, RE::NiAVObject* model, const char* file, const hdt::DefaultBBP::NameMap_t* names,
 		const std::unordered_map<std::string, std::string>* lists, RE::NiAVObject* hairShape, const char* headPartModel, bool raceHead)
 	{
+		// A script may have swapped this actor's file for another (SMPSetPhysicsFile): built from that one.
+		const std::string originalFile = file;
+		if (const std::string* swapped = m_scanRef && !m_scanWorldObject ? fileOverride(m_scanRef, file) : nullptr)
+			file = swapped->c_str();
 		// A head part (or the race's head) shares the FaceGen node with the hair and the other head parts: keyed by its own shape.
-		auto key = std::make_pair((void*)root, (headPartModel || raceHead) && hairShape ? (void*)hairShape : (void*)model);
+		auto key =std::make_pair((void*)root, (headPartModel || raceHead) && hairShape ? (void*)hairShape : (void*)model);
 		auto it = m_items.find(key);
+		bool swappedFile = false;   // the same item, another file (a script swap): its skin is bound already, built next frame
 		if (it != m_items.end() && it->second.file != file) {
+			swappedFile = true;
 			// The same node now names another file: rebuild.
 			if (it->second.system) {
 				ReleaseCpuSkins(it->second);
@@ -672,7 +678,9 @@ namespace nvsmp
 			item.skeleton = root;
 			item.model = model;
 			item.file = file;
+			item.originalFile = originalFile;
 			item.worldObject = m_scanWorldObject;
+			item.ref = m_scanWorldObject ? nullptr : m_scanRef;
 			if (names) item.names = *names;
 			if (lists && raceHead) {
 				item.boneLists = *lists;
@@ -683,7 +691,7 @@ namespace nvsmp
 				if (headPartModel) { item.hairModel = headPartModel; item.headPart = true; }
 				else if (const char* h = HairModel(m_scanRef)) item.hairModel = h;
 			}
-			item.buildAt = m_frame + kSettleFrames;
+			item.buildAt = m_frame + (swappedFile ? 1 : kSettleFrames);
 			it = m_items.emplace(key, std::move(item)).first;
 		}
 		it->second.frame = m_frame;
@@ -797,6 +805,8 @@ namespace nvsmp
 		// edge, which would then hang below the plane and be shoved up through it).
 		creator.m_ground = gSettings.ground && !item.worldObject;
 		creator.m_worldObject = item.worldObject;
+		if (item.ref && m_rules.count(item.ref))
+			creator.m_forceKinematic = [this, ref = item.ref](const char* bone) { return scriptKinematic(ref, bone); };
 		m_builtGround = gSettings.ground;
 		logger::info("[SMP] building '{}' for {} on '{}' (try {})", file, model->GetName(), root->GetName(), item.builds);
 		// Race hair: its Bip01 Head slot on the skeleton's head. The game binds it by name and may take the hair NIF's own node
@@ -2301,6 +2311,23 @@ namespace nvsmp
 
 	void ActorManager::rebuildIfPending()
 	{
+		// Actors a script command changed: their items built again (next frames, as a new item), the world not stepping now.
+		for (void* ref : m_rebuildRefs)
+			for (auto& [key, item] : m_items) {
+				if (item.ref != ref || (!item.system && !item.failed)) continue;
+				if (item.system) {
+					item.system->m_itemDetached = false;   // still attached: the skin slots go back to the game's
+					ReleaseCpuSkins(item);
+					hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(item.system.get());
+					item.system = nullptr;
+				}
+				SetProxiesHidden(item.model.get(), false);
+				logger::info("[SMP] {}: building again for a script command ('{}')", item.model ? item.model->GetName() : "?", item.file);
+				item.builds = 0;
+				item.failed = false;
+				item.buildAt = m_frame + 1;
+			}
+		m_rebuildRefs.clear();
 		if (!m_rebuildPending)
 			return;
 		m_rebuildPending = false;
@@ -2317,5 +2344,159 @@ namespace nvsmp
 				{ ReleaseCpuSkins(item); hdt::SkyrimPhysicsWorld::get()->removeSkinnedMeshSystem(item.system.get()); }
 		m_items.clear();
 		stats = {};
+	}
+
+	// --- script commands (see Script.cpp) ---------------------------------------------------------------------------------
+
+	static std::string LowerCopy(std::string s)
+	{
+		for (auto& c : s) c = (char)tolower((unsigned char)c);
+		return s;
+	}
+
+	// A physics file path as compared: lower case, '\' separators, without a leading "data\" or "meshes\".
+	static std::string NormalizeFile(const char* file)
+	{
+		std::string s = LowerCopy(file ? file : "");
+		for (auto& c : s) if (c == '/') c = '\\';
+		while (!s.empty() && s[0] == '\\') s.erase(0, 1);
+		if (!s.compare(0, 5, "data\\")) s.erase(0, 5);
+		if (!s.compare(0, 7, "meshes\\")) s.erase(0, 7);
+		return s;
+	}
+
+	static bool BoneMatches(const std::string& pattern, const std::string& lowerBone)
+	{
+		if (!pattern.empty() && pattern.back() == '*')
+			return !lowerBone.compare(0, pattern.size() - 1, pattern, 0, pattern.size() - 1);
+		return pattern == lowerBone;
+	}
+
+	bool ActorManager::scriptKinematic(void* ref, const char* bone) const
+	{
+		auto it = m_rules.find(ref);
+		if (it == m_rules.end()) return false;
+		const std::string lower = LowerCopy(bone ? bone : "");
+		bool on = true;
+		for (auto& [pattern, simulated] : it->second.bones)
+			if (BoneMatches(pattern, lower)) on = simulated;
+		return !on;
+	}
+
+	const std::string* ActorManager::fileOverride(void* ref, const char* file) const
+	{
+		auto it = m_rules.find(ref);
+		if (it == m_rules.end() || it->second.files.empty()) return nullptr;
+		auto f = it->second.files.find(NormalizeFile(file));
+		return f == it->second.files.end() ? nullptr : &f->second;
+	}
+
+	int ActorManager::setBonePhysics(void* ref, const std::string& list, bool on)
+	{
+		auto& rules = m_rules[ref].bones;
+		int count = 0;
+		size_t start = 0;
+		while (start <= list.size()) {
+			size_t end = list.find_first_of("|,", start);   // ',' too: the console eats '|' (its text cursor)
+			if (end == std::string::npos) end = list.size();
+			std::string name = list.substr(start, end - start);
+			while (!name.empty() && isspace((unsigned char)name.front())) name.erase(0, 1);
+			while (!name.empty() && isspace((unsigned char)name.back())) name.pop_back();
+			if (!name.empty()) {
+				name = LowerCopy(name);
+				// The same pattern given again replaces its old entry (the list stays short however often a script calls).
+				rules.erase(std::remove_if(rules.begin(), rules.end(), [&](auto& r) { return r.first == name; }), rules.end());
+				rules.emplace_back(name, on);
+				++count;
+			}
+			start = end + 1;
+		}
+		if (count) requestRebuild(ref);
+		return count;
+	}
+
+	int ActorManager::getBonePhysics(void* ref, const char* bone)
+	{
+		for (auto& [key, item] : m_items) {
+			if (item.ref != ref || !item.system) continue;
+			for (auto& b : item.system->getBones())
+				if (b->m_name.c_str() && !_stricmp(b->m_name.c_str(), bone))
+					return b->m_rig.isStaticOrKinematicObject() ? 0 : 1;
+		}
+		return -1;
+	}
+
+	void ActorManager::setPhysicsFile(void* ref, const char* original, const char* replacement)
+	{
+		auto& files = m_rules[ref].files;
+		const std::string key = NormalizeFile(original);
+		if (!replacement || !*replacement || NormalizeFile(replacement) == key)
+			files.erase(key);
+		else
+			files[key] = replacement;
+		// found() sees the item's file change at the next scan and builds it again: nothing more to do here.
+	}
+
+	std::string ActorManager::getPhysicsFile(void* ref, const char* original)
+	{
+		const std::string key = NormalizeFile(original);
+		for (auto& [k, item] : m_items)
+			if (item.ref == ref && (NormalizeFile(item.originalFile.c_str()) == key || NormalizeFile(item.file.c_str()) == key))
+				return item.file;
+		return {};
+	}
+
+	// The item built from an armor form the actor wears: the game's biped (Character::pBipedAnim, the third-person one)
+	// names each slot's form and the 3D node it loaded; the item is the one whose model is that node or under it.
+	const ActorManager::Item* ActorManager::itemOfForm(void* ref, void* form) const
+	{
+		if (!ref || !form || !NpcOf(ref)) return nullptr;   // a Character only (an NPC_ base): creatures have no such biped
+		struct BipObject { void* owner; void* part; RE::NiNode* node; bool skinned; };
+		struct BipedAnim { RE::NiNode* root; struct { bool exists; RE::NiNode* bone; } bones[5]; BipObject objects[20]; };
+		typedef BipedAnim*(__thiscall * GetBiped_t)(void*);
+		static const auto getBiped = (GetBiped_t)0x005D9F90;   // Character::GetBiped
+		RE::NiNode* nodes[20] = {};
+		int count = 0;
+		__try {
+			if (BipedAnim* biped = getBiped(ref))
+				for (auto& o : biped->objects)
+					if (o.owner == form && o.node) nodes[count++] = o.node;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return nullptr;
+		}
+		for (auto& [key, item] : m_items) {
+			if (item.ref != ref || item.firstPerson || item.worldObject) continue;
+			int depth = 0;
+			for (RE::NiAVObject* p = item.model.get(); p && depth < 256; p = p->parent, ++depth)
+				for (int i = 0; i < count; ++i)
+					if (p == nodes[i]) return &item;
+		}
+		return nullptr;
+	}
+
+	std::string ActorManager::getItemPhysicsFile(void* ref, void* form)
+	{
+		const Item* item = itemOfForm(ref, form);
+		return item ? item->file : std::string();
+	}
+
+	int ActorManager::setItemPhysicsFile(void* ref, void* form, const char* replacement)
+	{
+		const Item* item = itemOfForm(ref, form);
+		if (!item) return 0;
+		setPhysicsFile(ref, item->originalFile.c_str(), replacement);   // by the file its NIF names, as the path command
+		return 1;
+	}
+
+	void ActorManager::requestRebuild(void* ref)
+	{
+		if (std::find(m_rebuildRefs.begin(), m_rebuildRefs.end(), ref) == m_rebuildRefs.end())
+			m_rebuildRefs.push_back(ref);
+	}
+
+	void ActorManager::clearScriptRules()
+	{
+		m_rules.clear();
+		m_rebuildRefs.clear();
 	}
 }

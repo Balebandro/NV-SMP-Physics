@@ -1626,6 +1626,11 @@ namespace hdt
 			auto boneTemplate = getBoneTemplate(templateName);
 			if (readTemplate)
 				readBoneTemplate(boneTemplate);
+			if (boneTemplate.m_mass != 0 && m_forceKinematic && m_forceKinematic(bodyName.c_str())) {
+				logger::info("[SMP] bone {}: physics off by a script command (kinematic)", bodyName.c_str());
+				boneTemplate.m_mass = 0;
+				boneTemplate.m_localInertia.setZero();
+			}
 			auto bone = new SkyrimBone(bodyName, node, this->m_skeleton, boneTemplate);
 			if (extra && anchor) {
 				bone->m_anchor = anchor;

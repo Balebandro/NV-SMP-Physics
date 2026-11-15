@@ -37,6 +37,20 @@ namespace nvsmp
 		// Once per frame, after the world steps: race hair skinned on the CPU (see CpuSkin).
 		void skinOnCpu();
 
+		// Script commands (Script.cpp), per actor reference, kept until a save is loaded or the main menu (clearScriptRules).
+		// Bones: a '|' list of names, a name ending in '*' matching every bone starting with it; off = kinematic (follows the
+		// animation). Files: an item whose physics file is `original` is built from `replacement` instead ("" = the original).
+		// Both take effect by rebuilding the actor's items at the next rebuildIfPending.
+		int setBonePhysics(void* ref, const std::string& list, bool on);
+		int getBonePhysics(void* ref, const char* bone);       // 1 simulated, 0 not (by the file or a command), -1 no such bone built
+		void setPhysicsFile(void* ref, const char* original, const char* replacement);
+		std::string getPhysicsFile(void* ref, const char* original);   // the file the item is built from ("" if the actor has none such)
+		// The same by the armor form worn (its 3D found through the actor's biped): "" / 0 if not worn or not an SMP item.
+		std::string getItemPhysicsFile(void* ref, void* form);
+		int setItemPhysicsFile(void* ref, void* form, const char* replacement);
+		void requestRebuild(void* ref);
+		void clearScriptRules();
+
 		ActorStats stats;
 
 	private:
@@ -45,6 +59,8 @@ namespace nvsmp
 			RE::NiPointer<RE::NiNode> skeleton;   // the actor's 3D root
 			RE::NiPointer<RE::NiAVObject> model;  // the item's root under it
 			std::string file;
+			std::string originalFile;             // the file its NIF names (file differs when a script swapped it)
+			void* ref = nullptr;                  // the actor reference it is on (null for a placed object)
 			RE::BSTSmartPointer<hdt::SkyrimSystem> system;
 			unsigned frame = 0;                   // last frame it was seen
 			unsigned buildAt = 0;                 // frame of the next build
@@ -195,5 +211,16 @@ namespace nvsmp
 		RE::NiNode* m_firstPersonRoot = nullptr;   // the player's first-person model this frame (its items: SkyrimSystem::setFirstPerson)
 		int m_builtGround = -1;                // the ground setting the systems were built with
 		bool m_rebuildPending = false;         // a collision setting changed: rebuild at the next update
+
+		struct ScriptRules
+		{
+			std::vector<std::pair<std::string, bool>> bones;       // lower-case pattern, simulated; the last match wins
+			std::unordered_map<std::string, std::string> files;    // normalized original -> replacement as given
+		};
+		std::unordered_map<void*, ScriptRules> m_rules;
+		std::vector<void*> m_rebuildRefs;      // actors whose items are rebuilt at the next rebuildIfPending
+		bool scriptKinematic(void* ref, const char* bone) const;
+		const Item* itemOfForm(void* ref, void* form) const;
+		const std::string* fileOverride(void* ref, const char* file) const;
 	};
 }
