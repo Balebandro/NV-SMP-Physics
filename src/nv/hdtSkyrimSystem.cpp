@@ -198,7 +198,7 @@ namespace hdt
 	SkyrimSystem::SkyrimSystem(RE::NiNode* skeleton) :
 		m_skeleton(skeleton), m_oldRoot(nullptr)
 	{
-		m_oldRoot = m_skeleton;
+		m_oldRoot = m_skeleton.get();
 		m_lastRootPosition.setZero();
 	}
 
@@ -327,7 +327,7 @@ namespace hdt
 		m_lastRootRotation = newRot;
 		m_lastRootPosition = newPos;
 		if (m_model) { m_lastModelOffset = modelOffset(); m_haveModelOffset = true; }
-		m_oldRoot = hdt::make_nismart(newRoot);
+		m_oldRoot = newRoot;
 		return timeStep;
 	}
 

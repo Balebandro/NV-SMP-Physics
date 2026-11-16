@@ -38,7 +38,7 @@ namespace hdt
 		const std::vector<RE::BSTSmartPointer<ConstraintGroup>>& constraintGroups() const { return m_constraintGroups; }
 
 		RE::NiPointer<RE::NiNode> m_skeleton;
-		RE::NiPointer<RE::NiNode> m_oldRoot;
+		RE::NiNode* m_oldRoot;   // only compared: no reference (the race menu's player ShadowSceneNode is held by none, one taken and dropped deletes it)
 		bool m_initialized = false;
 		float m_windFactor = 1.f;
 
